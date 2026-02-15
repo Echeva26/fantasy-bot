@@ -1,0 +1,26 @@
+# Secrets and local config
+.env
+.env.*
+!.env.example
+.laliga_token
+.autopilot_state.json
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local runtime outputs
+*.log
+informe_j*.md
+snapshots/
+scrapes/
+apk/
+
+# OS/editor noise
+.DS_Store

@@ -1,0 +1,25 @@
+# -----------------------------------------------------------------------------
+# Cron de ejemplo para bot autónomo (hora local del servidor)
+# Ajusta rutas, horarios y league_id según tu caso.
+# -----------------------------------------------------------------------------
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# Carpeta del repo
+BOT_DIR=/Users/jorge/Documents/Github/fantasy-bot
+
+# Logs
+LOG_DIR=$BOT_DIR/logs
+
+# 10 min antes de cierre estimado de mercado: analiza y ejecuta fase 1/compras
+50 7 * * * cd $BOT_DIR && mkdir -p $LOG_DIR && ./scripts/run_pre_market.sh TU_LEAGUE_ID >> $LOG_DIR/pre_market.log 2>&1
+
+# 10 min después del cierre: aceptar ofertas de liga (fase 2)
+10 8 * * * cd $BOT_DIR && mkdir -p $LOG_DIR && ./scripts/run_post_market.sh TU_LEAGUE_ID >> $LOG_DIR/post_market.log 2>&1
+
+# -----------------------------------------------------------------------------
+# Variante Docker (descomenta si quieres ejecutar dentro de contenedor)
+# -----------------------------------------------------------------------------
+# 50 7 * * * cd $BOT_DIR && mkdir -p $LOG_DIR && docker compose run --rm fantasy-bot python -m prediction.autopilot --mode pre --league TU_LEAGUE_ID >> $LOG_DIR/pre_market.log 2>&1
+# 10 8 * * * cd $BOT_DIR && mkdir -p $LOG_DIR && docker compose run --rm fantasy-bot python -m prediction.autopilot --mode post --league TU_LEAGUE_ID >> $LOG_DIR/post_market.log 2>&1

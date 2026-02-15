@@ -1,0 +1,177 @@
+{
+  "model_type": "lightgbm",
+  "feature_cols": [
+    "media_pts_3j",
+    "media_pts_5j",
+    "media_min_3j",
+    "media_min_5j",
+    "tendencia_pts",
+    "titular_pct_5j",
+    "puntos_max_5j",
+    "puntos_min_5j",
+    "media_goles_5j",
+    "media_asistencias_5j",
+    "media_recuperaciones_5j",
+    "media_tiros_5j",
+    "media_paradas_5j",
+    "fdr_rival",
+    "goles_contra_rival",
+    "goles_favor_rival",
+    "posicion_rival",
+    "es_local",
+    "posicion_id",
+    "valor_mercado_norm",
+    "prob_victoria",
+    "prob_derrota",
+    "prob_clean_sheet",
+    "prob_btts"
+  ],
+  "metrics": {
+    "walk_forward_oof": {
+      "mae": 2.4788,
+      "rmse": 3.2557,
+      "r2": 0.2374
+    },
+    "folds": 17,
+    "total_oof_predictions": 6759,
+    "fold_details": [
+      {
+        "jornada": 7,
+        "mae": 2.544,
+        "rmse": 3.268,
+        "r2": 0.172,
+        "n_train": 1958,
+        "n_pred": 396
+      },
+      {
+        "jornada": 8,
+        "mae": 2.408,
+        "rmse": 3.132,
+        "r2": 0.179,
+        "n_train": 2359,
+        "n_pred": 398
+      },
+      {
+        "jornada": 9,
+        "mae": 2.477,
+        "rmse": 3.146,
+        "r2": 0.264,
+        "n_train": 2755,
+        "n_pred": 404
+      },
+      {
+        "jornada": 10,
+        "mae": 2.585,
+        "rmse": 3.371,
+        "r2": 0.142,
+        "n_train": 3153,
+        "n_pred": 412
+      },
+      {
+        "jornada": 11,
+        "mae": 2.535,
+        "rmse": 3.277,
+        "r2": 0.311,
+        "n_train": 3557,
+        "n_pred": 408
+      },
+      {
+        "jornada": 12,
+        "mae": 2.285,
+        "rmse": 3.08,
+        "r2": 0.28,
+        "n_train": 3969,
+        "n_pred": 404
+      },
+      {
+        "jornada": 13,
+        "mae": 2.476,
+        "rmse": 3.219,
+        "r2": 0.248,
+        "n_train": 4377,
+        "n_pred": 404
+      },
+      {
+        "jornada": 14,
+        "mae": 2.328,
+        "rmse": 3.048,
+        "r2": 0.275,
+        "n_train": 4781,
+        "n_pred": 396
+      },
+      {
+        "jornada": 15,
+        "mae": 2.605,
+        "rmse": 3.503,
+        "r2": 0.181,
+        "n_train": 5185,
+        "n_pred": 395
+      },
+      {
+        "jornada": 16,
+        "mae": 2.571,
+        "rmse": 3.398,
+        "r2": 0.253,
+        "n_train": 5581,
+        "n_pred": 350
+      },
+      {
+        "jornada": 17,
+        "mae": 2.612,
+        "rmse": 3.611,
+        "r2": 0.257,
+        "n_train": 5976,
+        "n_pred": 385
+      },
+      {
+        "jornada": 18,
+        "mae": 2.427,
+        "rmse": 3.282,
+        "r2": 0.221,
+        "n_train": 6326,
+        "n_pred": 403
+      },
+      {
+        "jornada": 19,
+        "mae": 2.248,
+        "rmse": 2.974,
+        "r2": 0.312,
+        "n_train": 6711,
+        "n_pred": 404
+      },
+      {
+        "jornada": 20,
+        "mae": 2.542,
+        "rmse": 3.339,
+        "r2": 0.273,
+        "n_train": 7114,
+        "n_pred": 400
+      },
+      {
+        "jornada": 21,
+        "mae": 2.506,
+        "rmse": 3.244,
+        "r2": 0.168,
+        "n_train": 7518,
+        "n_pred": 405
+      },
+      {
+        "jornada": 22,
+        "mae": 2.359,
+        "rmse": 2.999,
+        "r2": 0.246,
+        "n_train": 7918,
+        "n_pred": 422
+      },
+      {
+        "jornada": 23,
+        "mae": 2.665,
+        "rmse": 3.438,
+        "r2": 0.204,
+        "n_train": 8323,
+        "n_pred": 373
+      }
+    ]
+  },
+  "training_strategy": "walk_forward_validation"
+}

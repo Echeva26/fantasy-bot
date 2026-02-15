@@ -1,0 +1,13 @@
+services:
+  autonomous-bot:
+    build: .
+    image: fantasy-bot:latest
+    working_dir: /app
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Europe/Madrid}
+    command: ["python", "-m", "prediction.docker_autonomous"]
+    restart: unless-stopped

@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+.env
+.laliga_token
+.autopilot_state.json
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.md
+snapshots
+scrapes
+apk
