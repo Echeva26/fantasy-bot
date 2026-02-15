@@ -34,6 +34,8 @@ class PreRunResult:
     ventas_fase1: int
     compras: int
     errores: list[str]
+    message: str = ""
+    report_content: str = ""
 
 
 def _money(value: int | float | None) -> str:
@@ -58,7 +60,11 @@ def _save_report(report: str, jornada: str | int, output: str | None) -> Path:
     return out_path
 
 
-def run_pre_market(args: argparse.Namespace) -> PreRunResult:
+def run_pre_market(
+    args: argparse.Namespace,
+    *,
+    skip_notify: bool = False,
+) -> PreRunResult:
     result = run_advisor_pipeline(args)
     snapshot = result["snapshot"]
     transfer_plan = result["transfer_plan"]
@@ -90,7 +96,8 @@ def run_pre_market(args: argparse.Namespace) -> PreRunResult:
     )
     if errores:
         msg += f"\nErrores: {len(errores)}"
-    _notify_if_configured(msg)
+    if not skip_notify:
+        _notify_if_configured(msg)
 
     return PreRunResult(
         report_path=report_path,
@@ -98,6 +105,8 @@ def run_pre_market(args: argparse.Namespace) -> PreRunResult:
         ventas_fase1=ventas_fase1,
         compras=compras,
         errores=errores,
+        message=msg,
+        report_content=report,
     )
 
 

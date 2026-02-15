@@ -118,8 +118,10 @@ Para renovarlo:
 4. El daemon retomara operaciones automaticamente.
 
 Comandos utiles por Telegram:
-- `/help`
-- `/status`
+- `/help` - Ayuda y lista de comandos
+- `/status` - Estado del token
+- `/informe` - Generar informe de predicciones inmediatamente
+- `/compraventa` - Ejecutar recomendaciones (ventas + compras) del informe
 
 ---
 

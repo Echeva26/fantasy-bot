@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from prediction.autopilot import run_post_market, run_pre_market
-from prediction.telegram_notify import send_telegram_message
+from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
 
 logger = logging.getLogger(__name__)
 
@@ -142,20 +142,13 @@ def _maybe_alert_token_issue(
     if should_alert:
         if token_status == "expired":
             msg = (
-                "Fantasy Autopilot TOKEN CADUCADO\n"
-                f"Edad estimada: {age_h:.1f}h\n"
-                "Renueva el token enviando JWT/URL al bot de Telegram."
+                f"Fantasy Autopilot TOKEN CADUCADO (edad ~{age_h:.1f}h)"
+                + GUIDA_RENOVACION_TOKEN
             )
         elif token_status == "missing":
-            msg = (
-                "Fantasy Autopilot TOKEN AUSENTE\n"
-                "No existe .laliga_token. Envia JWT/URL al bot de Telegram."
-            )
+            msg = "Fantasy Autopilot TOKEN AUSENTE" + GUIDA_RENOVACION_TOKEN
         else:
-            msg = (
-                "Fantasy Autopilot TOKEN INVALIDO\n"
-                "No se puede leer .laliga_token. Renuevalo desde Telegram."
-            )
+            msg = "Fantasy Autopilot TOKEN INVALIDO" + GUIDA_RENOVACION_TOKEN
         logger.warning(msg.replace("\n", " | "))
         _notify(msg)
         new_state["token_alert_key"] = alert_key

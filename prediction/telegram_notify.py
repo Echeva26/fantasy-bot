@@ -9,6 +9,34 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_MAX_LEN = 3900
 
+# URL de login LaLiga Fantasy (Google) que redirige a jwt.ms
+LALIGA_LOGIN_URL = (
+    "https://login.laliga.es/laligadspprob2c.onmicrosoft.com/oauth2/v2.0/authorize"
+    "?p=b2c_1a_5ulaip_parametrized_signin"
+    "&client_id=cf110827-e4a9-4d20-affb-8ea0c6f15f94"
+    "&redirect_uri=https://jwt.ms"
+    "&response_type=id_token"
+    "&scope=openid%20cf110827-e4a9-4d20-affb-8ea0c6f15f94"
+    "&nonce=laligafantasy"
+    "&response_mode=fragment"
+)
+
+GUIDA_RENOVACION_TOKEN = f"""
+📋 CÓMO RENOVAR EL TOKEN
+
+1️⃣ Abre este enlace en el navegador:
+{LALIGA_LOGIN_URL}
+
+2️⃣ Inicia sesión con tu cuenta de LaLiga Fantasy (Google).
+
+3️⃣ Tras el login te redirigirá a jwt.ms.
+   Copia la URL COMPLETA de la barra de direcciones
+   (empieza con https://jwt.ms/#id_token=eyJ...)
+
+4️⃣ Envía esa URL a este bot de Telegram.
+   También vale enviar solo el JWT (eyJ...).
+"""
+
 
 def _chunk_text(text: str, size: int = TELEGRAM_MAX_LEN) -> Iterable[str]:
     text = (text or "").strip()
