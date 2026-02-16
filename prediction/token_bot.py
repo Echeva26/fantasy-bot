@@ -12,14 +12,21 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone
 from threading import Event
 from urllib.parse import parse_qs, urlparse
 
 import requests
 
-from laliga_fantasy_client import TOKEN_FILE, load_token, save_token
+from laliga_fantasy_client import LaLigaFantasyClient, TOKEN_FILE, load_token, save_token
 from prediction.autopilot import run_pre_market
+from prediction.league_selection import (
+    load_selected_league,
+    resolve_league_id,
+    save_selected_league,
+)
+from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
 
 logger = logging.getLogger(__name__)
@@ -100,6 +107,164 @@ def _token_status(max_age_hours: float = 23.0) -> tuple[str, float | None]:
         return "invalid", None
 
 
+def _list_user_leagues() -> tuple[list[dict], str]:
+    """
+    Devuelve (ligas, error).
+    ligas: [{"id": "...", "name": "..."}, ...]
+    """
+    status, _ = _token_status(max_age_hours=float(os.getenv("TOKEN_MAX_AGE_HOURS", "23")))
+    if status != "ok":
+        return [], f"token no válido ({status})"
+    try:
+        client = LaLigaFantasyClient.from_saved_token(league_id="")
+        raw = client.get_leagues() or []
+        leagues = []
+        for lg in raw:
+            lid = str(lg.get("id", "")).strip()
+            if not lid:
+                continue
+            leagues.append(
+                {
+                    "id": lid,
+                    "name": str(lg.get("name", "")).strip() or "(Sin nombre)",
+                }
+            )
+        return leagues, ""
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def _resolve_operational_league_id() -> tuple[str, str]:
+    """
+    Resuelve league_id para ejecutar comandos operativos.
+    Si hay una sola liga en la cuenta, la selecciona automáticamente.
+    """
+    league_id = resolve_league_id("")
+    if league_id:
+        return league_id, ""
+
+    leagues, err = _list_user_leagues()
+    if err:
+        return "", f"No se pudo resolver la liga: {err}"
+    if not leagues:
+        return "", "No se encontraron ligas para este usuario."
+    if len(leagues) == 1:
+        lg = leagues[0]
+        save_selected_league(lg["id"], lg["name"], source="auto_single_league")
+        return lg["id"], ""
+
+    return (
+        "",
+        "No hay liga seleccionada. Usa /ligas para verlas y /liga <nombre> para elegir.",
+    )
+
+
+def _selected_league_text() -> str:
+    selected = load_selected_league()
+    if not selected:
+        fallback = resolve_league_id("")
+        if fallback:
+            return "Liga activa: definida por configuracion avanzada."
+        return "Liga seleccionada: (ninguna)"
+    name = selected.get("league_name", "")
+    if name:
+        return f"Liga activa: {name}"
+    return "Liga activa: seleccionada"
+
+
+def _norm(text: str) -> str:
+    s = (text or "").strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return " ".join(s.split())
+
+
+def _cmd_list_leagues() -> str:
+    leagues, err = _list_user_leagues()
+    if err:
+        return f"No se pudieron listar ligas: {err}"
+    if not leagues:
+        return "No se encontraron ligas para este usuario."
+
+    selected_id = resolve_league_id("")
+    lines = ["Ligas disponibles:"]
+    for i, lg in enumerate(leagues, 1):
+        mark = " ✅" if str(lg["id"]) == str(selected_id) else ""
+        lines.append(f"{i}. {lg['name']}{mark}")
+    lines.append("")
+    lines.append("Usa /liga <nombre> para seleccionarla.")
+    return "\n".join(lines)
+
+
+def _cmd_select_league(raw_text: str) -> str:
+    parts = raw_text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        current = _selected_league_text()
+        return (
+            f"{current}\n"
+            "Para seleccionar liga: /liga <nombre>\n"
+            "Para ver ligas: /ligas"
+        )
+    target = parts[1].strip()
+
+    leagues, err = _list_user_leagues()
+    if err:
+        return f"No se pudo seleccionar liga: {err}"
+    if not leagues:
+        return "No se encontraron ligas para este usuario."
+
+    chosen = None
+    if target.isdigit():
+        idx = int(target)
+        if 1 <= idx <= len(leagues):
+            chosen = leagues[idx - 1]
+    else:
+        norm_target = _norm(target)
+        exact = [lg for lg in leagues if _norm(lg.get("name", "")) == norm_target]
+        if len(exact) == 1:
+            chosen = exact[0]
+        elif len(exact) > 1:
+            names = "\n".join(f"- {lg['name']}" for lg in exact[:10])
+            return (
+                "Hay varias ligas con ese nombre exacto. "
+                "Escribe el nombre completo tal cual o usa el número:\n"
+                f"{names}"
+            )
+        else:
+            partial = [lg for lg in leagues if norm_target in _norm(lg.get("name", ""))]
+            if len(partial) == 1:
+                chosen = partial[0]
+            elif len(partial) > 1:
+                names = "\n".join(f"- {lg['name']}" for lg in partial[:10])
+                return (
+                    "Coinciden varias ligas con ese texto. "
+                    "Escribe un nombre más específico o usa el número:\n"
+                    f"{names}"
+                )
+
+    if not chosen:
+        return (
+            f"No encontré la liga '{target}'.\n"
+            "Usa /ligas para ver opciones y luego /liga <nombre>."
+        )
+
+    save_selected_league(chosen["id"], chosen["name"], source="telegram")
+    sched, sched_err = build_market_schedule(
+        chosen["id"],
+        timezone_name=os.getenv("TZ", "Europe/Madrid"),
+    )
+    schedule_txt = (
+        "\n\n" + schedule_message(sched)
+        if sched
+        else f"\n\nNo pude calcular la hora de mercado ahora: {sched_err}"
+    )
+    return (
+        "Liga seleccionada correctamente.\n"
+        f"{chosen['name']}"
+        f"{schedule_txt}"
+    )
+
+
 def _run_pre_market_cmd(analysis_only: bool, bot_token: str, chat_id: str) -> str:
     """Ejecuta informe o compraventa, envía mensaje intermedio y devuelve resumen."""
     cmd = "informe" if analysis_only else "compraventa"
@@ -109,9 +274,9 @@ def _run_pre_market_cmd(analysis_only: bool, bot_token: str, chat_id: str) -> st
         "Generando informe..." if analysis_only
         else "Ejecutando compraventa (recomendaciones del bot)...",
     )
-    league_id = os.getenv("LALIGA_LEAGUE_ID", "").strip()
+    league_id, league_err = _resolve_operational_league_id()
     if not league_id:
-        return "Error: falta LALIGA_LEAGUE_ID en .env"
+        return f"Error de liga: {league_err}"
 
     status, _ = _token_status(max_age_hours=float(os.getenv("TOKEN_MAX_AGE_HOURS", "23")))
     if status != "ok":
@@ -121,7 +286,7 @@ def _run_pre_market_cmd(analysis_only: bool, bot_token: str, chat_id: str) -> st
 
     args = SimpleNamespace(
         league=league_id,
-        model=os.getenv("AUTOPILOT_MODEL", "xgboost"),
+        model="xgboost",
         snapshot=None,
         output=None,
         dry_run=False,
@@ -151,6 +316,8 @@ def _handle_text(
             "Comandos:\n"
             "• /help - Esta ayuda\n"
             "• /status - Estado del token\n"
+            "• /ligas - Listar ligas disponibles\n"
+            "• /liga <nombre> - Seleccionar liga activa\n"
             "• /informe - Generar informe de predicciones ahora\n"
             "• /compraventa - Ejecutar recomendaciones (ventas+compras)\n\n"
             "Para renovar token: envia JWT (eyJ...) o URL de jwt.ms con id_token.",
@@ -159,7 +326,13 @@ def _handle_text(
         age = _token_age_hours()
         if age is None:
             return False, "No hay token valido guardado."
-        return False, f"Token guardado. Edad aproximada: {age:.1f}h."
+        return False, f"Token guardado. Edad aproximada: {age:.1f}h.\n{_selected_league_text()}"
+
+    if t.startswith("/ligas"):
+        return False, _cmd_list_leagues()
+
+    if t.startswith("/liga"):
+        return False, _cmd_select_league(text)
 
     if t.startswith("/informe"):
         if bot_token and chat_id:
@@ -180,7 +353,30 @@ def _handle_text(
         return False, "No detecte un token valido. Usa /help para instrucciones."
 
     save_token(token)
-    return True, "Token guardado correctamente en .laliga_token."
+    leagues, err = _list_user_leagues()
+    if not err and len(leagues) == 1:
+        lg = leagues[0]
+        save_selected_league(lg["id"], lg["name"], source="auto_single_league")
+        sched, sched_err = build_market_schedule(
+            lg["id"],
+            timezone_name=os.getenv("TZ", "Europe/Madrid"),
+        )
+        schedule_txt = (
+            "\n\n" + schedule_message(sched)
+            if sched
+            else f"\n\nNo pude calcular la hora de mercado ahora: {sched_err}"
+        )
+        return (
+            True,
+            "Token guardado correctamente en .laliga_token.\n"
+            f"Liga auto-seleccionada: {lg['name']}"
+            f"{schedule_txt}",
+        )
+    return (
+        True,
+        "Token guardado correctamente en .laliga_token.\n"
+        "Si tienes varias ligas, usa /ligas y /liga para elegir la activa.",
+    )
 
 
 def _set_bot_commands(bot_token: str) -> None:
@@ -188,6 +384,8 @@ def _set_bot_commands(bot_token: str) -> None:
     commands = [
         {"command": "informe", "description": "Generar informe de predicciones"},
         {"command": "compraventa", "description": "Ejecutar recomendaciones ventas+compras"},
+        {"command": "ligas", "description": "Listar ligas disponibles"},
+        {"command": "liga", "description": "Seleccionar liga por nombre"},
         {"command": "status", "description": "Estado del token"},
         {"command": "help", "description": "Ayuda y lista de comandos"},
     ]
@@ -242,7 +440,11 @@ def run_token_bot(
         elif status == "invalid":
             msg = "Fantasy Autopilot TOKEN INVALIDO" + GUIDA_RENOVACION_TOKEN
         else:
-            msg = "Token bot iniciado. Enviame token/URL para refrescar .laliga_token."
+            msg = (
+                "Token bot iniciado. Envíame token/URL para refrescar .laliga_token.\n"
+                f"{_selected_league_text()}\n"
+                "Puedes cambiarla con /ligas y /liga <nombre>."
+            )
         send_telegram_message(bot_token, notify_chat_id, msg)
 
     _set_bot_commands(bot_token)

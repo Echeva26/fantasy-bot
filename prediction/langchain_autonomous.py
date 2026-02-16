@@ -2,7 +2,7 @@
 Daemon autónomo para el agente LangChain.
 
 Ejemplo:
-  python -m prediction.langchain_autonomous --league 016615640
+  python -m prediction.langchain_autonomous
 """
 
 from __future__ import annotations
@@ -18,25 +18,33 @@ from threading import Event
 from zoneinfo import ZoneInfo
 
 from laliga_fantasy_client import load_token
+from prediction.league_selection import load_selected_league, resolve_league_id
 from prediction.langchain_agent import run_agent_objective, run_agent_phase
+from prediction.lineup_autoset import autoset_best_lineup
+from prediction.market_schedule import build_market_schedule, schedule_message
+from prediction.predict import get_next_round, get_sofascore_season_id
 from prediction.telegram_notify import send_telegram_message
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_STATE_FILE = Path(".langchain_agent_state.json")
+MODEL_TYPE = "xgboost"
+POLL_SECONDS = 30
+MARKET_REFRESH_SECONDS = 300
+LINEUP_REFRESH_SECONDS = 900
+LINEUP_MINUTES_BEFORE_FIRST_MATCH = 23 * 60 + 55
 
 
-def _parse_hhmm(raw: str) -> tuple[int, int]:
-    s = (raw or "").strip()
+def _parse_iso_dt(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
     try:
-        hh, mm = s.split(":", 1)
-        h = int(hh)
-        m = int(mm)
-    except Exception as exc:
-        raise ValueError(f"Hora inválida '{raw}', se esperaba HH:MM.") from exc
-    if not (0 <= h <= 23 and 0 <= m <= 59):
-        raise ValueError(f"Hora inválida '{raw}'.")
-    return h, m
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 def _load_state(path: Path) -> dict:
@@ -59,13 +67,6 @@ def _notify(text: str) -> None:
         send_telegram_message(token, chat_id, text)
 
 
-def _should_run(last_run_date: str | None, now_local: datetime, target_h: int, target_m: int) -> bool:
-    today = now_local.date().isoformat()
-    if last_run_date == today:
-        return False
-    return (now_local.hour, now_local.minute) >= (target_h, target_m)
-
-
 def _token_ok() -> bool:
     return bool(load_token())
 
@@ -79,19 +80,11 @@ def _maybe_alert_token_issue(state: dict, cooldown_minutes: int) -> dict:
         return new_state
 
     cooldown = timedelta(minutes=max(1, int(cooldown_minutes)))
-    last_alert_raw = new_state.get("token_alert_at")
-    should_alert = False
-    if not last_alert_raw:
-        should_alert = True
-    else:
-        try:
-            last_alert = datetime.fromisoformat(last_alert_raw)
-            if last_alert.tzinfo is None:
-                last_alert = last_alert.replace(tzinfo=timezone.utc)
-            if now_utc - last_alert >= cooldown:
-                should_alert = True
-        except Exception:
-            should_alert = True
+    last_alert = _parse_iso_dt(new_state.get("token_alert_at"))
+    should_alert = (
+        last_alert is None
+        or (now_utc - last_alert) >= cooldown
+    )
 
     if should_alert:
         msg = (
@@ -105,6 +98,48 @@ def _maybe_alert_token_issue(state: dict, cooldown_minutes: int) -> dict:
     return new_state
 
 
+def _maybe_alert_missing_league(state: dict, cooldown_minutes: int) -> dict:
+    now_utc = datetime.now(timezone.utc)
+    new_state = dict(state)
+
+    cooldown = timedelta(minutes=max(1, int(cooldown_minutes)))
+    last_alert = _parse_iso_dt(new_state.get("league_alert_at"))
+    should_alert = (
+        last_alert is None
+        or (now_utc - last_alert) >= cooldown
+    )
+
+    if should_alert:
+        _notify(
+            "Fantasy LangChain Agent: no hay liga seleccionada.\n"
+            "Usa el bot de Telegram: /ligas y /liga <nombre>."
+        )
+        new_state["league_alert_at"] = now_utc.isoformat()
+
+    return new_state
+
+
+def _maybe_alert_market_unknown(state: dict, cooldown_minutes: int, err: str) -> dict:
+    now_utc = datetime.now(timezone.utc)
+    new_state = dict(state)
+
+    cooldown = timedelta(minutes=max(1, int(cooldown_minutes)))
+    last_alert = _parse_iso_dt(new_state.get("market_alert_at"))
+    should_alert = (
+        last_alert is None
+        or (now_utc - last_alert) >= cooldown
+    )
+
+    if should_alert:
+        _notify(
+            "Fantasy LangChain Agent: no pude calcular la hora del mercado ahora.\n"
+            f"Detalle: {err}"
+        )
+        new_state["market_alert_at"] = now_utc.isoformat()
+
+    return new_state
+
+
 def _build_objective(phase: str, custom_pre: str, custom_post: str) -> str | None:
     if phase == "pre" and custom_pre.strip():
         return custom_pre.strip()
@@ -113,13 +148,13 @@ def _build_objective(phase: str, custom_pre: str, custom_post: str) -> str | Non
     return None
 
 
-def _run_phase(phase: str, args: argparse.Namespace) -> dict:
+def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
     custom_objective = _build_objective(phase, args.pre_objective, args.post_objective)
     if custom_objective:
         return run_agent_objective(
-            league_id=args.league,
+            league_id=league_id,
             objective=custom_objective,
-            model_type=args.model,
+            model_type=MODEL_TYPE,
             llm_model=args.llm_model,
             temperature=args.temperature,
             max_iterations=args.max_iterations,
@@ -127,9 +162,9 @@ def _run_phase(phase: str, args: argparse.Namespace) -> dict:
             verbose=args.verbose,
         )
     return run_agent_phase(
-        league_id=args.league,
+        league_id=league_id,
         phase=phase,
-        model_type=args.model,
+        model_type=MODEL_TYPE,
         llm_model=args.llm_model,
         temperature=args.temperature,
         max_iterations=args.max_iterations,
@@ -138,13 +173,139 @@ def _run_phase(phase: str, args: argparse.Namespace) -> dict:
     )
 
 
+def _market_schedule_from_state(state: dict) -> dict | None:
+    close = _parse_iso_dt(state.get("market_close_local"))
+    pre = _parse_iso_dt(state.get("market_pre_local"))
+    post = _parse_iso_dt(state.get("market_post_local"))
+    key = str(state.get("market_key", "")).strip()
+    if not (close and pre and post and key):
+        return None
+    return {
+        "market_key": key,
+        "close_local": close,
+        "pre_local": pre,
+        "post_local": post,
+        "timezone_name": state.get("market_timezone", ""),
+    }
+
+
+def _refresh_market_schedule(
+    state: dict,
+    *,
+    league_id: str,
+    tz_name: str,
+    cooldown_seconds: int = MARKET_REFRESH_SECONDS,
+) -> tuple[dict, dict | None, str, bool]:
+    now_utc = datetime.now(timezone.utc)
+    new_state = dict(state)
+
+    last_refresh = _parse_iso_dt(new_state.get("market_refreshed_at"))
+    cached = _market_schedule_from_state(new_state)
+    if cached and last_refresh and (now_utc - last_refresh).total_seconds() < cooldown_seconds:
+        return new_state, cached, "", False
+
+    schedule, err = build_market_schedule(league_id, timezone_name=tz_name)
+    new_state["market_refreshed_at"] = now_utc.isoformat()
+    if not schedule:
+        return new_state, None, err, False
+
+    old_key = str(new_state.get("market_key", ""))
+    changed = old_key != schedule["market_key"]
+
+    new_state["market_key"] = schedule["market_key"]
+    new_state["market_close_local"] = schedule["close_local"].isoformat()
+    new_state["market_pre_local"] = schedule["pre_local"].isoformat()
+    new_state["market_post_local"] = schedule["post_local"].isoformat()
+    new_state["market_timezone"] = schedule.get("timezone_name", tz_name)
+    new_state.pop("market_alert_at", None)
+
+    return new_state, schedule, "", changed
+
+
+def _refresh_lineup_target(
+    state: dict,
+    *,
+    cooldown_seconds: int = LINEUP_REFRESH_SECONDS,
+) -> tuple[dict, str]:
+    now_utc = datetime.now(timezone.utc)
+    new_state = dict(state)
+
+    last_refresh = _parse_iso_dt(new_state.get("lineup_refreshed_at"))
+    if last_refresh and (now_utc - last_refresh).total_seconds() < cooldown_seconds:
+        return new_state, ""
+
+    try:
+        season_id = get_sofascore_season_id()
+        jornada, _, first_match_ts = get_next_round(season_id)
+        new_state["lineup_refreshed_at"] = now_utc.isoformat()
+        if first_match_ts <= 0:
+            new_state.pop("lineup_jornada", None)
+            new_state.pop("lineup_first_match_ts", None)
+            new_state.pop("lineup_target_ts", None)
+            return new_state, "sin timestamp del primer partido"
+
+        target_ts = int(first_match_ts) - (LINEUP_MINUTES_BEFORE_FIRST_MATCH * 60)
+        new_state["lineup_jornada"] = int(jornada)
+        new_state["lineup_first_match_ts"] = int(first_match_ts)
+        new_state["lineup_target_ts"] = int(target_ts)
+        new_state["lineup_target_at"] = datetime.fromtimestamp(target_ts, tz=timezone.utc).isoformat()
+        return new_state, ""
+    except Exception as exc:
+        new_state["lineup_refreshed_at"] = now_utc.isoformat()
+        return new_state, f"{type(exc).__name__}: {exc}"
+
+
+def _maybe_run_lineup(
+    state: dict,
+    *,
+    league_id: str,
+    dry_run: bool,
+) -> tuple[dict, str]:
+    new_state = dict(state)
+    jornada = new_state.get("lineup_jornada")
+    target_ts = int(new_state.get("lineup_target_ts", 0) or 0)
+    first_ts = int(new_state.get("lineup_first_match_ts", 0) or 0)
+
+    if not jornada or target_ts <= 0 or first_ts <= 0:
+        return new_state, ""
+
+    applied_jornada = int(new_state.get("last_lineup_applied_jornada", 0) or 0)
+    if applied_jornada == int(jornada):
+        return new_state, ""
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if now_ts < target_ts:
+        return new_state, ""
+    if now_ts >= first_ts:
+        new_state["last_lineup_applied_jornada"] = int(jornada)
+        new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
+        return new_state, "lineup saltado: jornada ya iniciada"
+
+    result = autoset_best_lineup(
+        league_id=league_id,
+        model=MODEL_TYPE,
+        day_before_only=False,
+        after_market_time="00:00",
+        timezone_name=os.getenv("TZ", "Europe/Madrid"),
+        force=True,
+        dry_run=dry_run,
+    )
+
+    if result.get("applied") or result.get("dry_run"):
+        new_state["last_lineup_applied_jornada"] = int(jornada)
+        new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
+        msg = (
+            "Fantasy LangChain LINEUP\n"
+            f"Jornada: {jornada}\n"
+            f"Objetivo: 23h55 antes del inicio"
+        )
+        return new_state, msg
+
+    reason = str(result.get("reason", "no aplicada"))
+    return new_state, f"lineup no aplicada: {reason}"
+
+
 def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> None:
-    if not args.league:
-        raise RuntimeError("Falta league_id: usa --league o LALIGA_LEAGUE_ID.")
-
-    pre_h, pre_m = _parse_hhmm(args.pre_time)
-    post_h, post_m = _parse_hhmm(args.post_time)
-
     tz_name = os.getenv("TZ", "Europe/Madrid")
     try:
         tz = ZoneInfo(tz_name)
@@ -155,18 +316,27 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
     state_path = Path(args.state_file)
     state = _load_state(state_path)
 
+    startup_league = resolve_league_id(args.league)
+    startup_sel = load_selected_league() or {}
+    startup_name = startup_sel.get("league_name", "")
+    if startup_name:
+        startup_league_desc = startup_name
+    elif startup_league:
+        startup_league_desc = "definida por configuracion avanzada"
+    else:
+        startup_league_desc = "pendiente (usa /ligas y /liga en Telegram)"
+
     _notify(
         "Fantasy LangChain daemon iniciado\n"
-        f"Liga: {args.league}\n"
-        f"PRE: {args.pre_time} | POST: {args.post_time} | LLM: {args.llm_model}"
+        f"Liga: {startup_league_desc}\n"
+        "PRE/POST: automáticos a 5 min antes/después del cierre real de mercado\n"
+        "Alineación: 23h55 antes del inicio de jornada"
     )
     logger.info(
-        "LangChain daemon iniciado liga=%s pre=%s post=%s model=%s llm=%s",
-        args.league,
-        args.pre_time,
-        args.post_time,
-        args.model,
+        "LangChain daemon iniciado liga_inicial=%s llm=%s model_fijo=%s",
+        startup_league,
         args.llm_model,
+        MODEL_TYPE,
     )
 
     while True:
@@ -177,14 +347,90 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
             now_local = datetime.now(tz)
             now_utc = datetime.now(timezone.utc)
             state = _maybe_alert_token_issue(state, args.token_alert_cooldown_minutes)
+
+            league_id = resolve_league_id(args.league)
             has_token = _token_ok()
 
-            if _should_run(state.get("last_pre_run"), now_local, pre_h, pre_m):
-                if has_token:
-                    logger.info("Lanzando fase PRE con agente LangChain...")
-                    res = _run_phase("pre", args)
+            prev_league = str(state.get("active_league_id", ""))
+            if league_id and league_id != prev_league:
+                sel = load_selected_league() or {}
+                league_name = sel.get("league_name", "")
+                if league_name:
+                    _notify(f"Fantasy LangChain Agent: liga activa\n{league_name}")
+
+                # Reset de ciclo por cambio de liga
+                for key in (
+                    "last_pre_market_key",
+                    "last_post_market_key",
+                    "market_key",
+                    "market_close_local",
+                    "market_pre_local",
+                    "market_post_local",
+                    "market_refreshed_at",
+                    "lineup_jornada",
+                    "lineup_first_match_ts",
+                    "lineup_target_ts",
+                    "lineup_target_at",
+                    "lineup_refreshed_at",
+                    "last_lineup_applied_jornada",
+                ):
+                    state.pop(key, None)
+
+                state["active_league_id"] = league_id
+                state["active_league_name"] = league_name
+
+            if not league_id:
+                state = _maybe_alert_missing_league(state, args.token_alert_cooldown_minutes)
+                _save_state(state_path, state)
+                if stop_event:
+                    stop_event.wait(timeout=POLL_SECONDS)
+                else:
+                    time.sleep(POLL_SECONDS)
+                continue
+
+            state.pop("league_alert_at", None)
+
+            if not has_token:
+                _save_state(state_path, state)
+                if stop_event:
+                    stop_event.wait(timeout=POLL_SECONDS)
+                else:
+                    time.sleep(POLL_SECONDS)
+                continue
+
+            # 1) Refrescar horario real de mercado (liga)
+            state, schedule, market_err, market_changed = _refresh_market_schedule(
+                state,
+                league_id=league_id,
+                tz_name=tz_name,
+            )
+
+            if not schedule:
+                logger.warning("No se pudo calcular horario de mercado: %s", market_err)
+                state = _maybe_alert_market_unknown(
+                    state,
+                    args.token_alert_cooldown_minutes,
+                    market_err,
+                )
+            else:
+                market_key = schedule["market_key"]
+                close_local = schedule["close_local"]
+                pre_local = schedule["pre_local"]
+                post_local = schedule["post_local"]
+
+                if market_changed:
+                    _notify("Horario de mercado detectado\n" + schedule_message(schedule))
+
+                # PRE: 5 min antes del cierre y antes del cierre
+                if (
+                    now_local >= pre_local
+                    and now_local < close_local
+                    and str(state.get("last_pre_market_key", "")) != market_key
+                ):
+                    logger.info("Lanzando fase PRE (market_key=%s)...", market_key)
+                    res = _run_phase("pre", args, league_id)
                     output = res.get("output", "")
-                    state["last_pre_run"] = now_local.date().isoformat()
+                    state["last_pre_market_key"] = market_key
                     state["last_pre_run_at"] = now_utc.isoformat()
                     state["last_pre_output"] = output[:2000]
                     _notify(
@@ -192,15 +438,16 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                         f"Tools: {len(res.get('steps', []))}\n"
                         f"Resumen:\n{output[:1200]}"
                     )
-                else:
-                    logger.warning("PRE omitido: token no válido.")
 
-            if _should_run(state.get("last_post_run"), now_local, post_h, post_m):
-                if has_token:
-                    logger.info("Lanzando fase POST con agente LangChain...")
-                    res = _run_phase("post", args)
+                # POST: 5 min después del cierre
+                if (
+                    now_local >= post_local
+                    and str(state.get("last_post_market_key", "")) != market_key
+                ):
+                    logger.info("Lanzando fase POST (market_key=%s)...", market_key)
+                    res = _run_phase("post", args, league_id)
                     output = res.get("output", "")
-                    state["last_post_run"] = now_local.date().isoformat()
+                    state["last_post_market_key"] = market_key
                     state["last_post_run_at"] = now_utc.isoformat()
                     state["last_post_output"] = output[:2000]
                     _notify(
@@ -208,42 +455,45 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                         f"Tools: {len(res.get('steps', []))}\n"
                         f"Resumen:\n{output[:1200]}"
                     )
-                else:
-                    logger.warning("POST omitido: token no válido.")
+
+            # 2) Programación de alineación exacta: 23h55 antes
+            state, lineup_err = _refresh_lineup_target(state)
+            if lineup_err:
+                logger.info("Lineup target info: %s", lineup_err)
+            state, lineup_msg = _maybe_run_lineup(
+                state,
+                league_id=league_id,
+                dry_run=args.dry_run,
+            )
+            if lineup_msg.startswith("Fantasy LangChain LINEUP"):
+                _notify(lineup_msg)
+            elif lineup_msg:
+                logger.info(lineup_msg)
 
             _save_state(state_path, state)
-            sleep_seconds = max(10, int(args.poll_seconds))
             if stop_event:
-                stop_event.wait(timeout=sleep_seconds)
+                stop_event.wait(timeout=POLL_SECONDS)
             else:
-                time.sleep(sleep_seconds)
+                time.sleep(POLL_SECONDS)
+
         except KeyboardInterrupt:
             logger.info("Daemon LangChain detenido por usuario.")
             return
         except Exception as exc:
             logger.exception("Error en bucle LangChain daemon: %s", exc)
             _notify(f"Fantasy LangChain daemon ERROR\n{type(exc).__name__}: {exc}")
-            sleep_seconds = max(10, int(args.poll_seconds))
             if stop_event:
-                stop_event.wait(timeout=sleep_seconds)
+                stop_event.wait(timeout=POLL_SECONDS)
             else:
-                time.sleep(sleep_seconds)
+                time.sleep(POLL_SECONDS)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Daemon autónomo con agente LangChain")
-    parser.add_argument("--league", default=os.getenv("LALIGA_LEAGUE_ID", ""))
     parser.add_argument(
-        "--model",
-        default=os.getenv("AUTOPILOT_MODEL", "xgboost"),
-        choices=["xgboost", "lightgbm"],
-    )
-    parser.add_argument("--pre-time", default=os.getenv("AUTOPILOT_PRE_TIME", "07:50"))
-    parser.add_argument("--post-time", default=os.getenv("AUTOPILOT_POST_TIME", "08:10"))
-    parser.add_argument(
-        "--poll-seconds",
-        type=int,
-        default=int(os.getenv("AUTOPILOT_POLL_SECONDS", "30")),
+        "--league",
+        default="",
+        help="Liga fija opcional (modo avanzado). Si se omite, usa la selección de Telegram.",
     )
     parser.add_argument(
         "--state-file",

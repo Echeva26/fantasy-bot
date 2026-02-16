@@ -37,15 +37,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--league", default=os.getenv("LALIGA_LEAGUE_ID", ""))
     parser.add_argument(
         "--model",
-        default=os.getenv("AUTOPILOT_MODEL", "xgboost"),
+        default="xgboost",
         choices=["xgboost", "lightgbm"],
     )
-    parser.add_argument("--pre-time", default=os.getenv("AUTOPILOT_PRE_TIME", "07:50"))
-    parser.add_argument("--post-time", default=os.getenv("AUTOPILOT_POST_TIME", "08:10"))
+    parser.add_argument("--pre-time", default="07:50")
+    parser.add_argument("--post-time", default="08:10")
     parser.add_argument(
         "--poll-seconds",
         type=int,
-        default=int(os.getenv("AUTOPILOT_POLL_SECONDS", "30")),
+        default=30,
     )
     parser.add_argument(
         "--token-max-age-hours",
@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lineup-after-time",
-        default=os.getenv("LINEUP_AUTO_AFTER_TIME", os.getenv("AUTOPILOT_POST_TIME", "08:10")),
+        default=os.getenv("LINEUP_AUTO_AFTER_TIME", "08:10"),
         help="Hora local mínima para auto-set de alineación (HH:MM)",
     )
     parser.add_argument(

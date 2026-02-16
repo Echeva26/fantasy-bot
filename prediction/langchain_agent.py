@@ -2,7 +2,7 @@
 Agente LangChain para gestión autónoma de LaLiga Fantasy.
 
 Ejemplos:
-  python -m prediction.langchain_agent --phase pre --league 016615640
+  python -m prediction.langchain_agent --phase pre
   python -m prediction.langchain_agent --phase full --dry-run
   python -m prediction.langchain_agent --objective "Analiza y optimiza mi once para la jornada."
 """
@@ -16,9 +16,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+from prediction.league_selection import resolve_league_id
 from prediction.langchain_tools import FantasyAgentRuntime, build_langchain_tools
 
 logger = logging.getLogger(__name__)
+
+MODEL_TYPE = "xgboost"
 
 
 SYSTEM_PROMPT = """
@@ -119,7 +122,7 @@ def run_agent_objective(
     *,
     league_id: str,
     objective: str,
-    model_type: str = "xgboost",
+    model_type: str = MODEL_TYPE,
     llm_model: str = "gpt-5-mini",
     temperature: float = 0.1,
     max_iterations: int = 20,
@@ -166,7 +169,7 @@ def run_agent_phase(
     *,
     league_id: str,
     phase: str,
-    model_type: str = "xgboost",
+    model_type: str = MODEL_TYPE,
     llm_model: str = "gpt-5-mini",
     temperature: float = 0.1,
     max_iterations: int = 20,
@@ -190,18 +193,16 @@ def run_agent_phase(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agente LangChain para LaLiga Fantasy")
-    parser.add_argument("--league", default=os.getenv("LALIGA_LEAGUE_ID", ""))
+    parser.add_argument(
+        "--league",
+        default="",
+        help="Liga fija opcional (modo avanzado). Si se omite, usa la selección de Telegram.",
+    )
     parser.add_argument("--phase", choices=["pre", "post", "full"], default="pre")
     parser.add_argument(
         "--objective",
         default="",
         help="Si se define, reemplaza el objetivo por fase.",
-    )
-    parser.add_argument(
-        "--model",
-        default=os.getenv("AUTOPILOT_MODEL", "xgboost"),
-        choices=["xgboost", "lightgbm"],
-        help="Modelo de predicción xP.",
     )
     parser.add_argument(
         "--llm-model",
@@ -233,14 +234,19 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.league:
-        raise RuntimeError("Falta league_id: usa --league o LALIGA_LEAGUE_ID.")
+    league_id = resolve_league_id(args.league)
+    if not league_id:
+        raise RuntimeError(
+            "No se pudo resolver league_id.\n"
+            "Selecciona liga en Telegram con /ligas y /liga <nombre> "
+            "o usa --league en modo avanzado."
+        )
 
     objective = args.objective.strip() if args.objective else PHASE_OBJECTIVES[args.phase]
     result = run_agent_objective(
-        league_id=args.league,
+        league_id=league_id,
         objective=objective,
-        model_type=args.model,
+        model_type=MODEL_TYPE,
         llm_model=args.llm_model,
         temperature=args.temperature,
         max_iterations=max(1, args.max_iterations),

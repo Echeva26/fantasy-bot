@@ -1,80 +1,46 @@
 # LangChain Fantasy Agent
 
-## Objetivo
+## 1. Que hace el bot
 
-Gestionar el equipo de LaLiga Fantasy de forma autónoma usando:
-- herramientas analíticas del repo (`prediction/*`),
-- operaciones de mercado/alineación de la API (`laliga_fantasy_client.py`),
-- y un LLM orquestado por LangChain.
+El agente IA gestiona tu equipo de LaLiga Fantasy de forma autonoma:
 
-## Módulos añadidos
+- Usa tools del repositorio + API oficial para analizar equipo, mercado y expected points.
+- Modelo de prediccion fijo: `xgboost`.
+- La liga se selecciona en Telegram por nombre (`/ligas` y `/liga <nombre>`), sin configurar `LALIGA_LEAGUE_ID`.
+- Detecta automaticamente la hora de mercado desde la expiracion de jugadores publicados en la liga.
+- Ejecuta PRE siempre 5 minutos antes del cierre real de mercado.
+- Ejecuta POST siempre 5 minutos despues del cierre real de mercado.
+- Guarda alineacion exactamente 23h55 antes del inicio de jornada.
+- Si el token no esta valido, avisa por Telegram para renovarlo.
 
-- `prediction/langchain_tools.py`
-  - expone tools para snapshot, predicciones, mercado, simulación y ejecución.
-- `prediction/langchain_agent.py`
-  - ejecuta una misión puntual (`pre`, `post`, `full` o `objective` custom).
-- `prediction/langchain_autonomous.py`
-  - daemon diario PRE/POST.
-- `prediction/docker_langchain_autonomous.py`
-  - runner único (daemon LangChain + token bot Telegram).
+## 2. Como ponerlo a funcionar
 
-## Variables de entorno
+1. Crea `.env`:
+
+```bash
+cp .env.example .env
+```
+
+2. Configura `.env` con LLM y Telegram:
 
 ```env
 OPENAI_API_KEY=...
 LANGCHAIN_LLM_MODEL=gpt-5-mini
-LANGCHAIN_TEMPERATURE=0.1
-LANGCHAIN_MAX_ITERATIONS=20
-LALIGA_LEAGUE_ID=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+TELEGRAM_ALLOWED_CHAT_ID=...
 ```
 
-También reutiliza:
-- `AUTOPILOT_PRE_TIME`
-- `AUTOPILOT_POST_TIME`
-- `AUTOPILOT_POLL_SECONDS`
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_ALLOWED_CHAT_ID`
-
-## Ejecución manual
+3. Arranca el modo autonomo 24/7:
 
 ```bash
-python -m prediction.langchain_agent --phase pre --league TU_LEAGUE_ID
-python -m prediction.langchain_agent --phase post --league TU_LEAGUE_ID
-python -m prediction.langchain_agent --phase full --league TU_LEAGUE_ID
+docker compose up -d
+docker compose logs -f autonomous-bot
 ```
 
-Dry run:
+4. En Telegram:
+- Envia token (URL `jwt.ms` o JWT `eyJ...`).
+- `/ligas`
+- `/liga <nombre>`
 
-```bash
-python -m prediction.langchain_agent --phase full --league TU_LEAGUE_ID --dry-run
-```
-
-Objetivo custom:
-
-```bash
-python -m prediction.langchain_agent --league TU_LEAGUE_ID --objective "Analiza mi plantilla y ejecuta decisiones óptimas."
-```
-
-## Daemon autónomo
-
-```bash
-python -m prediction.langchain_autonomous --league TU_LEAGUE_ID
-```
-
-Estado en disco:
-- `.langchain_agent_state.json`
-
-## Runner Docker-like (un proceso)
-
-```bash
-python -m prediction.docker_langchain_autonomous --league TU_LEAGUE_ID
-```
-
-Incluye:
-- scheduler LangChain PRE/POST,
-- token bot de Telegram (si está habilitado).
-
-## Notas
-
-- El agente usa tanto herramientas de alto nivel (simulación/ejecución) como
-  herramientas directas de API (`sell`, `bid`, `buyout`).
-- Para evitar operaciones reales mientras validas comportamiento, usa `--dry-run`.
+El bot confirmara la hora detectada de mercado y los horarios automaticos PRE/POST (-5m/+5m).

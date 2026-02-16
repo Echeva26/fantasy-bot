@@ -200,7 +200,7 @@ def main() -> None:
     parser.add_argument("--model", default="xgboost", choices=["xgboost", "lightgbm"])
     parser.add_argument(
         "--after-market-time",
-        default=os.getenv("LINEUP_AUTO_AFTER_TIME", os.getenv("AUTOPILOT_POST_TIME", "08:10")),
+        default=os.getenv("LINEUP_AUTO_AFTER_TIME", "08:10"),
         help="Hora local mínima para ejecutar (HH:MM)",
     )
     parser.add_argument(

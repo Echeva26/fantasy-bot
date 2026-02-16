@@ -32,18 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Runner Docker LangChain: daemon + token bot"
     )
-    parser.add_argument("--league", default=os.getenv("LALIGA_LEAGUE_ID", ""))
     parser.add_argument(
-        "--model",
-        default=os.getenv("AUTOPILOT_MODEL", "xgboost"),
-        choices=["xgboost", "lightgbm"],
-    )
-    parser.add_argument("--pre-time", default=os.getenv("AUTOPILOT_PRE_TIME", "07:50"))
-    parser.add_argument("--post-time", default=os.getenv("AUTOPILOT_POST_TIME", "08:10"))
-    parser.add_argument(
-        "--poll-seconds",
-        type=int,
-        default=int(os.getenv("AUTOPILOT_POLL_SECONDS", "30")),
+        "--league",
+        default="",
+        help="Liga fija opcional (modo avanzado). Si se omite, usa la selección de Telegram.",
     )
     parser.add_argument(
         "--state-file",
@@ -104,18 +96,11 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.league:
-        raise RuntimeError("Falta league_id: usa --league o LALIGA_LEAGUE_ID.")
-
     stop_event = threading.Event()
     token_bot_enabled = bool(args.token_bot_enabled and not args.token_bot_disabled)
 
     daemon_args = SimpleNamespace(
         league=args.league,
-        model=args.model,
-        pre_time=args.pre_time,
-        post_time=args.post_time,
-        poll_seconds=args.poll_seconds,
         state_file=args.state_file,
         token_alert_cooldown_minutes=args.token_alert_cooldown_minutes,
         llm_model=args.llm_model,

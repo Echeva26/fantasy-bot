@@ -1,51 +1,38 @@
-# Fantasy Bot IA (Produccion)
+# Fantasy Bot IA (LangChain)
 
-Bot autonomo para LaLiga Fantasy basado en LangChain.
+## 1. Que hace el bot
 
-Por defecto (via `docker-compose.yml`) arranca:
-- daemon IA PRE/POST mercado (`prediction.docker_langchain_autonomous`),
-- bot de Telegram para renovar token (si `TOKEN_BOT_ENABLED=1`).
+El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 
-## 1. Requisitos
+- Usa herramientas del repo + API real de LaLiga Fantasy para analizar plantilla, mercado y expected points.
+- El modelo de prediccion es fijo: `xgboost`.
+- No necesitas configurar `LALIGA_LEAGUE_ID`.
+- La liga se elige en Telegram por nombre: `/ligas` y `/liga <nombre>`.
+- Al elegir la liga, el bot detecta automaticamente la hora real de cierre del mercado leyendo la expiracion de jugadores publicados.
+- PRE mercado: se ejecuta siempre 5 minutos antes del cierre real.
+- POST mercado: se ejecuta siempre 5 minutos despues del cierre real.
+- Guarda la alineacion exactamente 23 horas y 55 minutos antes del inicio de la jornada.
+- Si el token falta o caduca, te avisa por Telegram para renovarlo.
 
-- Docker + Docker Compose
-- `OPENAI_API_KEY`
-- Token de bot Telegram (recomendado)
-- `.laliga_token` valido (o renovarlo desde Telegram)
+## 2. Como ponerlo a funcionar
 
-## 2. Configuracion minima
+1. Crea el entorno:
 
 ```bash
 cp .env.example .env
 ```
 
-Configura al menos esto en `.env`:
+2. Rellena en `.env` solo lo necesario:
 
 ```env
-LALIGA_LEAGUE_ID=TU_LEAGUE_ID
-TZ=Europe/Madrid
-
-AUTOPILOT_MODEL=xgboost
-AUTOPILOT_PRE_TIME=07:50
-AUTOPILOT_POST_TIME=08:10
-AUTOPILOT_POLL_SECONDS=30
-
 OPENAI_API_KEY=...
 LANGCHAIN_LLM_MODEL=gpt-5-mini
-LANGCHAIN_TEMPERATURE=0.1
-LANGCHAIN_MAX_ITERATIONS=20
-
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 TELEGRAM_ALLOWED_CHAT_ID=...
-TOKEN_BOT_ENABLED=1
-TOKEN_BOT_POLL_TIMEOUT=50
-
-TOKEN_MAX_AGE_HOURS=23
-TOKEN_ALERT_COOLDOWN_MINUTES=360
 ```
 
-## 3. Arranque en produccion (24/7)
+3. Arranca el bot:
 
 ```bash
 docker compose build
@@ -53,73 +40,9 @@ docker compose up -d
 docker compose logs -f autonomous-bot
 ```
 
-## 4. Operacion diaria
+4. En Telegram:
+- Envia el token (JWT `eyJ...` o URL de `jwt.ms`).
+- Ejecuta `/ligas`.
+- Ejecuta `/liga <nombre>`.
 
-El agente ejecuta automaticamente:
-- PRE (`AUTOPILOT_PRE_TIME`): analiza estado del equipo/mercado y decide acciones.
-- POST (`AUTOPILOT_POST_TIME`): gestiona cierre (aceptacion de ofertas/alineacion segun decision del agente).
-
-Persistencia local:
-- `.laliga_token`
-- `.langchain_agent_state.json`
-
-## 5. Comandos utiles
-
-Iniciar:
-```bash
-docker compose up -d
-```
-
-Logs en vivo:
-```bash
-docker compose logs -f autonomous-bot
-```
-
-Reiniciar:
-```bash
-docker compose restart autonomous-bot
-```
-
-Parar:
-```bash
-docker compose down
-```
-
-## 6. Validacion segura (sin tocar mercado real)
-
-Prueba manual del agente en dry-run:
-
-```bash
-docker compose run --rm autonomous-bot \
-  python -m prediction.langchain_agent --phase full --league TU_LEAGUE_ID --dry-run
-```
-
-## 7. Renovacion de token
-
-Si el token falta/caduca, el bot avisa por Telegram.
-
-Para renovarlo, envia al bot:
-- URL completa de `jwt.ms` con token, o
-- JWT (`eyJ...`).
-
-## 8. Troubleshooting rapido
-
-No ejecuta ciclos:
-- Revisa `LALIGA_LEAGUE_ID`, `TZ`, horarios PRE/POST y logs.
-
-Errores del LLM:
-- Revisa `OPENAI_API_KEY` y `LANGCHAIN_LLM_MODEL`.
-
-No llegan mensajes Telegram:
-- Revisa `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` y que hayas escrito al bot al menos una vez.
-
-## 9. Seguridad
-
-- No subir `.env` ni `.laliga_token` al repositorio.
-- Mantener `TELEGRAM_ALLOWED_CHAT_ID` configurado.
-- No compartir claves (`OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`).
-
-## 10. Documentacion completa
-
-Detalles del agente y herramientas:
-- `docs/LANGCHAIN_AGENT.md`
+Al seleccionar la liga, el bot te respondera con la hora de mercado detectada y confirmara que PRE y POST se ejecutan 5 minutos antes/despues.
