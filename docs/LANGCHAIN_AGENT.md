@@ -11,6 +11,7 @@ El agente IA gestiona tu equipo de LaLiga Fantasy de forma autonoma:
 - Ejecuta PRE siempre 5 minutos antes del cierre real de mercado.
 - Ejecuta POST siempre 5 minutos despues del cierre real de mercado.
 - Guarda alineacion exactamente 23h55 antes del inicio de jornada.
+- Permite optimizacion manual inmediata de alineacion con `/optimizar`.
 - Si el token no esta valido, avisa por Telegram para renovarlo.
 
 ## 2. Como ponerlo a funcionar

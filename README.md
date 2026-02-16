@@ -13,7 +13,7 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 - Guarda la alineacion exactamente 23 horas y 55 minutos antes del inicio de la jornada.
 - Si el token falta o caduca, te avisa por Telegram para renovarlo.
 
-### Operativa (PRE, POST, /informe y /compraventa)
+### Operativa (PRE, POST, /informe, /compraventa y /optimizar)
 
 - PRE (automatico, 5 min antes del cierre):
   - Lo lanza el daemon LangChain.
@@ -33,6 +33,11 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
   - Ejecuta en real exactamente el plan cacheado del ultimo `/informe`.
   - Solo se permite si ese `/informe` es del mismo ciclo de mercado.
   - Si el ciclo cambió, bloquea la ejecución y obliga a lanzar `/informe` de nuevo para evitar operar con plan deprecado.
+
+- /optimizar (manual en Telegram):
+  - Recalcula y guarda en ese momento la mejor alineacion por xP.
+  - Fuerza la optimizacion inmediata (no espera a ventana PRE/POST).
+  - Guarda la alineacion y capitan en la API de LaLiga Fantasy.
 
 ## 2. Como ponerlo a funcionar
 

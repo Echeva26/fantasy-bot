@@ -27,6 +27,7 @@ from prediction.league_selection import (
     resolve_league_id,
     save_selected_league,
 )
+from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
 
@@ -903,6 +904,72 @@ def _run_langchain_agent_cmd(
         return f"Error ejecutando {cmd} (LangChain): {type(exc).__name__}: {exc}"
 
 
+def _run_optimize_lineup_cmd(
+    *,
+    bot_token: str,
+    chat_id: str,
+) -> str:
+    """
+    Recalcula y guarda la mejor alineación actual por xP (xgboost).
+    """
+    send_telegram_message(bot_token, chat_id, "Optimizando alineacion actual por xP...")
+
+    league_id, league_err = _resolve_operational_league_id()
+    if not league_id:
+        return f"Error de liga: {league_err}"
+
+    status, _ = _token_status(max_age_hours=float(os.getenv("TOKEN_MAX_AGE_HOURS", "23")))
+    if status != "ok":
+        return f"Error: token no valido ({status}). Renuevalo con /help."
+
+    selected = load_selected_league() or {}
+    league_name = str(selected.get("league_name", "")).strip() or league_id
+
+    try:
+        result = autoset_best_lineup(
+            league_id=league_id,
+            model="xgboost",
+            day_before_only=False,
+            after_market_time="00:00",
+            timezone_name=os.getenv("TZ", "Europe/Madrid"),
+            force=True,
+            dry_run=False,
+        )
+    except Exception as exc:
+        logger.exception("Error en /optimizar: %s", exc)
+        return f"Error ejecutando /optimizar: {type(exc).__name__}: {exc}"
+
+    if result.get("applied"):
+        formation = result.get("formation") or []
+        form_txt = "-".join(str(x) for x in formation) if formation else "?"
+        xp_once = result.get("xp_once")
+        xp_txt = (
+            f"{_safe_float(xp_once):.1f}"
+            if xp_once not in (None, "")
+            else "?"
+        )
+        jornada = result.get("jornada", "?")
+        text = (
+            "ALINEACION OPTIMIZADA\n"
+            f"Liga: {league_name}\n"
+            f"Jornada: {jornada}\n"
+            f"Formacion: {form_txt}\n"
+            f"xP del once: {xp_txt}\n"
+            "Estado: guardada en LaLiga Fantasy."
+        )
+        return text
+
+    if result.get("skipped"):
+        reason = str(result.get("reason", "sin detalle"))
+        return f"No se pudo optimizar ahora: {reason}"
+
+    if result.get("dry_run"):
+        return "Optimizacion en dry-run (sin cambios)."
+
+    reason = str(result.get("reason", "resultado no esperado"))
+    return f"No se pudo optimizar la alineacion: {reason}"
+
+
 def _handle_text(
     text: str,
     *,
@@ -920,6 +987,7 @@ def _handle_text(
             "• /liga <nombre> - Seleccionar liga activa\n"
             "• /informe - Generar informe IA y cachear plan del ciclo\n"
             "• /compraventa - Ejecutar en real el plan del ultimo /informe (mismo ciclo)\n\n"
+            "• /optimizar - Guardar ahora la mejor alineacion por xP\n\n"
             "Para renovar token: envia JWT (eyJ...) o URL de jwt.ms con id_token.",
         )
     if t.startswith("/status"):
@@ -954,6 +1022,16 @@ def _handle_text(
             )
         else:
             msg = "Comando /compraventa requiere contexto de bot."
+        return False, msg
+
+    if t.startswith("/optimizar"):
+        if bot_token and chat_id:
+            msg = _run_optimize_lineup_cmd(
+                bot_token=bot_token,
+                chat_id=chat_id,
+            )
+        else:
+            msg = "Comando /optimizar requiere contexto de bot."
         return False, msg
 
     token = _extract_token_from_text(text.strip())
@@ -992,6 +1070,7 @@ def _set_bot_commands(bot_token: str) -> None:
     commands = [
         {"command": "informe", "description": "Informe IA y plan cacheado (ciclo actual)"},
         {"command": "compraventa", "description": "Ejecutar plan cacheado del ultimo /informe"},
+        {"command": "optimizar", "description": "Optimizar y guardar ahora la alineacion"},
         {"command": "ligas", "description": "Listar ligas disponibles"},
         {"command": "liga", "description": "Seleccionar liga por nombre"},
         {"command": "status", "description": "Estado del token"},
