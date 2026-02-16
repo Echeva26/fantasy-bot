@@ -31,7 +31,7 @@ from prediction.lineup_autoset import autoset_best_lineup
 logger = logging.getLogger(__name__)
 MODEL_TYPE = "xgboost"
 CLAUSE_INCREASE_FACTOR = 2.0
-CLAUSE_EXPOSURE_THRESHOLD = 0.9
+CLAUSE_EXPOSURE_THRESHOLD = 0.88
 
 
 def _to_builtin(value: Any) -> Any:
@@ -597,7 +597,7 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
         key_player_team_ids = {
             str(p.get("player_team_id", "")).strip()
-            for p in sorted_players[:5]
+            for p in sorted_players[:7]
             if str(p.get("player_team_id", "")).strip()
         }
         xp_value = _safe_float(selected.get("xP"), 0.0)
