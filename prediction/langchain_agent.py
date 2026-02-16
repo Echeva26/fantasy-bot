@@ -67,17 +67,60 @@ PHASE_OBJECTIVES = {
 }
 
 
-def _load_langchain_stack() -> tuple[Any, Any, Any, Any, Any]:
+def _load_langchain_stack() -> dict[str, Any]:
+    try:
+        from langchain_openai import ChatOpenAI
+    except ModuleNotFoundError as exc:
+        missing = getattr(exc, "name", "dependencia desconocida")
+        raise RuntimeError(
+            "No se pudo cargar LangChain/LangChain-OpenAI.\n"
+            f"Falta el módulo: {missing}\n"
+            "Instalación local: .venv/bin/pip install -r requirements.txt\n"
+            "Docker: docker compose build --no-cache autonomous-bot && "
+            "docker compose up -d --force-recreate autonomous-bot"
+        ) from exc
+
+    # Compatibilidad con API legacy (<1.0)
     try:
         from langchain.agents import AgentExecutor, create_tool_calling_agent
         from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-        from langchain_openai import ChatOpenAI
+
+        return {
+            "api": "legacy",
+            "ChatOpenAI": ChatOpenAI,
+            "AgentExecutor": AgentExecutor,
+            "create_tool_calling_agent": create_tool_calling_agent,
+            "ChatPromptTemplate": ChatPromptTemplate,
+            "MessagesPlaceholder": MessagesPlaceholder,
+        }
+    except Exception:
+        pass
+
+    # Compatibilidad con API actual (>=1.0)
+    try:
+        from langchain.agents import create_agent
+
+        return {
+            "api": "modern",
+            "ChatOpenAI": ChatOpenAI,
+            "create_agent": create_agent,
+        }
+    except ModuleNotFoundError as exc:
+        missing = getattr(exc, "name", "dependencia desconocida")
+        raise RuntimeError(
+            "No se pudo cargar LangChain/LangChain-OpenAI.\n"
+            f"Falta el módulo: {missing}\n"
+            "Instalación local: .venv/bin/pip install -r requirements.txt\n"
+            "Docker: docker compose build --no-cache autonomous-bot && "
+            "docker compose up -d --force-recreate autonomous-bot"
+        ) from exc
     except Exception as exc:
         raise RuntimeError(
-            "No se pudo cargar LangChain/LangChain-OpenAI. "
-            "Instala dependencias con: pip install -r requirements.txt"
+            "No se pudo inicializar LangChain.\n"
+            "Parece una incompatibilidad de versión (API antigua vs nueva).\n"
+            "Prueba: .venv/bin/pip install -r requirements.txt\n"
+            "o fija versión compatible en requirements."
         ) from exc
-    return AgentExecutor, create_tool_calling_agent, ChatPromptTemplate, MessagesPlaceholder, ChatOpenAI
 
 
 def build_agent_executor(
@@ -88,34 +131,99 @@ def build_agent_executor(
     max_iterations: int = 20,
     verbose: bool = False,
 ):
-    (
-        AgentExecutor,
-        create_tool_calling_agent,
-        ChatPromptTemplate,
-        MessagesPlaceholder,
-        ChatOpenAI,
-    ) = _load_langchain_stack()
+    stack = _load_langchain_stack()
+    ChatOpenAI = stack["ChatOpenAI"]
+
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        raise RuntimeError(
+            "Falta OPENAI_API_KEY para ejecutar el agente LangChain.\n"
+            "Configúralo en .env y reinicia el servicio."
+        )
 
     tools = build_langchain_tools(runtime)
     llm = ChatOpenAI(model=llm_model, temperature=temperature)
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", SYSTEM_PROMPT),
-            ("human", "{input}"),
-            MessagesPlaceholder("agent_scratchpad"),
-        ]
+    if stack["api"] == "legacy":
+        AgentExecutor = stack["AgentExecutor"]
+        create_tool_calling_agent = stack["create_tool_calling_agent"]
+        ChatPromptTemplate = stack["ChatPromptTemplate"]
+        MessagesPlaceholder = stack["MessagesPlaceholder"]
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", SYSTEM_PROMPT),
+                ("human", "{input}"),
+                MessagesPlaceholder("agent_scratchpad"),
+            ]
+        )
+
+        agent = create_tool_calling_agent(llm, tools, prompt)
+        return AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=verbose,
+            max_iterations=max_iterations,
+            return_intermediate_steps=True,
+            handle_parsing_errors=True,
+        )
+
+    # API moderna de LangChain (v1+)
+    create_agent = stack["create_agent"]
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=SYSTEM_PROMPT,
+        debug=bool(verbose),
     )
 
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=verbose,
-        max_iterations=max_iterations,
-        return_intermediate_steps=True,
-        handle_parsing_errors=True,
-    )
-    return executor
+
+def _message_content(msg: Any) -> str:
+    content = getattr(msg, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if txt:
+                    parts.append(str(txt))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _extract_steps_from_messages(messages: list[Any]) -> list[dict]:
+    steps: list[dict] = []
+    for msg in messages:
+        cls_name = msg.__class__.__name__
+        if cls_name == "ToolMessage":
+            steps.append(
+                {
+                    "tool": getattr(msg, "name", "") or "tool",
+                    "tool_input": {},
+                    "observation": _message_content(msg)[:4000],
+                }
+            )
+    return steps
+
+
+def _extract_output(response: dict) -> str:
+    output = str(response.get("output", "") or "").strip()
+    if output:
+        return output
+
+    messages = response.get("messages") or []
+    for msg in reversed(messages):
+        cls_name = msg.__class__.__name__
+        if cls_name == "AIMessage":
+            text = _message_content(msg).strip()
+            if text:
+                return text
+
+    if messages:
+        return _message_content(messages[-1]).strip()
+    return ""
 
 
 def run_agent_objective(
@@ -141,18 +249,28 @@ def run_agent_objective(
         max_iterations=max_iterations,
         verbose=verbose,
     )
-    response = executor.invoke({"input": objective})
+    # API legacy: {"input": ...}
+    # API moderna: {"messages": [{"role":"user","content": ...}]}
+    try:
+        response = executor.invoke({"input": objective})
+    except Exception:
+        response = executor.invoke(
+            {"messages": [{"role": "user", "content": objective}]}
+        )
 
     steps = []
-    for step in response.get("intermediate_steps", []):
-        action, observation = step
-        steps.append(
-            {
-                "tool": getattr(action, "tool", ""),
-                "tool_input": getattr(action, "tool_input", {}),
-                "observation": str(observation)[:4000],
-            }
-        )
+    if response.get("intermediate_steps"):
+        for step in response.get("intermediate_steps", []):
+            action, observation = step
+            steps.append(
+                {
+                    "tool": getattr(action, "tool", ""),
+                    "tool_input": getattr(action, "tool_input", {}),
+                    "observation": str(observation)[:4000],
+                }
+            )
+    else:
+        steps = _extract_steps_from_messages(response.get("messages") or [])
 
     return {
         "league_id": league_id,
@@ -160,7 +278,7 @@ def run_agent_objective(
         "dry_run": dry_run,
         "model_type": model_type,
         "llm_model": llm_model,
-        "output": response.get("output", ""),
+        "output": _extract_output(response),
         "steps": steps,
     }
 

@@ -14,6 +14,23 @@ PRE_OFFSET_MINUTES = 5
 POST_OFFSET_MINUTES = 5
 
 
+def _is_league_market_item(item: dict) -> bool:
+    """
+    Detecta si un item de mercado pertenece a la liga (no a manager).
+    """
+    discr = str(item.get("discr", "")).strip().lower()
+    if "marketplayerleague" in discr:
+        return True
+
+    # Fallback defensivo: en respuestas antiguas/variantes, sellerTeam nulo
+    # suele indicar jugador publicado por la propia liga.
+    if "marketplayer" in discr:
+        seller = item.get("sellerTeam")
+        if seller in (None, "", {}):
+            return True
+    return False
+
+
 def _parse_iso_dt(raw: str | None) -> datetime | None:
     if not raw:
         return None
@@ -45,6 +62,16 @@ def _pick_close_dt(candidates: list[datetime]) -> datetime | None:
     return sorted(top)[-1]
 
 
+def _normalize_close_dt(close_dt: datetime) -> datetime:
+    """
+    Normaliza al bloque de 5 minutos anterior para evitar ruido de minutos.
+    Ejemplo: 20:18 -> 20:15.
+    """
+    dt = close_dt.replace(second=0, microsecond=0)
+    minute = dt.minute - (dt.minute % 5)
+    return dt.replace(minute=minute)
+
+
 def get_market_close_datetime_utc(league_id: str) -> tuple[datetime | None, str]:
     """
     Devuelve (market_close_utc, error_msg).
@@ -61,8 +88,10 @@ def get_market_close_datetime_utc(league_id: str) -> tuple[datetime | None, str]
     if not raw:
         return None, "mercado vacío"
 
-    league_items = [i for i in raw if str(i.get("discr", "")) == "marketPlayerLeague"]
-    source = league_items if league_items else raw
+    league_items = [i for i in raw if _is_league_market_item(i)]
+    if not league_items:
+        return None, "no se detectaron jugadores publicados por la liga en el mercado"
+    source = league_items
 
     expirations = []
     for item in source:
@@ -73,7 +102,7 @@ def get_market_close_datetime_utc(league_id: str) -> tuple[datetime | None, str]
     close_dt = _pick_close_dt(expirations)
     if not close_dt:
         return None, "no se encontró expirationDate en el mercado"
-    return close_dt, ""
+    return _normalize_close_dt(close_dt), ""
 
 
 def build_market_schedule(
