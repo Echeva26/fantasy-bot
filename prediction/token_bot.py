@@ -308,11 +308,23 @@ def _extract_agent_report_payload(output: str) -> dict:
 
 def _report_recommends_clause_protection(report_payload: dict) -> bool:
     decision = str(report_payload.get("decision_general", "")).lower()
-    if not decision:
+    siguiente = str(report_payload.get("siguiente_revision_recomendada", "")).lower()
+    riesgos = report_payload.get("riesgos_detectados", [])
+    riesgos_txt = " ".join(str(r or "") for r in riesgos) if isinstance(riesgos, list) else ""
+    riesgos_txt = riesgos_txt.lower()
+
+    all_text = " ".join([decision, siguiente, riesgos_txt]).strip()
+    if not all_text:
         return False
-    has_clause_word = any(w in decision for w in ("clausula", "cláusula", "clausul"))
-    has_action_word = any(w in decision for w in ("aument", "sub", "proteg", "blind"))
-    return has_clause_word and has_action_word
+
+    has_clause_word = any(w in all_text for w in ("clausula", "cláusula", "clausul", "buyout"))
+    has_action_word = any(w in all_text for w in ("aument", "sub", "proteg", "blind", "evaluar"))
+    has_exposure_signal = any(
+        w in all_text
+        for w in ("exposicion a clausulazo", "exposición a clausulazo", "ratio valor_vs_clausula", "muy vulnerable")
+    )
+
+    return (has_clause_word and has_action_word) or (has_clause_word and has_exposure_signal)
 
 
 def _extract_clause_names_from_report(report_payload: dict) -> list[str]:
@@ -417,6 +429,7 @@ def _build_clause_actions_from_report(report_payload: dict, steps: list[dict]) -
         if len(selected) >= 3:
             break
 
+    target_recommended = 2
     if not selected:
         exposed = sorted(
             players,
@@ -432,7 +445,24 @@ def _build_clause_actions_from_report(report_payload: dict, steps: list[dict]) -
                 continue
             selected.append(p)
             selected_ptids.add(ptid)
-            if len(selected) >= 2:
+            if len(selected) >= target_recommended:
+                break
+    elif len(selected) < target_recommended:
+        exposed = sorted(
+            players,
+            key=lambda x: _safe_float(x.get("ratio_valor_vs_clausula"), 0.0),
+            reverse=True,
+        )
+        for p in exposed:
+            ratio = _safe_float(p.get("ratio_valor_vs_clausula"), 0.0)
+            if ratio < 0.88:
+                continue
+            ptid = str(p.get("player_team_id", "")).strip()
+            if not ptid or ptid in selected_ptids:
+                continue
+            selected.append(p)
+            selected_ptids.add(ptid)
+            if len(selected) >= target_recommended:
                 break
 
     actions: list[dict] = []
