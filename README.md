@@ -18,8 +18,9 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 
 - PRE (automatico, 10 min antes del cierre):
   - Lo lanza el daemon LangChain.
-  - Analiza equipo y mercado del ciclo actual.
-  - Puede preparar/ejecutar movimientos pre-cierre (segun decision del agente y herramientas disponibles).
+  - Ejecuta el mismo flujo que `/informe` + `/compraventa` en ese ciclo.
+  - Primero genera el plan del ciclo en simulacion y despues ejecuta en real ese plan (si el daemon no esta en `dry-run`).
+  - Incluye ventas, pujas, clausulazos y subidas de clausula cuando aplique.
 
 - POST (automatico, 10 min despues del cierre):
   - Lo lanza el daemon LangChain.

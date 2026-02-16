@@ -24,6 +24,18 @@ from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.predict import get_next_round, get_sofascore_season_id
 from prediction.telegram_notify import send_telegram_message
+from prediction.token_bot import (
+    REPORT_PLAN_OBJECTIVE,
+    _build_clause_actions_from_report,
+    _build_compraventa_message,
+    _build_informe_message,
+    _execute_cached_actions,
+    _extract_agent_report_payload,
+    _extract_executable_actions,
+    _extract_latest_simulation_payload,
+    _now_iso,
+    _save_report_plan_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +183,111 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
         dry_run=args.dry_run,
         verbose=args.verbose,
     )
+
+
+def _run_pre_informe_plus_compraventa(
+    *,
+    args: argparse.Namespace,
+    league_id: str,
+    league_name: str,
+    market_key: str,
+) -> dict:
+    """
+    PRE operativo equivalente a ejecutar /informe y /compraventa en secuencia.
+    - Siempre genera plan en dry-run (como /informe).
+    - Si el daemon NO está en dry-run, ejecuta el plan resultante (como /compraventa).
+    """
+    res = run_agent_objective(
+        league_id=league_id,
+        objective=REPORT_PLAN_OBJECTIVE,
+        llm_model=args.llm_model,
+        temperature=args.temperature,
+        max_iterations=args.max_iterations,
+        dry_run=True,
+        verbose=args.verbose,
+    )
+
+    output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
+    steps = res.get("steps", []) or []
+    simulation_payload = _extract_latest_simulation_payload(steps)
+    actions, action_source = _extract_executable_actions(steps)
+    report_payload = _extract_agent_report_payload(output)
+    if not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions):
+        inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
+        if inferred_clause_actions:
+            actions.extend(inferred_clause_actions)
+            action_source = (
+                "tool_calls+report_clause_fallback"
+                if action_source == "tool_calls"
+                else "simulate_transfer_plan+report_clause_fallback"
+            )
+
+    sim_summary = (
+        simulation_payload.get("summary")
+        if isinstance(simulation_payload, dict) and isinstance(simulation_payload.get("summary"), dict)
+        else {}
+    )
+
+    cache_payload = {
+        "version": 1,
+        "created_at": _now_iso(),
+        "league_id": league_id,
+        "league_name": league_name,
+        "market_key": market_key,
+        "llm_model": str(res.get("llm_model", "")),
+        "objective": REPORT_PLAN_OBJECTIVE,
+        "output": output,
+        "action_source": action_source,
+        "simulation_summary": sim_summary,
+        "actions": actions,
+        "actions_count": len(actions),
+        "executed_at": "",
+    }
+
+    report_text = _build_informe_message(
+        league_name=league_name,
+        market_key=market_key,
+        steps=steps,
+        output=output,
+        actions=actions,
+        action_source=action_source,
+        simulation_payload=simulation_payload,
+    )
+
+    out = {
+        "output": output,
+        "steps": steps,
+        "actions": actions,
+        "action_source": action_source,
+        "report_text": report_text,
+        "compraventa_text": "",
+        "execution_summary": {},
+        "executed": False,
+        "dry_run": bool(args.dry_run),
+    }
+
+    if args.dry_run:
+        _save_report_plan_cache(cache_payload)
+        return out
+
+    if not actions:
+        _save_report_plan_cache(cache_payload)
+        return out
+
+    summary = _execute_cached_actions(league_id=league_id, actions=actions)
+    cache_payload["executed_at"] = _now_iso()
+    cache_payload["execution_summary"] = summary
+    _save_report_plan_cache(cache_payload)
+
+    out["execution_summary"] = summary
+    out["executed"] = True
+    out["compraventa_text"] = _build_compraventa_message(
+        league_name=league_name,
+        market_key=market_key,
+        action_source=action_source,
+        summary=summary,
+    )
+    return out
 
 
 def _market_schedule_from_state(state: dict) -> dict | None:
@@ -428,16 +545,48 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                     and str(state.get("last_pre_market_key", "")) != market_key
                 ):
                     logger.info("Lanzando fase PRE (market_key=%s)...", market_key)
-                    res = _run_phase("pre", args, league_id)
-                    output = res.get("output", "")
+                    selected = load_selected_league() or {}
+                    league_name = str(selected.get("league_name", "")).strip() or league_id
+
+                    if args.pre_objective.strip():
+                        # Modo avanzado: objetivo PRE custom.
+                        res = _run_phase("pre", args, league_id)
+                        output = str(res.get("output", "") or "")
+                        _notify(
+                            "Fantasy LangChain (PRE) completado\n"
+                            f"Tools: {len(res.get('steps', []))}\n"
+                            f"Resumen:\n{output[:1200]}"
+                        )
+                    else:
+                        # Flujo estándar solicitado: PRE = /informe + /compraventa.
+                        pre_run = _run_pre_informe_plus_compraventa(
+                            args=args,
+                            league_id=league_id,
+                            league_name=league_name,
+                            market_key=market_key,
+                        )
+                        output = str(pre_run.get("output", "") or "")
+                        report_text = str(pre_run.get("report_text", "") or "").strip()
+                        if report_text:
+                            _notify(report_text)
+                        if pre_run.get("executed"):
+                            resume_text = str(pre_run.get("compraventa_text", "") or "").strip()
+                            if resume_text:
+                                _notify(resume_text)
+                        elif args.dry_run:
+                            _notify(
+                                "Fantasy LangChain (PRE)\n"
+                                "Dry-run activo: plan generado y cacheado sin ejecución real."
+                            )
+                        else:
+                            _notify(
+                                "Fantasy LangChain (PRE)\n"
+                                "El informe no dejó acciones ejecutables para este ciclo."
+                            )
+
                     state["last_pre_market_key"] = market_key
                     state["last_pre_run_at"] = now_utc.isoformat()
                     state["last_pre_output"] = output[:2000]
-                    _notify(
-                        "Fantasy LangChain (PRE) completado\n"
-                        f"Tools: {len(res.get('steps', []))}\n"
-                        f"Resumen:\n{output[:1200]}"
-                    )
 
                 # POST: 10 min después del cierre
                 if (

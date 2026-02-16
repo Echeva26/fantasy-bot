@@ -8,7 +8,7 @@ El agente IA gestiona tu equipo de LaLiga Fantasy de forma autonoma:
 - Modelo de prediccion fijo: `xgboost`.
 - La liga se selecciona en Telegram por nombre (`/ligas` y `/liga <nombre>`), sin configurar `LALIGA_LEAGUE_ID`.
 - Detecta automaticamente la hora de mercado desde la expiracion de jugadores publicados en la liga.
-- Ejecuta PRE siempre 10 minutos antes del cierre real de mercado.
+- Ejecuta PRE siempre 10 minutos antes del cierre real de mercado (flujo conjunto de `/informe` + `/compraventa` del ciclo actual).
 - Ejecuta POST siempre 10 minutos despues del cierre real de mercado.
 - Guarda alineacion exactamente 23h55 antes del inicio de jornada.
 - Permite optimizacion manual inmediata de alineacion con `/optimizar`.
