@@ -294,8 +294,10 @@ def _run_pre_market_cmd(analysis_only: bool, bot_token: str, chat_id: str) -> st
     )
     try:
         result = run_pre_market(args, skip_notify=True)
-        # Enviar informe completo como mensaje para verlo en el chat
-        if result.report_content:
+        # Enviar informe optimizado para Telegram.
+        if result.report_telegram:
+            send_telegram_message(bot_token, chat_id, result.report_telegram)
+        elif result.report_content:
             send_telegram_message(bot_token, chat_id, result.report_content)
         return result.message
     except Exception as exc:

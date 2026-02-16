@@ -42,7 +42,50 @@ def _chunk_text(text: str, size: int = TELEGRAM_MAX_LEN) -> Iterable[str]:
     text = (text or "").strip()
     if not text:
         return []
-    return (text[i : i + size] for i in range(0, len(text), size))
+
+    def _split_long_line(line: str) -> list[str]:
+        if len(line) <= size:
+            return [line]
+
+        parts: list[str] = []
+        rest = line
+        while len(rest) > size:
+            cut = rest.rfind(" ", 0, size + 1)
+            if cut < int(size * 0.6):
+                cut = size
+            parts.append(rest[:cut].rstrip())
+            rest = rest[cut:].lstrip()
+        if rest:
+            parts.append(rest)
+        return parts
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    for raw_line in text.splitlines():
+        for line in _split_long_line(raw_line.rstrip()):
+            add_len = len(line) + (1 if current_lines else 0)
+            if current_lines and (current_len + add_len > size):
+                chunk = "\n".join(current_lines).strip()
+                if chunk:
+                    chunks.append(chunk)
+                current_lines = [line]
+                current_len = len(line)
+            else:
+                if current_lines:
+                    current_lines.append(line)
+                    current_len += 1 + len(line)
+                else:
+                    current_lines = [line]
+                    current_len = len(line)
+
+    if current_lines:
+        chunk = "\n".join(current_lines).strip()
+        if chunk:
+            chunks.append(chunk)
+
+    return chunks
 
 
 def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:

@@ -31,14 +31,37 @@ TELEGRAM_CHAT_ID=...
 TELEGRAM_ALLOWED_CHAT_ID=...
 ```
 
-3. Arranca el modo autonomo 24/7:
+### Obtener variables de Telegram
+
+1. Crea el bot con `@BotFather`:
+- Abre `@BotFather` en Telegram.
+- Ejecuta `/newbot`.
+- Sigue el asistente y copia el token.
+- Ese valor es `TELEGRAM_BOT_TOKEN`.
+
+2. Obtén tu `chat_id`:
+- Abre chat con tu bot y envía `/start`.
+- Ejecuta:
+
+```bash
+curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates"
+```
+
+- Busca `message.chat.id` en la respuesta.
+- Ese valor es `TELEGRAM_CHAT_ID`.
+
+3. Define `TELEGRAM_ALLOWED_CHAT_ID`:
+- Para chat privado, usa el mismo valor que `TELEGRAM_CHAT_ID`.
+- Para grupo, añade el bot al grupo, envía un mensaje y vuelve a ejecutar `getUpdates` para obtener el `chat.id` del grupo.
+
+4. Arranca el modo autonomo 24/7:
 
 ```bash
 docker compose up -d
 docker compose logs -f autonomous-bot
 ```
 
-4. En Telegram:
+5. En Telegram:
 - Envia token (URL `jwt.ms` o JWT `eyJ...`).
 - `/ligas`
 - `/liga <nombre>`

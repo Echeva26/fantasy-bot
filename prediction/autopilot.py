@@ -36,6 +36,7 @@ class PreRunResult:
     errores: list[str]
     message: str = ""
     report_content: str = ""
+    report_telegram: str = ""
 
 
 def _money(value: int | float | None) -> str:
@@ -58,6 +59,99 @@ def _save_report(report: str, jornada: str | int, output: str | None) -> Path:
     out_path = Path(output) if output else Path(__file__).parent.parent / f"informe_j{jornada}.md"
     out_path.write_text(report, encoding="utf-8")
     return out_path
+
+
+def _build_telegram_report(
+    *,
+    result: dict,
+    movimientos: int,
+    ventas_fase1: int,
+    compras: int,
+    errores: list[str],
+    analysis_only: bool,
+) -> str:
+    snapshot = result.get("snapshot", {})
+    team = result.get("team_analysis", {})
+    plan = result.get("transfer_plan", {})
+    jornada = result.get("jornada", "?")
+
+    xp_now = float(team.get("xp_total_once", 0) or 0)
+    xp_post = float(plan.get("xp_total_post", xp_now) or 0)
+    diff = xp_post - xp_now
+    saldo_now = int(team.get("saldo", 0) or 0)
+    saldo_post = int(plan.get("saldo_final", saldo_now) or 0)
+
+    lines: list[str] = [
+        f"INFORME FANTASY | Jornada {jornada}",
+        f"Liga: {snapshot.get('league_name', '?')}",
+        f"Manager: {team.get('manager_name', '?')}",
+        "",
+        "RESUMEN",
+        f"- xP once: {xp_now:.1f} -> {xp_post:.1f} ({diff:+.1f})",
+        f"- Saldo: {_money(saldo_now)} -> {_money(saldo_post)}",
+        f"- Movimientos recomendados: {movimientos}",
+    ]
+
+    if not analysis_only:
+        lines.append(f"- Ejecutado: ventas {ventas_fase1} | compras {compras}")
+        if errores:
+            lines.append(f"- Errores de ejecucion: {len(errores)}")
+
+    problemas = team.get("problemas") or []
+    if problemas:
+        lines.append("")
+        lines.append(f"ALERTAS ({min(len(problemas), 5)})")
+        for p in problemas[:5]:
+            jugador = str(p.get("jugador", "?"))
+            problema = str(p.get("problema", "?"))
+            lines.append(f"- {jugador}: {problema}")
+
+    movs = plan.get("movimientos") or []
+    lines.append("")
+    lines.append("PLAN RECOMENDADO")
+    if not movs:
+        lines.append("- No hay movimientos. Plantilla ya optimizada para la jornada.")
+    else:
+        for mov in movs[:8]:
+            paso = mov.get("paso", "?")
+            venta = mov.get("venta") or {}
+            compra = mov.get("compra") or {}
+            saldo_antes = _money(mov.get("saldo_antes", 0))
+            saldo_despues = _money(mov.get("saldo_despues", 0))
+            ganancia = float(mov.get("ganancia_xp", 0) or 0)
+
+            if venta and compra:
+                lines.append(
+                    f"- Paso {paso}: VENDER {venta.get('nombre', '?')} -> "
+                    f"COMPRAR {compra.get('nombre', '?')} ({ganancia:+.1f} xP)"
+                )
+            elif venta:
+                lines.append(
+                    f"- Paso {paso}: VENDER {venta.get('nombre', '?')} ({ganancia:+.1f} xP)"
+                )
+            elif compra:
+                lines.append(
+                    f"- Paso {paso}: COMPRAR {compra.get('nombre', '?')} ({ganancia:+.1f} xP)"
+                )
+            else:
+                lines.append(f"- Paso {paso}: sin acciones")
+            lines.append(f"  Saldo: {saldo_antes} -> {saldo_despues}")
+
+        if len(movs) > 8:
+            lines.append(f"- ... y {len(movs) - 8} pasos mas")
+
+    once_post = plan.get("once_post") or []
+    if once_post:
+        lines.append("")
+        lines.append(f"ONCE IDEAL ({plan.get('formacion_post', '4-3-3')})")
+        for j in once_post[:11]:
+            pos = str(j.get("posicion", "?"))
+            nombre = str(j.get("nombre", "?"))
+            xp = float(j.get("xP", 0) or 0)
+            nuevo = " [nuevo]" if j.get("nuevo_fichaje") else ""
+            lines.append(f"- {pos} {nombre}: {xp:.1f}xP{nuevo}")
+
+    return "\n".join(lines)
 
 
 def run_pre_market(
@@ -99,6 +193,15 @@ def run_pre_market(
     if not skip_notify:
         _notify_if_configured(msg)
 
+    report_telegram = _build_telegram_report(
+        result=result,
+        movimientos=movimientos,
+        ventas_fase1=ventas_fase1,
+        compras=compras,
+        errores=errores,
+        analysis_only=bool(args.analysis_only),
+    )
+
     return PreRunResult(
         report_path=report_path,
         movimientos=movimientos,
@@ -107,6 +210,7 @@ def run_pre_market(
         errores=errores,
         message=msg,
         report_content=report,
+        report_telegram=report_telegram,
     )
 
 

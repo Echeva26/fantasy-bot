@@ -6,7 +6,6 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 
 - Usa herramientas del repo + API real de LaLiga Fantasy para analizar plantilla, mercado y expected points.
 - El modelo de prediccion es fijo: `xgboost`.
-- No necesitas configurar `LALIGA_LEAGUE_ID`.
 - La liga se elige en Telegram por nombre: `/ligas` y `/liga <nombre>`.
 - Al elegir la liga, el bot detecta automaticamente la hora real de cierre del mercado leyendo la expiracion de jugadores publicados.
 - PRE mercado: se ejecuta siempre 5 minutos antes del cierre real.
@@ -32,7 +31,30 @@ TELEGRAM_CHAT_ID=...
 TELEGRAM_ALLOWED_CHAT_ID=...
 ```
 
-3. Arranca el bot:
+### Obtener variables de Telegram
+
+1. Crea el bot con `@BotFather`:
+- En Telegram abre `@BotFather`.
+- Ejecuta `/newbot`.
+- Sigue los pasos y copia el token que te da.
+- Ese valor es `TELEGRAM_BOT_TOKEN`.
+
+2. Obtén tu `chat_id`:
+- Abre chat con tu bot y envía `/start`.
+- Ejecuta:
+
+```bash
+curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates"
+```
+
+- Busca el campo `message.chat.id` en la respuesta.
+- Ese valor es `TELEGRAM_CHAT_ID`.
+
+3. Define `TELEGRAM_ALLOWED_CHAT_ID`:
+- Si solo quieres permitir tu chat, usa el mismo valor que `TELEGRAM_CHAT_ID`.
+- Si usas grupo, añade el bot al grupo, envía un mensaje y vuelve a ejecutar `getUpdates` para tomar el `chat.id` del grupo.
+
+4. Arranca el bot:
 
 ```bash
 docker compose build
@@ -40,7 +62,7 @@ docker compose up -d
 docker compose logs -f autonomous-bot
 ```
 
-4. En Telegram:
+5. En Telegram:
 - Envia el token (JWT `eyJ...` o URL de `jwt.ms`).
 - Ejecuta `/ligas`.
 - Ejecuta `/liga <nombre>`.
