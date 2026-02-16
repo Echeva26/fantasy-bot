@@ -9,5 +9,5 @@ services:
       - .env
     environment:
       - TZ=${TZ:-Europe/Madrid}
-    command: ["python", "-m", "prediction.docker_autonomous"]
+    command: ["python", "-m", "prediction.docker_langchain_autonomous"]
     restart: unless-stopped
