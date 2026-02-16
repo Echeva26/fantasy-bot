@@ -14,13 +14,14 @@ import re
 import time
 import unicodedata
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Event
 from urllib.parse import parse_qs, urlparse
 
 import requests
 
 from laliga_fantasy_client import LaLigaFantasyClient, TOKEN_FILE, load_token, save_token
-from prediction.autopilot import run_pre_market
+from prediction.langchain_agent import run_agent_objective
 from prediction.league_selection import (
     load_selected_league,
     resolve_league_id,
@@ -32,6 +33,145 @@ from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_mes
 logger = logging.getLogger(__name__)
 
 JWT_RE = re.compile(r"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)")
+REPORT_PLAN_CACHE_FILE = Path(".langchain_last_report_plan.json")
+EXECUTABLE_TOOLS = {"sell_player_phase1_tool", "place_bid_tool", "buyout_player_tool"}
+REPORT_PLAN_OBJECTIVE = (
+    "Genera el informe del ciclo actual y un plan EJECUTABLE de compraventa.\n"
+    "Reglas obligatorias:\n"
+    "1) Usa snapshot_summary, my_squad, market_opportunities y simulate_transfer_plan.\n"
+    "2) Simula EXACTAMENTE las operaciones finales llamando las herramientas:\n"
+    "   sell_player_phase1_tool, place_bid_tool, buyout_player_tool.\n"
+    "3) Respeta el orden real de ejecución y no uses accept_closed_offers.\n"
+    "4) Como dry_run está activo, no habrá cambios reales ahora.\n"
+    "5) Devuelve resumen breve y claro en español."
+)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except Exception:
+        return int(default)
+
+
+def _tool_input_dict(raw: object) -> dict:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            val = json.loads(raw)
+            if isinstance(val, dict):
+                return val
+        except Exception:
+            return {}
+    return {}
+
+
+def _extract_executable_actions(steps: list[dict]) -> list[dict]:
+    actions: list[dict] = []
+    for step in steps:
+        tool_name = str(step.get("tool", "")).strip()
+        if tool_name not in EXECUTABLE_TOOLS:
+            continue
+        actions.append(
+            {
+                "tool": tool_name,
+                "tool_input": _tool_input_dict(step.get("tool_input")),
+            }
+        )
+    return actions
+
+
+def _market_key_for_league(league_id: str) -> tuple[str, str]:
+    sched, err = build_market_schedule(
+        league_id,
+        timezone_name=os.getenv("TZ", "Europe/Madrid"),
+    )
+    if not sched:
+        return "", err
+    return str(sched.get("market_key", "")).strip(), ""
+
+
+def _load_report_plan_cache(path: Path = REPORT_PLAN_CACHE_FILE) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _save_report_plan_cache(payload: dict, path: Path = REPORT_PLAN_CACHE_FILE) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
+    client = LaLigaFantasyClient.from_saved_token(league_id=league_id)
+    summary = {
+        "actions_total": len(actions),
+        "actions_ok": 0,
+        "ventas": 0,
+        "pujas": 0,
+        "clausulazos": 0,
+        "errors": [],
+    }
+
+    for idx, action in enumerate(actions, 1):
+        tool = str(action.get("tool", "")).strip()
+        payload = _tool_input_dict(action.get("tool_input"))
+        try:
+            if tool == "sell_player_phase1_tool":
+                player_team_id = str(payload.get("player_team_id", "")).strip()
+                sale_price = _safe_int(payload.get("sale_price"), 0)
+                if not player_team_id or sale_price <= 0:
+                    raise ValueError("faltan player_team_id o sale_price")
+                client.sell_player_phase1(player_team_id=player_team_id, price=sale_price)
+                summary["actions_ok"] += 1
+                summary["ventas"] += 1
+                continue
+
+            if tool == "place_bid_tool":
+                market_item_id = str(payload.get("market_item_id", "")).strip()
+                amount = _safe_int(payload.get("amount"), 0)
+                player_id = payload.get("player_id")
+                player_id_int = _safe_int(player_id, 0) if player_id not in (None, "") else 0
+                if not market_item_id or amount <= 0:
+                    raise ValueError("faltan market_item_id o amount")
+                client.buy_player_bid(
+                    market_player_id=market_item_id,
+                    amount=amount,
+                    player_id=player_id_int or None,
+                )
+                summary["actions_ok"] += 1
+                summary["pujas"] += 1
+                continue
+
+            if tool == "buyout_player_tool":
+                player_team_id = str(payload.get("player_team_id", "")).strip()
+                clause = payload.get("clause_to_pay")
+                clause_int = _safe_int(clause, 0) if clause not in (None, "") else 0
+                if not player_team_id:
+                    raise ValueError("falta player_team_id")
+                client.buy_player_clausulazo(
+                    player_team_id=player_team_id,
+                    buyout_clause_to_pay=clause_int or None,
+                )
+                summary["actions_ok"] += 1
+                summary["clausulazos"] += 1
+                continue
+
+            summary["errors"].append(f"Paso {idx}: tool no soportada ({tool})")
+        except Exception as exc:
+            summary["errors"].append(f"Paso {idx} ({tool}): {type(exc).__name__}: {exc}")
+
+    return summary
 
 
 def _api(bot_token: str, method: str, payload: dict | None = None) -> dict:
@@ -265,15 +405,23 @@ def _cmd_select_league(raw_text: str) -> str:
     )
 
 
-def _run_pre_market_cmd(analysis_only: bool, bot_token: str, chat_id: str) -> str:
-    """Ejecuta informe o compraventa, envía mensaje intermedio y devuelve resumen."""
-    cmd = "informe" if analysis_only else "compraventa"
+def _run_langchain_agent_cmd(
+    *,
+    bot_token: str,
+    chat_id: str,
+    dry_run: bool,
+) -> str:
+    """
+    Ejecuta LangChain para informe (dry-run) o compraventa real (no dry-run).
+    """
     send_telegram_message(
         bot_token,
         chat_id,
-        "Generando informe..." if analysis_only
-        else "Ejecutando compraventa (recomendaciones del bot)...",
+        "Generando informe IA (LangChain)..."
+        if dry_run
+        else "Ejecutando plan IA de compraventa (LangChain)...",
     )
+
     league_id, league_err = _resolve_operational_league_id()
     if not league_id:
         return f"Error de liga: {league_err}"
@@ -282,27 +430,122 @@ def _run_pre_market_cmd(analysis_only: bool, bot_token: str, chat_id: str) -> st
     if status != "ok":
         return f"Error: token no valido ({status}). Renuevalo con /help."
 
-    from types import SimpleNamespace
-
-    args = SimpleNamespace(
-        league=league_id,
-        model="xgboost",
-        snapshot=None,
-        output=None,
-        dry_run=False,
-        analysis_only=analysis_only,
-    )
     try:
-        result = run_pre_market(args, skip_notify=True)
-        # Enviar informe optimizado para Telegram.
-        if result.report_telegram:
-            send_telegram_message(bot_token, chat_id, result.report_telegram)
-        elif result.report_content:
-            send_telegram_message(bot_token, chat_id, result.report_content)
-        return result.message
+        market_key, market_err = _market_key_for_league(league_id)
+        if not market_key:
+            return f"No se pudo resolver ciclo de mercado actual: {market_err}"
+
+        selected = load_selected_league() or {}
+        league_name = str(selected.get("league_name", "")).strip() or league_id
+
+        if dry_run:
+            res = run_agent_objective(
+                league_id=league_id,
+                objective=REPORT_PLAN_OBJECTIVE,
+                llm_model=os.getenv("LANGCHAIN_LLM_MODEL", "gpt-5-mini"),
+                temperature=float(os.getenv("LANGCHAIN_TEMPERATURE", "0.1")),
+                max_iterations=max(1, int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20"))),
+                dry_run=True,
+                verbose=False,
+            )
+
+            output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
+            steps = res.get("steps", []) or []
+            actions = _extract_executable_actions(steps)
+
+            cache_payload = {
+                "version": 1,
+                "created_at": _now_iso(),
+                "league_id": league_id,
+                "league_name": league_name,
+                "market_key": market_key,
+                "llm_model": str(res.get("llm_model", "")),
+                "objective": REPORT_PLAN_OBJECTIVE,
+                "output": output,
+                "actions": actions,
+                "actions_count": len(actions),
+                "executed_at": "",
+            }
+            _save_report_plan_cache(cache_payload)
+
+            tool_names = []
+            for s in steps:
+                name = str(s.get("tool", "")).strip()
+                if name and name not in tool_names:
+                    tool_names.append(name)
+            tools_txt = ", ".join(tool_names[:12]) if tool_names else "sin tools registradas"
+            if len(tool_names) > 12:
+                tools_txt += ", ..."
+
+            report_text = (
+                "INFORME IA (LangChain)\n"
+                f"Liga: {league_name}\n"
+                "Modo: simulacion (dry-run)\n"
+                f"Ciclo mercado: {market_key}\n"
+                f"Plan cacheado: {len(actions)} acciones ejecutables\n"
+                "Usa /compraventa para ejecutar ESTE plan en este mismo ciclo.\n"
+                f"Tools usadas: {len(steps)}\n"
+                f"Tools: {tools_txt}\n\n"
+                f"{output[:12000]}"
+            )
+            send_telegram_message(bot_token, chat_id, report_text)
+            return "Informe IA generado y plan cacheado para este ciclo."
+
+        # /compraventa: ejecutar EXACTAMENTE el último plan de /informe del mismo ciclo.
+        cache = _load_report_plan_cache()
+        if not cache:
+            return (
+                "No hay plan cacheado de /informe para ejecutar.\n"
+                "Primero ejecuta /informe en este ciclo de mercado."
+            )
+
+        cached_league = str(cache.get("league_id", "")).strip()
+        cached_market_key = str(cache.get("market_key", "")).strip()
+        if cached_league != league_id or cached_market_key != market_key:
+            return (
+                "El ultimo /informe no pertenece al ciclo de mercado actual.\n"
+                f"Actual: {market_key} | Informe cacheado: {cached_market_key or '(sin ciclo)'}\n"
+                "Vuelve a ejecutar /informe y despues /compraventa."
+            )
+
+        if str(cache.get("executed_at", "")).strip():
+            return "Este plan ya fue ejecutado en este ciclo. Ejecuta /informe para generar uno nuevo."
+
+        actions = cache.get("actions", [])
+        if not isinstance(actions, list) or not actions:
+            return (
+                "El /informe de este ciclo no dejó acciones ejecutables.\n"
+                "Genera un nuevo /informe y revisa que incluya plan de compraventa."
+            )
+
+        summary = _execute_cached_actions(league_id=league_id, actions=actions)
+        cache["executed_at"] = _now_iso()
+        cache["execution_summary"] = summary
+        _save_report_plan_cache(cache)
+
+        errors = summary.get("errors", []) or []
+        resume = (
+            "COMPRAVENTA IA (LangChain)\n"
+            f"Liga: {league_name}\n"
+            f"Ciclo mercado: {market_key}\n"
+            f"Acciones planificadas: {summary.get('actions_total', 0)}\n"
+            f"Acciones OK: {summary.get('actions_ok', 0)}\n"
+            f"Ventas fase1: {summary.get('ventas', 0)}\n"
+            f"Pujas: {summary.get('pujas', 0)}\n"
+            f"Clausulazos: {summary.get('clausulazos', 0)}"
+        )
+        if errors:
+            preview = "\n".join(f"- {e}" for e in errors[:8])
+            resume += f"\nErrores ({len(errors)}):\n{preview}"
+
+        send_telegram_message(bot_token, chat_id, resume)
+        if errors:
+            return f"Compraventa ejecutada con errores ({len(errors)})."
+        return "Compraventa ejecutada con el plan cacheado del informe."
     except Exception as exc:
-        logger.exception("Error en /%s: %s", cmd, exc)
-        return f"Error ejecutando /{cmd}: {type(exc).__name__}: {exc}"
+        cmd = "/informe" if dry_run else "/compraventa"
+        logger.exception("Error en %s (LangChain): %s", cmd, exc)
+        return f"Error ejecutando {cmd} (LangChain): {type(exc).__name__}: {exc}"
 
 
 def _handle_text(
@@ -320,8 +563,8 @@ def _handle_text(
             "• /status - Estado del token\n"
             "• /ligas - Listar ligas disponibles\n"
             "• /liga <nombre> - Seleccionar liga activa\n"
-            "• /informe - Generar informe de predicciones ahora\n"
-            "• /compraventa - Ejecutar recomendaciones (ventas+compras)\n\n"
+            "• /informe - Generar informe IA y cachear plan del ciclo\n"
+            "• /compraventa - Ejecutar en real el plan del ultimo /informe (mismo ciclo)\n\n"
             "Para renovar token: envia JWT (eyJ...) o URL de jwt.ms con id_token.",
         )
     if t.startswith("/status"):
@@ -338,14 +581,22 @@ def _handle_text(
 
     if t.startswith("/informe"):
         if bot_token and chat_id:
-            msg = _run_pre_market_cmd(analysis_only=True, bot_token=bot_token, chat_id=chat_id)
+            msg = _run_langchain_agent_cmd(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                dry_run=True,
+            )
         else:
             msg = "Comando /informe requiere contexto de bot."
         return False, msg
 
     if t.startswith("/compraventa"):
         if bot_token and chat_id:
-            msg = _run_pre_market_cmd(analysis_only=False, bot_token=bot_token, chat_id=chat_id)
+            msg = _run_langchain_agent_cmd(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                dry_run=False,
+            )
         else:
             msg = "Comando /compraventa requiere contexto de bot."
         return False, msg
@@ -384,8 +635,8 @@ def _handle_text(
 def _set_bot_commands(bot_token: str) -> None:
     """Configura el menú de comandos predefinidos en Telegram."""
     commands = [
-        {"command": "informe", "description": "Generar informe de predicciones"},
-        {"command": "compraventa", "description": "Ejecutar recomendaciones ventas+compras"},
+        {"command": "informe", "description": "Informe IA y plan cacheado (ciclo actual)"},
+        {"command": "compraventa", "description": "Ejecutar plan cacheado del ultimo /informe"},
         {"command": "ligas", "description": "Listar ligas disponibles"},
         {"command": "liga", "description": "Seleccionar liga por nombre"},
         {"command": "status", "description": "Estado del token"},

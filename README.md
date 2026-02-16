@@ -13,6 +13,27 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 - Guarda la alineacion exactamente 23 horas y 55 minutos antes del inicio de la jornada.
 - Si el token falta o caduca, te avisa por Telegram para renovarlo.
 
+### Operativa (PRE, POST, /informe y /compraventa)
+
+- PRE (automatico, 5 min antes del cierre):
+  - Lo lanza el daemon LangChain.
+  - Analiza equipo y mercado del ciclo actual.
+  - Puede preparar/ejecutar movimientos pre-cierre (segun decision del agente y herramientas disponibles).
+
+- POST (automatico, 5 min despues del cierre):
+  - Lo lanza el daemon LangChain.
+  - Ejecuta tareas de post-cierre (por ejemplo aceptar ofertas cerradas) y ajustes de gestion.
+
+- /informe (manual en Telegram):
+  - Ejecuta el agente IA en simulacion (`dry-run`), sin tocar mercado real.
+  - Genera un informe del ciclo actual.
+  - Guarda un plan ejecutable en cache para ese ciclo de mercado.
+
+- /compraventa (manual en Telegram):
+  - Ejecuta en real exactamente el plan cacheado del ultimo `/informe`.
+  - Solo se permite si ese `/informe` es del mismo ciclo de mercado.
+  - Si el ciclo cambió, bloquea la ejecución y obliga a lanzar `/informe` de nuevo para evitar operar con plan deprecado.
+
 ## 2. Como ponerlo a funcionar
 
 1. Crea el entorno:

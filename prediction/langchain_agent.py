@@ -195,13 +195,36 @@ def _message_content(msg: Any) -> str:
 
 def _extract_steps_from_messages(messages: list[Any]) -> list[dict]:
     steps: list[dict] = []
+    pending_calls: dict[str, dict[str, Any]] = {}
     for msg in messages:
         cls_name = msg.__class__.__name__
+        if cls_name == "AIMessage":
+            for call in getattr(msg, "tool_calls", []) or []:
+                call_id = str(call.get("id", "")).strip()
+                name = str(call.get("name", "")).strip() or "tool"
+                args = call.get("args", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {"raw": args}
+                if not isinstance(args, dict):
+                    args = {}
+                if call_id:
+                    pending_calls[call_id] = {
+                        "tool": name,
+                        "tool_input": args,
+                    }
         if cls_name == "ToolMessage":
+            call_id = str(getattr(msg, "tool_call_id", "")).strip()
+            call_meta = pending_calls.get(call_id, {})
+            tool_name = str(call_meta.get("tool", "")).strip()
+            if not tool_name:
+                tool_name = str(getattr(msg, "name", "")).strip() or "tool"
             steps.append(
                 {
-                    "tool": getattr(msg, "name", "") or "tool",
-                    "tool_input": {},
+                    "tool": tool_name,
+                    "tool_input": call_meta.get("tool_input", {}) or {},
                     "observation": _message_content(msg)[:4000],
                 }
             )
