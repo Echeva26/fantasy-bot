@@ -34,7 +34,6 @@ import os
 import pathlib
 import re
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
@@ -79,7 +78,6 @@ B2C_POLICY = "b2c_1a_5ulaip_parametrized_signin"
 B2C_CLIENT_ID = "cf110827-e4a9-4d20-affb-8ea0c6f15f94"
 B2C_AUTHORIZE_URL = f"https://login.laliga.es/{B2C_TENANT}/oauth2/v2.0/authorize"
 B2C_TOKEN_URL = f"https://login.laliga.es/{B2C_TENANT}/oauth2/v2.0/token"
-B2C_REDIRECT_URI = "authredirect://com.lfp.laligafantasy"
 B2C_SCOPE = f"openid {B2C_CLIENT_ID} offline_access"
 
 

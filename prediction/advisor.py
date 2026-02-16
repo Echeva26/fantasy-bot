@@ -25,7 +25,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from prediction.predict import predict, load_model
+from prediction.predict import predict
 
 logger = logging.getLogger(__name__)
 

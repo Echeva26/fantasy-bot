@@ -40,7 +40,6 @@ import json
 import logging
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -247,28 +246,6 @@ def build_features(dataset: dict) -> pd.DataFrame:
     )
 
     return result
-
-
-def get_feature_columns() -> list[str]:
-    """Devuelve la lista de columnas feature (sin meta ni target)."""
-    return [
-        "media_pts_3j", "media_pts_5j",
-        "media_min_3j", "media_min_5j",
-        "tendencia_pts",
-        "titular_pct_5j",
-        "puntos_max_5j", "puntos_min_5j",
-        "media_goles_5j", "media_asistencias_5j",
-        "media_recuperaciones_5j", "media_tiros_5j", "media_paradas_5j",
-        "fdr_rival",
-        "goles_contra_rival", "goles_favor_rival",
-        "posicion_rival",
-        "es_local",
-        "posicion_id",
-        "valor_mercado_norm",
-        "prob_victoria", "prob_derrota",
-        "prob_clean_sheet", "prob_btts",
-    ]
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

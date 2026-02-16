@@ -17,5 +17,5 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-# Comando por defecto solo muestra ayuda.
-CMD ["python", "-m", "prediction.full_agent", "--help"]
+# Comando por defecto: muestra ayuda del runner LangChain principal.
+CMD ["python", "-m", "prediction.docker_langchain_autonomous", "--help"]

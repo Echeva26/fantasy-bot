@@ -58,6 +58,13 @@ def _safe_int(value: object, default: int = 0) -> int:
         return int(default)
 
 
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except Exception:
+        return float(default)
+
+
 def _tool_input_dict(raw: object) -> dict:
     if isinstance(raw, dict):
         return raw
@@ -71,20 +78,369 @@ def _tool_input_dict(raw: object) -> dict:
     return {}
 
 
-def _extract_executable_actions(steps: list[dict]) -> list[dict]:
+def _money_short(value: object) -> str:
+    amount = _safe_int(value, 0)
+    sign = "-" if amount < 0 else ""
+    n = abs(amount)
+    if n >= 1_000_000_000:
+        return f"{sign}{n / 1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{sign}{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{sign}{n / 1_000:.1f}K"
+    return f"{sign}{n}"
+
+
+def _compact_text(text: object, limit: int = 280) -> str:
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _json_dict_from_text(text: object) -> dict:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+
+    direct = _tool_input_dict(raw)
+    if direct:
+        return direct
+
+    decoder = json.JSONDecoder()
+    candidates: list[dict] = []
+    for idx, ch in enumerate(raw):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(raw[idx:])
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            candidates.append(obj)
+
+    if not candidates:
+        return {}
+
+    for obj in reversed(candidates):
+        if "decision_general" in obj:
+            return obj
+    for obj in reversed(candidates):
+        if "plan" in obj and "summary" in obj:
+            return obj
+    return candidates[-1]
+
+
+def _format_action_label(tool_name: str, payload: dict) -> str:
+    tool_name = str(tool_name or "").strip()
+    name = str(payload.get("nombre", "")).strip()
+    if tool_name == "sell_player_phase1_tool":
+        player_ref = name or f"player_team_id={payload.get('player_team_id', '?')}"
+        return f"Vender {player_ref} por {_money_short(payload.get('sale_price', 0))}"
+    if tool_name == "place_bid_tool":
+        player_ref = name or f"market_item_id={payload.get('market_item_id', '?')}"
+        return f"Pujar por {player_ref} con {_money_short(payload.get('amount', 0))}"
+    if tool_name == "buyout_player_tool":
+        player_ref = name or f"player_team_id={payload.get('player_team_id', '?')}"
+        clause = payload.get("clause_to_pay")
+        if clause in (None, "", 0, "0"):
+            return f"Clausulazo a {player_ref}"
+        return f"Clausulazo a {player_ref} pagando {_money_short(clause)}"
+    return tool_name
+
+
+def _extract_direct_tool_actions(steps: list[dict]) -> list[dict]:
     actions: list[dict] = []
     for step in steps:
         tool_name = str(step.get("tool", "")).strip()
         if tool_name not in EXECUTABLE_TOOLS:
             continue
-        actions.append(
-            {
-                "tool": tool_name,
-                "tool_input": _tool_input_dict(step.get("tool_input")),
-            }
-        )
+        payload = _tool_input_dict(step.get("tool_input"))
+        action = {
+            "tool": tool_name,
+            "tool_input": payload,
+        }
+        label = _format_action_label(tool_name, payload)
+        if label:
+            action["label"] = label
+        actions.append(action)
     return actions
 
+
+def _extract_latest_simulation_payload(steps: list[dict]) -> dict:
+    for step in reversed(steps):
+        if str(step.get("tool", "")).strip() != "simulate_transfer_plan":
+            continue
+        payload = _json_dict_from_text(step.get("observation"))
+        if isinstance(payload.get("plan"), dict):
+            return payload
+    return {}
+
+
+def _extract_actions_from_simulation_payload(payload: dict) -> list[dict]:
+    actions: list[dict] = []
+    plan = payload.get("plan")
+    if not isinstance(plan, dict):
+        return actions
+    movimientos = plan.get("movimientos")
+    if not isinstance(movimientos, list):
+        return actions
+
+    for mov in movimientos:
+        if not isinstance(mov, dict):
+            continue
+
+        venta = mov.get("venta")
+        if isinstance(venta, dict):
+            player_team_id = str(venta.get("player_team_id", "")).strip()
+            sale_price = max(
+                _safe_int(venta.get("precio_publicacion"), 0),
+                _safe_int(venta.get("valor_mercado"), 0),
+            )
+            if player_team_id and sale_price > 0:
+                payload_sell = {
+                    "player_team_id": player_team_id,
+                    "sale_price": sale_price,
+                    "nombre": str(venta.get("nombre", "")).strip(),
+                }
+                actions.append(
+                    {
+                        "tool": "sell_player_phase1_tool",
+                        "tool_input": payload_sell,
+                        "label": _format_action_label("sell_player_phase1_tool", payload_sell),
+                    }
+                )
+
+        compra = mov.get("compra")
+        if not isinstance(compra, dict):
+            continue
+        tipo = str(compra.get("tipo", "")).strip().lower()
+        nombre = str(compra.get("nombre", "")).strip()
+        if tipo == "clausulazo":
+            player_team_id = str(compra.get("player_team_id", "")).strip()
+            if not player_team_id:
+                continue
+            payload_buyout = {
+                "player_team_id": player_team_id,
+                "nombre": nombre,
+            }
+            clause = _safe_int(compra.get("coste"), 0)
+            if clause > 0:
+                payload_buyout["clause_to_pay"] = clause
+            actions.append(
+                {
+                    "tool": "buyout_player_tool",
+                    "tool_input": payload_buyout,
+                    "label": _format_action_label("buyout_player_tool", payload_buyout),
+                }
+            )
+            continue
+
+        market_item_id = str(compra.get("market_item_id", "")).strip()
+        amount = _safe_int(compra.get("coste"), 0)
+        if not market_item_id or amount <= 0:
+            continue
+        payload_bid = {
+            "market_item_id": market_item_id,
+            "amount": amount,
+            "nombre": nombre,
+        }
+        player_id = _safe_int(compra.get("player_id"), 0)
+        if player_id > 0:
+            payload_bid["player_id"] = player_id
+        actions.append(
+            {
+                "tool": "place_bid_tool",
+                "tool_input": payload_bid,
+                "label": _format_action_label("place_bid_tool", payload_bid),
+            }
+        )
+
+    return actions
+
+
+def _extract_executable_actions(steps: list[dict]) -> tuple[list[dict], str]:
+    direct_actions = _extract_direct_tool_actions(steps)
+    if direct_actions:
+        return direct_actions, "tool_calls"
+
+    simulation_payload = _extract_latest_simulation_payload(steps)
+    simulated_actions = _extract_actions_from_simulation_payload(simulation_payload)
+    if simulated_actions:
+        return simulated_actions, "simulate_transfer_plan"
+
+    return [], "none"
+
+
+def _extract_agent_report_payload(output: str) -> dict:
+    payload = _json_dict_from_text(output)
+    if not payload:
+        return {}
+    if "decision_general" in payload:
+        return payload
+    return {}
+
+
+def _format_tools_used(steps: list[dict], limit: int = 8) -> str:
+    tool_names: list[str] = []
+    for s in steps:
+        name = str(s.get("tool", "")).strip()
+        if name and name not in tool_names:
+            tool_names.append(name)
+    if not tool_names:
+        return "sin tools registradas"
+    out = ", ".join(tool_names[:limit])
+    if len(tool_names) > limit:
+        out += ", ..."
+    return out
+
+
+def _build_informe_message(
+    *,
+    league_name: str,
+    market_key: str,
+    steps: list[dict],
+    output: str,
+    actions: list[dict],
+    action_source: str,
+    simulation_payload: dict,
+) -> str:
+    report_payload = _extract_agent_report_payload(output)
+    decision = _compact_text(report_payload.get("decision_general", ""), 420)
+    if not decision:
+        decision = _compact_text(output, 420)
+
+    riesgos = report_payload.get("riesgos_detectados", [])
+    if not isinstance(riesgos, list):
+        riesgos = []
+    riesgos_txt = [_compact_text(r, 180) for r in riesgos[:3] if str(r).strip()]
+
+    siguiente = _compact_text(report_payload.get("siguiente_revision_recomendada", ""), 220)
+    summary = simulation_payload.get("summary", {}) if isinstance(simulation_payload, dict) else {}
+    if not isinstance(summary, dict):
+        summary = {}
+
+    source_txt = {
+        "tool_calls": "tools ejecutables del agente",
+        "simulate_transfer_plan": "plan de simulacion del motor",
+        "none": "sin plan ejecutable detectado",
+    }.get(action_source, action_source)
+
+    lines = [
+        "INFORME IA (LangChain)",
+        f"Liga: {league_name}",
+        "Modo: simulacion (dry-run)",
+        f"Ciclo mercado: {market_key}",
+        "",
+        f"Plan cacheado: {len(actions)} accion(es) ejecutables",
+        f"Fuente del plan: {source_txt}",
+        "Usa /compraventa para ejecutar ESTE plan en este mismo ciclo.",
+    ]
+
+    xp_now = summary.get("xp_once_actual")
+    xp_post = summary.get("xp_once_post")
+    xp_delta = summary.get("xp_delta")
+    saldo_now = summary.get("saldo_actual")
+    saldo_final = summary.get("saldo_final")
+    movs = summary.get("movimientos")
+    has_summary = any(v not in (None, "") for v in (xp_now, xp_post, saldo_now, saldo_final, movs))
+    if has_summary:
+        lines.extend(["", "Resumen simulacion:"])
+        if xp_now not in (None, "") and xp_post not in (None, ""):
+            delta = _safe_float(xp_delta, _safe_float(xp_post) - _safe_float(xp_now))
+            delta_txt = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
+            lines.append(f"- xP once: {_safe_float(xp_now):.1f} -> {_safe_float(xp_post):.1f} ({delta_txt})")
+        if saldo_now not in (None, "") and saldo_final not in (None, ""):
+            lines.append(f"- Saldo: {_money_short(saldo_now)} -> {_money_short(saldo_final)}")
+        if movs not in (None, ""):
+            lines.append(f"- Movimientos simulados: {_safe_int(movs, 0)}")
+
+    if actions:
+        lines.extend(["", "Acciones propuestas para /compraventa:"])
+        for idx, action in enumerate(actions[:8], 1):
+            payload = _tool_input_dict(action.get("tool_input"))
+            label = str(action.get("label", "")).strip() or _format_action_label(
+                str(action.get("tool", "")).strip(), payload
+            )
+            lines.append(f"{idx}. {label}")
+        if len(actions) > 8:
+            lines.append(f"... y {len(actions) - 8} accion(es) mas.")
+    else:
+        lines.extend(
+            [
+                "",
+                "No se detectaron acciones ejecutables en este informe.",
+                "Si el texto recomienda operar, vuelve a lanzar /informe para regenerar el plan del ciclo.",
+            ]
+        )
+
+    if decision:
+        lines.extend(["", "Decision IA:", decision])
+
+    if riesgos_txt:
+        lines.append("")
+        lines.append("Riesgos clave:")
+        for r in riesgos_txt:
+            lines.append(f"- {r}")
+
+    if siguiente:
+        lines.extend(["", f"Siguiente revision recomendada: {siguiente}"])
+
+    lines.extend(
+        [
+            "",
+            f"Tools usadas: {len(steps)}",
+            f"Tools: {_format_tools_used(steps)}",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def _build_compraventa_message(
+    *,
+    league_name: str,
+    market_key: str,
+    action_source: str,
+    summary: dict,
+) -> str:
+    source_txt = {
+        "tool_calls": "tools ejecutables del agente",
+        "simulate_transfer_plan": "plan de simulacion cacheado",
+        "none": "origen no informado",
+    }.get(str(action_source), str(action_source or "none"))
+
+    lines = [
+        "COMPRAVENTA IA (LangChain)",
+        f"Liga: {league_name}",
+        f"Ciclo mercado: {market_key}",
+        f"Fuente del plan: {source_txt}",
+        "",
+        f"Acciones planificadas: {summary.get('actions_total', 0)}",
+        f"Acciones OK: {summary.get('actions_ok', 0)}",
+        f"Ventas fase1: {summary.get('ventas', 0)}",
+        f"Pujas: {summary.get('pujas', 0)}",
+        f"Clausulazos: {summary.get('clausulazos', 0)}",
+    ]
+
+    details = summary.get("details", [])
+    if isinstance(details, list) and details:
+        lines.append("")
+        lines.append("Detalle de ejecucion:")
+        for row in details[:10]:
+            lines.append(f"- {row}")
+        if len(details) > 10:
+            lines.append(f"- ... {len(details) - 10} linea(s) mas.")
+
+    errors = summary.get("errors", [])
+    if isinstance(errors, list) and errors:
+        lines.append("")
+        lines.append(f"Errores ({len(errors)}):")
+        for err in errors[:8]:
+            lines.append(f"- {_compact_text(err, 220)}")
+        if len(errors) > 8:
+            lines.append(f"- ... {len(errors) - 8} error(es) mas.")
+
+    return "\n".join(lines).strip()
 
 def _market_key_for_league(league_id: str) -> tuple[str, str]:
     sched, err = build_market_schedule(
@@ -120,12 +476,14 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
         "ventas": 0,
         "pujas": 0,
         "clausulazos": 0,
+        "details": [],
         "errors": [],
     }
 
     for idx, action in enumerate(actions, 1):
         tool = str(action.get("tool", "")).strip()
         payload = _tool_input_dict(action.get("tool_input"))
+        label = str(action.get("label", "")).strip() or _format_action_label(tool, payload)
         try:
             if tool == "sell_player_phase1_tool":
                 player_team_id = str(payload.get("player_team_id", "")).strip()
@@ -135,6 +493,7 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
                 client.sell_player_phase1(player_team_id=player_team_id, price=sale_price)
                 summary["actions_ok"] += 1
                 summary["ventas"] += 1
+                summary["details"].append(f"[OK] {idx}. {label}")
                 continue
 
             if tool == "place_bid_tool":
@@ -151,6 +510,7 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
                 )
                 summary["actions_ok"] += 1
                 summary["pujas"] += 1
+                summary["details"].append(f"[OK] {idx}. {label}")
                 continue
 
             if tool == "buyout_player_tool":
@@ -165,11 +525,16 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
                 )
                 summary["actions_ok"] += 1
                 summary["clausulazos"] += 1
+                summary["details"].append(f"[OK] {idx}. {label}")
                 continue
 
-            summary["errors"].append(f"Paso {idx}: tool no soportada ({tool})")
+            msg = f"Paso {idx}: tool no soportada ({tool})"
+            summary["errors"].append(msg)
+            summary["details"].append(f"[ERROR] {idx}. {label} -> {msg}")
         except Exception as exc:
-            summary["errors"].append(f"Paso {idx} ({tool}): {type(exc).__name__}: {exc}")
+            msg = f"Paso {idx} ({tool}): {type(exc).__name__}: {exc}"
+            summary["errors"].append(msg)
+            summary["details"].append(f"[ERROR] {idx}. {label} -> {type(exc).__name__}: {exc}")
 
     return summary
 
@@ -451,7 +816,13 @@ def _run_langchain_agent_cmd(
 
             output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
             steps = res.get("steps", []) or []
-            actions = _extract_executable_actions(steps)
+            simulation_payload = _extract_latest_simulation_payload(steps)
+            actions, action_source = _extract_executable_actions(steps)
+            sim_summary = (
+                simulation_payload.get("summary")
+                if isinstance(simulation_payload.get("summary"), dict)
+                else {}
+            )
 
             cache_payload = {
                 "version": 1,
@@ -462,31 +833,22 @@ def _run_langchain_agent_cmd(
                 "llm_model": str(res.get("llm_model", "")),
                 "objective": REPORT_PLAN_OBJECTIVE,
                 "output": output,
+                "action_source": action_source,
+                "simulation_summary": sim_summary,
                 "actions": actions,
                 "actions_count": len(actions),
                 "executed_at": "",
             }
             _save_report_plan_cache(cache_payload)
 
-            tool_names = []
-            for s in steps:
-                name = str(s.get("tool", "")).strip()
-                if name and name not in tool_names:
-                    tool_names.append(name)
-            tools_txt = ", ".join(tool_names[:12]) if tool_names else "sin tools registradas"
-            if len(tool_names) > 12:
-                tools_txt += ", ..."
-
-            report_text = (
-                "INFORME IA (LangChain)\n"
-                f"Liga: {league_name}\n"
-                "Modo: simulacion (dry-run)\n"
-                f"Ciclo mercado: {market_key}\n"
-                f"Plan cacheado: {len(actions)} acciones ejecutables\n"
-                "Usa /compraventa para ejecutar ESTE plan en este mismo ciclo.\n"
-                f"Tools usadas: {len(steps)}\n"
-                f"Tools: {tools_txt}\n\n"
-                f"{output[:12000]}"
+            report_text = _build_informe_message(
+                league_name=league_name,
+                market_key=market_key,
+                steps=steps,
+                output=output,
+                actions=actions,
+                action_source=action_source,
+                simulation_payload=simulation_payload,
             )
             send_telegram_message(bot_token, chat_id, report_text)
             return "Informe IA generado y plan cacheado para este ciclo."
@@ -524,19 +886,12 @@ def _run_langchain_agent_cmd(
         _save_report_plan_cache(cache)
 
         errors = summary.get("errors", []) or []
-        resume = (
-            "COMPRAVENTA IA (LangChain)\n"
-            f"Liga: {league_name}\n"
-            f"Ciclo mercado: {market_key}\n"
-            f"Acciones planificadas: {summary.get('actions_total', 0)}\n"
-            f"Acciones OK: {summary.get('actions_ok', 0)}\n"
-            f"Ventas fase1: {summary.get('ventas', 0)}\n"
-            f"Pujas: {summary.get('pujas', 0)}\n"
-            f"Clausulazos: {summary.get('clausulazos', 0)}"
+        resume = _build_compraventa_message(
+            league_name=league_name,
+            market_key=market_key,
+            action_source=str(cache.get("action_source", "")).strip() or "none",
+            summary=summary,
         )
-        if errors:
-            preview = "\n".join(f"- {e}" for e in errors[:8])
-            resume += f"\nErrores ({len(errors)}):\n{preview}"
 
         send_telegram_message(bot_token, chat_id, resume)
         if errors:

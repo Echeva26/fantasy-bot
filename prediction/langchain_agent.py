@@ -225,7 +225,7 @@ def _extract_steps_from_messages(messages: list[Any]) -> list[dict]:
                 {
                     "tool": tool_name,
                     "tool_input": call_meta.get("tool_input", {}) or {},
-                    "observation": _message_content(msg)[:4000],
+                    "observation": _message_content(msg)[:20000],
                 }
             )
     return steps
@@ -289,7 +289,7 @@ def run_agent_objective(
                 {
                     "tool": getattr(action, "tool", ""),
                     "tool_input": getattr(action, "tool_input", {}),
-                    "observation": str(observation)[:4000],
+                    "observation": str(observation)[:20000],
                 }
             )
     else:

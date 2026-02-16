@@ -30,16 +30,6 @@ def _fetch(url: str) -> BeautifulSoup:
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "lxml")
 
-
-def _extract_team_name(header) -> str:
-    """Extrae el nombre del equipo de un header de sección."""
-    img = header.find("img")
-    if img and img.get("alt"):
-        return img["alt"].strip()
-    text = header.get_text(strip=True)
-    return text if text else "?"
-
-
 # ───────────────────────────────────────────────────────────────
 # Lesionados
 # ───────────────────────────────────────────────────────────────

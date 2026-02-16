@@ -21,7 +21,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -34,11 +33,8 @@ from prediction.collect_data import (
     POS_MAP,
     _get,
     get_sofascore_season_id,
-    collect_standings,
     collect_odds_for_round,
-    build_team_mapping,
 )
-from prediction.features import get_feature_columns
 
 logger = logging.getLogger(__name__)
 

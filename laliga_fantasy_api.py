@@ -42,7 +42,6 @@ import re
 import os
 import time
 import logging
-from datetime import datetime
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 

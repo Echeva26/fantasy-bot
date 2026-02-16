@@ -6,7 +6,6 @@ Ejecutar: python -m test.test_all_apis [--league LEAGUE_ID]
 import sys
 import os
 import time
-import json
 import argparse
 import logging
 
