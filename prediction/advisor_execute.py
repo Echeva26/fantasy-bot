@@ -48,6 +48,7 @@ from prediction.advisor import (
 from prediction.advisor import _format_money as fm
 
 logger = logging.getLogger(__name__)
+MODEL_TYPE = "xgboost"
 
 
 def _format_money(amount: int) -> str:
@@ -64,7 +65,7 @@ def run_advisor_pipeline(args: argparse.Namespace) -> dict:
         snapshot = load_snapshot_from_file(args.snapshot)
     else:
         snapshot = load_snapshot(args.league)
-    pred_df, first_match_ts = get_predictions(args.model)
+    pred_df, first_match_ts = get_predictions(MODEL_TYPE)
     jornada = int(pred_df["jornada"].iloc[0]) if not pred_df.empty else "?"
     clausulazos_ok, horas_al_partido = clausulazos_available(first_match_ts)
     team_analysis = analyze_my_team(snapshot, pred_df)
@@ -76,7 +77,7 @@ def run_advisor_pipeline(args: argparse.Namespace) -> dict:
         team_analysis, available, snapshot, allow_clausulazos=clausulazos_ok
     )
     report = generate_report(
-        team_analysis, transfer_plan, snapshot, pred_df, args.model,
+        team_analysis, transfer_plan, snapshot, pred_df, MODEL_TYPE,
         clausulazos_ok=clausulazos_ok, horas_al_partido=horas_al_partido,
     )
     return {
@@ -304,7 +305,6 @@ def main() -> None:
         description="Fantasy Advisor: predicción + ejecución de movimientos"
     )
     parser.add_argument("--league", type=str, default="", help="League ID")
-    parser.add_argument("--model", default="xgboost", choices=["xgboost", "lightgbm"])
     parser.add_argument("--snapshot", type=str, help="Cargar snapshot desde JSON")
     parser.add_argument("--output", type=str, help="Ruta del informe .md")
     parser.add_argument("--dry-run", action="store_true", help="Simular sin ejecutar")

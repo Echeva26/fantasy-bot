@@ -1,12 +1,11 @@
 """
 Predicción xP para la próxima jornada
 =======================================
-Carga el modelo entrenado y genera predicciones para cada jugador
+Carga el modelo xgboost entrenado y genera predicciones para cada jugador
 en la próxima jornada.
 
 Uso:
     python -m prediction.predict
-    python -m prediction.predict --model lightgbm
     python -m prediction.predict --top 30
     python -m prediction.predict --position DEL
 """
@@ -40,10 +39,19 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
 MODELS_DIR = Path(__file__).parent / "models"
+MODEL_TYPE = "xgboost"
 
 
-def load_model(model_type: str = "xgboost"):
+def _resolve_model_type(model_type: str = MODEL_TYPE) -> str:
+    mt = (model_type or MODEL_TYPE).strip().lower()
+    if mt != MODEL_TYPE:
+        raise ValueError(f"Modelo no soportado: {model_type}. Solo se permite '{MODEL_TYPE}'.")
+    return MODEL_TYPE
+
+
+def load_model(model_type: str = MODEL_TYPE):
     """Carga el modelo entrenado y sus metadatos."""
+    model_type = _resolve_model_type(model_type)
     model_path = MODELS_DIR / f"{model_type}_model.pkl"
     meta_path = MODELS_DIR / f"{model_type}_meta.json"
 
@@ -283,7 +291,7 @@ def build_prediction_features(
     return pd.DataFrame(pred_rows)
 
 
-def predict(model_type: str = "xgboost") -> tuple[pd.DataFrame, int]:
+def predict(model_type: str = MODEL_TYPE) -> tuple[pd.DataFrame, int]:
     """
     Pipeline completo de predicción para la próxima jornada.
 
@@ -291,6 +299,7 @@ def predict(model_type: str = "xgboost") -> tuple[pd.DataFrame, int]:
         (pred_df, first_match_timestamp)
         first_match_timestamp: unix timestamp del primer partido de la jornada.
     """
+    model_type = _resolve_model_type(model_type)
     logger.info("Cargando modelo %s...", model_type)
     model, meta = load_model(model_type)
     feature_cols = meta["feature_cols"]
@@ -337,7 +346,6 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="Predice xP para la próxima jornada")
-    parser.add_argument("--model", default="xgboost", choices=["xgboost", "lightgbm"])
     parser.add_argument("--top", type=int, default=30, help="Top N jugadores a mostrar")
     parser.add_argument("--position", type=str, help="Filtrar por posición (POR/DEF/MED/DEL/ENT)")
     args = parser.parse_args()
@@ -347,14 +355,14 @@ def main():
     print("  xP Predictions — LaLiga Fantasy")
     print("=" * 70)
 
-    pred_df, _ = predict(args.model)
+    pred_df, _ = predict()
 
     if pred_df.empty:
         print("\n  No hay predicciones disponibles.")
         return
 
     jornada = int(pred_df["jornada"].iloc[0])
-    print(f"\n  Jornada {jornada} — Modelo: {args.model}")
+    print(f"\n  Jornada {jornada} — Modelo: {MODEL_TYPE}")
     print(f"  Jugadores: {len(pred_df)}")
 
     # Filtrar por posición

@@ -7,7 +7,7 @@ en la próxima jornada de LaLiga Fantasy.
 Módulos:
     collect_data  — Recolecta datos históricos de múltiples fuentes
     features      — Feature Engineering: transforma datos brutos en features
-    train         — Entrena el modelo XGBoost/LightGBM
+    train         — Entrena el modelo xgboost
     predict       — Genera predicciones para la próxima jornada
     advisor       — Conecta xP con tu liga y genera informe de recomendaciones
     langchain_tools       — Herramientas para agente LLM (snapshot/xP/mercado/API)

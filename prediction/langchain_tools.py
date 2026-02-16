@@ -29,6 +29,7 @@ from prediction.advisor_execute import execute_movements, run_aceptar_ofertas
 from prediction.lineup_autoset import autoset_best_lineup
 
 logger = logging.getLogger(__name__)
+MODEL_TYPE = "xgboost"
 
 
 def _to_builtin(value: Any) -> Any:
@@ -53,7 +54,7 @@ def _as_json(payload: Any) -> str:
 @dataclass
 class FantasyAgentRuntime:
     league_id: str
-    model_type: str = "xgboost"
+    model_type: str = MODEL_TYPE
     dry_run: bool = False
     _snapshot: dict | None = field(default=None, init=False, repr=False)
     _pred_df: pd.DataFrame | None = field(default=None, init=False, repr=False)
@@ -63,6 +64,16 @@ class FantasyAgentRuntime:
     _transfer_plan: dict | None = field(default=None, init=False, repr=False)
     _clausulazos_ok: bool | None = field(default=None, init=False, repr=False)
     _hours_to_first_match: float | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        mt = (self.model_type or MODEL_TYPE).strip().lower()
+        if mt != MODEL_TYPE:
+            logger.warning(
+                "Modelo no soportado '%s' en runtime LangChain; usando '%s'.",
+                self.model_type,
+                MODEL_TYPE,
+            )
+        self.model_type = MODEL_TYPE
 
     def invalidate(self) -> None:
         self._snapshot = None

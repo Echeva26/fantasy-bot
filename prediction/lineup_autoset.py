@@ -19,6 +19,7 @@ from laliga_fantasy_client import LaLigaFantasyClient
 from prediction.advisor import analyze_my_team, get_predictions, load_snapshot
 
 logger = logging.getLogger(__name__)
+MODEL_TYPE = "xgboost"
 
 
 def _parse_hhmm(raw: str) -> tuple[int, int]:
@@ -126,16 +127,20 @@ def _build_lineup_payload(team_analysis: dict, snapshot: dict) -> dict:
 def autoset_best_lineup(
     *,
     league_id: str,
-    model: str = "xgboost",
+    model: str = MODEL_TYPE,
     day_before_only: bool = True,
     after_market_time: str = "08:10",
     timezone_name: str | None = None,
     force: bool = False,
     dry_run: bool = False,
 ) -> dict:
+    mt = (model or MODEL_TYPE).strip().lower()
+    if mt != MODEL_TYPE:
+        raise ValueError(f"Modelo no soportado: {model}. Solo se permite '{MODEL_TYPE}'.")
+
     tz_name = timezone_name or os.getenv("TZ", "Europe/Madrid")
     snapshot = load_snapshot(league_id)
-    pred_df, first_match_ts = get_predictions(model)
+    pred_df, first_match_ts = get_predictions(MODEL_TYPE)
     if pred_df.empty:
         raise RuntimeError("Sin predicciones disponibles para calcular alineación")
 
@@ -197,7 +202,6 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Auto-set alineación por xP (D-1)")
     parser.add_argument("--league", default=os.getenv("LALIGA_LEAGUE_ID", ""))
-    parser.add_argument("--model", default="xgboost", choices=["xgboost", "lightgbm"])
     parser.add_argument(
         "--after-market-time",
         default=os.getenv("LINEUP_AUTO_AFTER_TIME", "08:10"),
@@ -222,7 +226,7 @@ def main() -> None:
 
     result = autoset_best_lineup(
         league_id=args.league,
-        model=args.model,
+        model=MODEL_TYPE,
         day_before_only=not args.no_day_before_check,
         after_market_time=args.after_market_time,
         timezone_name=args.timezone,

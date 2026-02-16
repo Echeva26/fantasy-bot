@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent / "data"
 OUTPUT_DIR = Path(__file__).parent.parent
+MODEL_TYPE = "xgboost"
 
 
 # ─── 1. Cargar estado de la liga ──────────────────────────────
@@ -94,13 +95,16 @@ def clausulazos_available(first_match_ts: int) -> tuple[bool, float]:
 
 
 # ─── 2. Generar predicciones xP ──────────────────────────────
-def get_predictions(model_type: str = "xgboost") -> tuple[pd.DataFrame, int]:
+def get_predictions(model_type: str = MODEL_TYPE) -> tuple[pd.DataFrame, int]:
     """
     Genera predicciones xP para la próxima jornada.
     Returns:
         (pred_df, first_match_timestamp)
     """
-    return predict(model_type=model_type)
+    mt = (model_type or MODEL_TYPE).strip().lower()
+    if mt != MODEL_TYPE:
+        raise ValueError(f"Modelo no soportado: {model_type}. Solo se permite '{MODEL_TYPE}'.")
+    return predict(model_type=MODEL_TYPE)
 
 
 # ─── 3. Analizar la plantilla del usuario ─────────────────────
@@ -1028,7 +1032,6 @@ def main():
         description="Fantasy Advisor: recomendaciones para la próxima jornada"
     )
     parser.add_argument("--league", type=str, default="", help="League ID")
-    parser.add_argument("--model", default="xgboost", choices=["xgboost", "lightgbm"])
     parser.add_argument("--output", type=str, help="Ruta del informe .md")
     parser.add_argument(
         "--snapshot", type=str,
@@ -1056,8 +1059,8 @@ def main():
     print(f"  Jugadores: {len(mi_equipo['plantilla'])}")
 
     # 2. Predicciones xP
-    print(f"\n  Generando predicciones xP ({args.model})...")
-    pred_df, first_match_ts = get_predictions(args.model)
+    print(f"\n  Generando predicciones xP ({MODEL_TYPE})...")
+    pred_df, first_match_ts = get_predictions(MODEL_TYPE)
     jornada = int(pred_df["jornada"].iloc[0]) if not pred_df.empty else "?"
     print(f"  Jornada: {jornada}")
     print(f"  Jugadores con predicción: {len(pred_df)}")
@@ -1102,7 +1105,7 @@ def main():
     # 6. Informe
     report = generate_report(
         team_analysis, transfer_plan,
-        snapshot, pred_df, args.model,
+        snapshot, pred_df, MODEL_TYPE,
         clausulazos_ok=clausulazos_ok,
         horas_al_partido=horas_al_partido,
     )
