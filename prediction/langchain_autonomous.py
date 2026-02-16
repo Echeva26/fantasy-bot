@@ -329,7 +329,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
     _notify(
         "Fantasy LangChain daemon iniciado\n"
         f"Liga: {startup_league_desc}\n"
-        "PRE/POST: automáticos a 5 min antes/después del cierre real de mercado\n"
+        "PRE/POST: automáticos a 10 min antes/después del cierre real de mercado\n"
         "Alineación: 23h55 antes del inicio de jornada"
     )
     logger.info(
@@ -421,7 +421,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 if market_changed:
                     _notify("Horario de mercado detectado\n" + schedule_message(schedule))
 
-                # PRE: 5 min antes del cierre y antes del cierre
+                # PRE: 10 min antes del cierre y antes del cierre
                 if (
                     now_local >= pre_local
                     and now_local < close_local
@@ -439,7 +439,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                         f"Resumen:\n{output[:1200]}"
                     )
 
-                # POST: 5 min después del cierre
+                # POST: 10 min después del cierre
                 if (
                     now_local >= post_local
                     and str(state.get("last_post_market_key", "")) != market_key

@@ -10,8 +10,8 @@ from zoneinfo import ZoneInfo
 
 from laliga_fantasy_client import LaLigaFantasyClient
 
-PRE_OFFSET_MINUTES = 5
-POST_OFFSET_MINUTES = 5
+PRE_OFFSET_MINUTES = 10
+POST_OFFSET_MINUTES = 10
 
 
 def _is_league_market_item(item: dict) -> bool:
@@ -146,7 +146,7 @@ def schedule_message(schedule: dict) -> str:
     tz_name = schedule.get("timezone_name", "")
     return (
         f"Mercado: {close_local.strftime('%H:%M')}\n"
-        f"PRE automático: {pre_local.strftime('%H:%M')} (5 min antes)\n"
-        f"POST automático: {post_local.strftime('%H:%M')} (5 min después)\n"
+        f"PRE automático: {pre_local.strftime('%H:%M')} (10 min antes)\n"
+        f"POST automático: {post_local.strftime('%H:%M')} (10 min después)\n"
         f"Zona horaria: {tz_name}"
     )

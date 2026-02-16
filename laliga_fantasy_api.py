@@ -200,6 +200,22 @@ class LaLigaFantasyAPI:
         resp.raise_for_status()
         return resp.json() if resp.content else {}
 
+    def _put(self, url: str, json_body: dict) -> dict | list:
+        """PUT autenticado para updates de recursos (p. ej. subir cláusula)."""
+        headers = {
+            **self._auth_headers(),
+            "Content-Type": "application/json",
+        }
+        resp = self.session.put(url, json=json_body, headers=headers)
+        if not resp.ok:
+            try:
+                err_body = resp.json() if resp.content else resp.text[:500]
+            except Exception:
+                err_body = resp.text[:500] if resp.text else ""
+            logger.warning("PUT %s → %s | body: %s | response: %s", url, resp.status_code, json_body, err_body)
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
     # -----------------------------------------------------------------------
     # Operaciones de mercado (POST - endpoints extraídos del APK)
     # -----------------------------------------------------------------------
@@ -257,6 +273,46 @@ class LaLigaFantasyAPI:
         url = f"{BASE_URL}/api/v4/league/{self.league_id}/buyout/{player_team_id}/pay"
         logger.info("Clausulazo a jugador %s...", player_team_id)
         return self._post(url, {})
+
+    def increase_player_clause(
+        self,
+        player_team_id: str,
+        value_to_increase: int,
+        factor: float = 2.0,
+    ) -> dict:
+        """
+        Aumentar cláusula de un jugador propio.
+
+        PUT /api/v5/league/{leagueId}/buyout/player
+        Body: {"playerId": "<playerTeamId>", "valueToIncrease": int, "factor": float}
+
+        Regla habitual: invertir 1M => +2M en cláusula (factor 2.0).
+        """
+        ptid = str(player_team_id or "").strip()
+        if not ptid:
+            raise ValueError("player_team_id vacío")
+        if int(value_to_increase) <= 0:
+            raise ValueError("value_to_increase debe ser > 0")
+        try:
+            factor_value = float(factor)
+        except Exception:
+            factor_value = 2.0
+        if factor_value <= 0:
+            factor_value = 2.0
+
+        url = f"{BASE_URL}/api/v5/league/{self.league_id}/buyout/player"
+        body = {
+            "playerId": ptid,
+            "valueToIncrease": int(value_to_increase),
+            "factor": factor_value,
+        }
+        logger.info(
+            "Subiendo cláusula de jugador %s con inversión %s (factor %.2f)...",
+            ptid,
+            value_to_increase,
+            factor_value,
+        )
+        return self._put(url, body)
 
     # -----------------------------------------------------------------------
     # Ligas

@@ -14,6 +14,7 @@
 | **Fase 2 venta** (aceptar oferta liga) | POST | `POST /api/v4/league/{leagueId}/market/{marketPlayerId}/offer/{offerId}/accept` | `marketPlayerId`, `offerId` en path |
 | **Puja** (mercado libre) | POST | `POST /api/v3/league/{leagueId}/market/{marketPlayerId}/bid` | Body: `amount` |
 | **Clausulazo** | POST | `POST /api/v4/league/{leagueId}/buyout/{playerTeamId}/pay` | `playerTeamId` en path |
+| **Subir cláusula propia** | PUT | `PUT /api/v5/league/{leagueId}/buyout/player` | Body: `playerId`(playerTeamId), `valueToIncrease`, `factor` |
 
 ---
 
@@ -77,6 +78,21 @@ POST /api/v4/league/{leagueId}/buyout/{playerTeamId}/pay
 
 > **Importante:** Se usa `playerTeamId` (ID del jugador en el equipo del rival, en su plantilla), no `player_id` + `target_team_id` por separado.
 
+### 5. Subir cláusula de un jugador propio
+
+**Real (APK - IncreaseClauseRequest + Retrofit):**
+```
+PUT /api/v5/league/{leagueId}/buyout/player
+Body: {
+  "playerId": "<playerTeamId>",
+  "valueToIncrease": <int>,
+  "factor": <float>
+}
+```
+
+> **Importante:** `playerId` es realmente el `playerTeamId` del jugador en tu plantilla.  
+> Regla operativa usada por el bot: 1M invertido -> +2M de cláusula (`factor=2.0`).
+
 ---
 
 ## Listado completo de endpoints extraídos
@@ -130,7 +146,7 @@ POST /api/v4/league/{leagueId}/buyout/{playerTeamId}/pay
 
 | Endpoint | Uso probable |
 |----------|--------------|
-| `/api/v5/league/{leagueId}/buyout/player` | Clausulazo (alternativa) |
+| `/api/v5/league/{leagueId}/buyout/player` | PUT subir cláusula propia / POST clausulazo (alternativa) |
 
 ---
 

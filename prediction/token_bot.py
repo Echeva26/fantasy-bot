@@ -35,16 +35,23 @@ logger = logging.getLogger(__name__)
 
 JWT_RE = re.compile(r"(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)")
 REPORT_PLAN_CACHE_FILE = Path(".langchain_last_report_plan.json")
-EXECUTABLE_TOOLS = {"sell_player_phase1_tool", "place_bid_tool", "buyout_player_tool"}
+EXECUTABLE_TOOLS = {
+    "sell_player_phase1_tool",
+    "place_bid_tool",
+    "buyout_player_tool",
+    "increase_clause_tool",
+}
 REPORT_PLAN_OBJECTIVE = (
     "Genera el informe del ciclo actual y un plan EJECUTABLE de compraventa.\n"
     "Reglas obligatorias:\n"
     "1) Usa snapshot_summary, my_squad, market_opportunities y simulate_transfer_plan.\n"
     "2) Simula EXACTAMENTE las operaciones finales llamando las herramientas:\n"
-    "   sell_player_phase1_tool, place_bid_tool, buyout_player_tool.\n"
+    "   sell_player_phase1_tool, place_bid_tool, buyout_player_tool, increase_clause_tool.\n"
     "3) Respeta el orden real de ejecución y no uses accept_closed_offers.\n"
     "4) Como dry_run está activo, no habrá cambios reales ahora.\n"
-    "5) Devuelve resumen breve y claro en español."
+    "5) Si propones subir cláusula, sé moderado: solo jugadores clave y expuestos.\n"
+    "   Regla fija: cada 1M invertido sube 2M la cláusula.\n"
+    "6) Devuelve resumen breve y claro en español."
 )
 
 
@@ -147,6 +154,16 @@ def _format_action_label(tool_name: str, payload: dict) -> str:
         if clause in (None, "", 0, "0"):
             return f"Clausulazo a {player_ref}"
         return f"Clausulazo a {player_ref} pagando {_money_short(clause)}"
+    if tool_name == "increase_clause_tool":
+        player_ref = name or f"player_team_id={payload.get('player_team_id', '?')}"
+        invest = _safe_int(payload.get("value_to_increase"), 0)
+        if invest <= 0:
+            return f"Subir cláusula de {player_ref}"
+        delta = invest * 2
+        return (
+            f"Subir cláusula de {player_ref} invirtiendo {_money_short(invest)} "
+            f"(+{_money_short(delta)} de cláusula)"
+        )
     return tool_name
 
 
@@ -156,6 +173,12 @@ def _extract_direct_tool_actions(steps: list[dict]) -> list[dict]:
         tool_name = str(step.get("tool", "")).strip()
         if tool_name not in EXECUTABLE_TOOLS:
             continue
+        obs = _json_dict_from_text(step.get("observation"))
+        if isinstance(obs, dict):
+            if bool(obs.get("blocked")):
+                continue
+            if obs.get("ok") is False and not bool(obs.get("dry_run")):
+                continue
         payload = _tool_input_dict(step.get("tool_input"))
         action = {
             "tool": tool_name,
@@ -421,6 +444,7 @@ def _build_compraventa_message(
         f"Ventas fase1: {summary.get('ventas', 0)}",
         f"Pujas: {summary.get('pujas', 0)}",
         f"Clausulazos: {summary.get('clausulazos', 0)}",
+        f"Subidas de cláusula: {summary.get('clausulas_subidas', 0)}",
     ]
 
     details = summary.get("details", [])
@@ -477,6 +501,7 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
         "ventas": 0,
         "pujas": 0,
         "clausulazos": 0,
+        "clausulas_subidas": 0,
         "details": [],
         "errors": [],
     }
@@ -526,6 +551,21 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
                 )
                 summary["actions_ok"] += 1
                 summary["clausulazos"] += 1
+                summary["details"].append(f"[OK] {idx}. {label}")
+                continue
+
+            if tool == "increase_clause_tool":
+                player_team_id = str(payload.get("player_team_id", "")).strip()
+                value_to_increase = _safe_int(payload.get("value_to_increase"), 0)
+                if not player_team_id or value_to_increase <= 0:
+                    raise ValueError("faltan player_team_id o value_to_increase")
+                client.increase_player_clause(
+                    player_team_id=player_team_id,
+                    value_to_increase=value_to_increase,
+                    factor=2.0,
+                )
+                summary["actions_ok"] += 1
+                summary["clausulas_subidas"] += 1
                 summary["details"].append(f"[OK] {idx}. {label}")
                 continue
 

@@ -977,6 +977,62 @@ class LaLigaFantasyClient:
             logger.info("Fallback clausulazo: POST /api/v5/league/.../buyout/player")
             return self._post(alt_url, alt_body)
 
+    def increase_player_clause(
+        self,
+        player_team_id: str,
+        value_to_increase: int,
+        factor: float = 2.0,
+    ) -> dict:
+        """
+        Aumenta la cláusula de un jugador propio (playerTeamId).
+
+        PUT /api/v5/league/{leagueId}/buyout/player
+
+        Body (según APK IncreaseClauseRequest):
+          - playerId: "<playerTeamId>"
+          - valueToIncrease: int
+          - factor: float
+
+        Regla habitual: invertir 1M aumenta la cláusula en 2M (factor 2.0).
+        """
+        ptid = str(player_team_id or "").strip()
+        amount = _to_int(value_to_increase) or 0
+        if not ptid:
+            raise ValueError("player_team_id vacío")
+        if amount <= 0:
+            raise ValueError("value_to_increase debe ser > 0")
+
+        try:
+            factor_value = float(factor)
+        except Exception:
+            factor_value = 2.0
+        if factor_value <= 0:
+            factor_value = 2.0
+
+        url = f"{BASE_URL}/api/v5/league/{self.league_id}/buyout/player"
+        body = {
+            "playerId": ptid,
+            "valueToIncrease": int(amount),
+            "factor": factor_value,
+        }
+        logger.info(
+            "Subiendo cláusula de player_team_id=%s con inversión=%s (factor=%.2f)...",
+            ptid,
+            amount,
+            factor_value,
+        )
+        try:
+            return self._put(url, body)
+        except requests.exceptions.HTTPError:
+            # Fallback defensivo por compatibilidad de backend.
+            alt_body = {
+                "playerTeamId": ptid,
+                "valueToIncrease": int(amount),
+                "factor": factor_value,
+            }
+            logger.info("Fallback subida de cláusula con body alternativo playerTeamId.")
+            return self._put(url, alt_body)
+
     # ===================================================================
     # ENDPOINTS DE LA API (GET)
     # ===================================================================

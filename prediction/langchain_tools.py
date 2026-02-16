@@ -30,6 +30,8 @@ from prediction.lineup_autoset import autoset_best_lineup
 
 logger = logging.getLogger(__name__)
 MODEL_TYPE = "xgboost"
+CLAUSE_INCREASE_FACTOR = 2.0
+CLAUSE_EXPOSURE_THRESHOLD = 0.9
 
 
 def _to_builtin(value: Any) -> Any:
@@ -49,6 +51,28 @@ def _to_builtin(value: Any) -> Any:
 
 def _as_json(payload: Any) -> str:
     return json.dumps(_to_builtin(payload), ensure_ascii=False)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _clause_exposure_ratio(market_value: Any, clause_value: Any) -> float | None:
+    market = _safe_int(market_value, 0)
+    clause = _safe_int(clause_value, 0)
+    if market <= 0 or clause <= 0:
+        return None
+    return float(market) / float(clause)
 
 
 @dataclass
@@ -234,6 +258,12 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
                     "estado": p.get("estado"),
                     "en_venta": p.get("en_venta"),
                     "valor_mercado": p.get("valor_mercado"),
+                    "clausula": p.get("clausula"),
+                    "clausula_bloqueada_hasta": p.get("clausula_bloqueada_hasta"),
+                    "ratio_valor_vs_clausula": _clause_exposure_ratio(
+                        p.get("valor_mercado"),
+                        p.get("clausula"),
+                    ),
                     "xP": p.get("xP", 0),
                     "rival": p.get("rival"),
                     "es_local": p.get("es_local"),
@@ -521,6 +551,128 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
             return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
+    def increase_clause_tool(
+        player_team_id: str,
+        value_to_increase: int,
+        force: bool = False,
+    ) -> str:
+        """
+        Aumenta la cláusula de un jugador propio.
+
+        Regla económica: 1M invertido sube 2M de cláusula (factor fijo 2.0).
+        Debe usarse de forma moderada: prioriza jugadores clave y expuestos
+        (valor de mercado cercano a la cláusula).
+        """
+        ptid = str(player_team_id or "").strip()
+        amount = _safe_int(value_to_increase, 0)
+        if not ptid:
+            return _as_json({"ok": False, "error": "player_team_id vacío"})
+        if amount <= 0:
+            return _as_json({"ok": False, "error": "value_to_increase debe ser > 0"})
+
+        team_analysis = runtime.get_team_analysis(force_refresh=False)
+        players = team_analysis.get("jugadores", [])
+        if not isinstance(players, list):
+            players = []
+
+        selected = None
+        sorted_players = sorted(
+            [p for p in players if isinstance(p, dict)],
+            key=lambda x: _safe_float(x.get("xP"), 0.0),
+            reverse=True,
+        )
+        for p in sorted_players:
+            if str(p.get("player_team_id", "")).strip() == ptid:
+                selected = p
+                break
+
+        if not selected:
+            return _as_json(
+                {
+                    "ok": False,
+                    "error": "No se encontró ese player_team_id en tu plantilla actual.",
+                    "player_team_id": ptid,
+                }
+            )
+
+        key_player_team_ids = {
+            str(p.get("player_team_id", "")).strip()
+            for p in sorted_players[:5]
+            if str(p.get("player_team_id", "")).strip()
+        }
+        xp_value = _safe_float(selected.get("xP"), 0.0)
+        market_value = _safe_int(selected.get("valor_mercado"), 0)
+        clause_value = _safe_int(selected.get("clausula"), 0)
+        ratio = _clause_exposure_ratio(market_value, clause_value)
+        exposed = ratio is not None and ratio >= CLAUSE_EXPOSURE_THRESHOLD
+        is_key = ptid in key_player_team_ids
+        increase_delta = int(round(amount * CLAUSE_INCREASE_FACTOR))
+        estimated_new_clause = clause_value + increase_delta if clause_value > 0 else None
+
+        if not force and (not is_key or not exposed):
+            return _as_json(
+                {
+                    "ok": False,
+                    "blocked": True,
+                    "player_team_id": ptid,
+                    "nombre": selected.get("nombre"),
+                    "xP": xp_value,
+                    "valor_mercado": market_value,
+                    "clausula_actual": clause_value,
+                    "ratio_valor_vs_clausula": ratio,
+                    "regla_moderacion": {
+                        "jugador_clave": is_key,
+                        "expuesto_clausulazo": exposed,
+                        "umbral_exposicion": CLAUSE_EXPOSURE_THRESHOLD,
+                    },
+                    "error": (
+                        "Bloqueado por moderación: solo subir cláusula en jugadores clave "
+                        "y con valor de mercado cercano a cláusula. Usa force=true solo si hay justificación."
+                    ),
+                }
+            )
+
+        if runtime.dry_run:
+            return _as_json(
+                {
+                    "dry_run": True,
+                    "action": "increase_clause",
+                    "player_team_id": ptid,
+                    "nombre": selected.get("nombre"),
+                    "value_to_increase": amount,
+                    "factor": CLAUSE_INCREASE_FACTOR,
+                    "estimated_clause_increase": increase_delta,
+                    "clausula_actual": clause_value,
+                    "clausula_estimada_nueva": estimated_new_clause,
+                    "ratio_valor_vs_clausula": ratio,
+                    "jugador_clave": is_key,
+                    "expuesto_clausulazo": exposed,
+                }
+            )
+
+        try:
+            client = runtime.get_client()
+            res = client.increase_player_clause(
+                player_team_id=ptid,
+                value_to_increase=amount,
+                factor=CLAUSE_INCREASE_FACTOR,
+            )
+            runtime.invalidate()
+            return _as_json(
+                {
+                    "ok": True,
+                    "response": res,
+                    "player_team_id": ptid,
+                    "value_to_increase": amount,
+                    "factor": CLAUSE_INCREASE_FACTOR,
+                    "estimated_clause_increase": increase_delta,
+                    "clausula_estimada_nueva": estimated_new_clause,
+                }
+            )
+        except Exception as exc:
+            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    @tool
     def current_lineup() -> str:
         """Obtiene la alineación actual guardada en la API para mi equipo."""
         try:
@@ -547,5 +699,6 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         sell_player_phase1_tool,
         place_bid_tool,
         buyout_player_tool,
+        increase_clause_tool,
         current_lineup,
     ]

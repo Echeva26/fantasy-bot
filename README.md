@@ -8,31 +8,33 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 - El modelo de prediccion es fijo: `xgboost`.
 - La liga se elige en Telegram por nombre: `/ligas` y `/liga <nombre>`.
 - Al elegir la liga, el bot detecta automaticamente la hora real de cierre del mercado leyendo la expiracion de jugadores publicados.
-- PRE mercado: se ejecuta siempre 5 minutos antes del cierre real.
-- POST mercado: se ejecuta siempre 5 minutos despues del cierre real.
+- PRE mercado: se ejecuta siempre 10 minutos antes del cierre real.
+- POST mercado: se ejecuta siempre 10 minutos despues del cierre real.
 - Guarda la alineacion exactamente 23 horas y 55 minutos antes del inicio de la jornada.
+- Puede proteger plantilla subiendo clausulas de jugadores clave cuando estan expuestos a clausulazo.
 - Si el token falta o caduca, te avisa por Telegram para renovarlo.
 
 ### Operativa (PRE, POST, /informe, /compraventa y /optimizar)
 
-- PRE (automatico, 5 min antes del cierre):
+- PRE (automatico, 10 min antes del cierre):
   - Lo lanza el daemon LangChain.
   - Analiza equipo y mercado del ciclo actual.
   - Puede preparar/ejecutar movimientos pre-cierre (segun decision del agente y herramientas disponibles).
 
-- POST (automatico, 5 min despues del cierre):
+- POST (automatico, 10 min despues del cierre):
   - Lo lanza el daemon LangChain.
   - Ejecuta tareas de post-cierre (por ejemplo aceptar ofertas cerradas) y ajustes de gestion.
 
 - /informe (manual en Telegram):
   - Ejecuta el agente IA en simulacion (`dry-run`), sin tocar mercado real.
   - Genera un informe del ciclo actual.
-  - Guarda un plan ejecutable en cache para ese ciclo de mercado.
+  - Guarda un plan ejecutable en cache para ese ciclo de mercado (ventas, pujas, clausulazos y subida de clausula).
 
 - /compraventa (manual en Telegram):
   - Ejecuta en real exactamente el plan cacheado del ultimo `/informe`.
   - Solo se permite si ese `/informe` es del mismo ciclo de mercado.
   - Si el ciclo cambió, bloquea la ejecución y obliga a lanzar `/informe` de nuevo para evitar operar con plan deprecado.
+  - Si el plan incluye subida de clausula, aplica la regla fija: por cada 1M invertido sube 2M la clausula.
 
 - /optimizar (manual en Telegram):
   - Recalcula y guarda en ese momento la mejor alineacion por xP.
@@ -93,4 +95,4 @@ docker compose logs -f autonomous-bot
 - Ejecuta `/ligas`.
 - Ejecuta `/liga <nombre>`.
 
-Al seleccionar la liga, el bot te respondera con la hora de mercado detectada y confirmara que PRE y POST se ejecutan 5 minutos antes/despues.
+Al seleccionar la liga, el bot te respondera con la hora de mercado detectada y confirmara que PRE y POST se ejecutan 10 minutos antes/despues.

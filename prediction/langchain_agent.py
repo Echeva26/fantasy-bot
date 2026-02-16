@@ -35,6 +35,8 @@ Reglas operativas:
 4. Respeta presupuesto, ventanas de mercado y limitaciones de datos.
 5. Si dry_run está activo, actúa como simulación (sin cambios reales).
 6. Después de acciones ejecutadas, verifica estado de nuevo con herramientas.
+7. La subida de cláusula debe ser moderada: solo jugadores clave y expuestos a clausulazo.
+8. Regla fija de cláusulas: por cada 1M invertido, la cláusula sube 2M (factor 2.0).
 
 Formato de salida final:
 - Responde en español.
