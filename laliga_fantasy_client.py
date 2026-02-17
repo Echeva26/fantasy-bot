@@ -577,7 +577,14 @@ class LaLigaFantasyClient:
         resp.raise_for_status()
         return resp.json()
 
-    def _post(self, url: str, json_body: dict) -> dict | list:
+    def _post(
+        self,
+        url: str,
+        json_body: dict,
+        *,
+        expected_error_codes: set[str] | None = None,
+        expected_error_substrings: tuple[str, ...] = (),
+    ) -> dict | list:
         """POST autenticado. Usado para operaciones de mercado (vender, comprar)."""
         headers = {
             **self._auth_headers(),
@@ -589,7 +596,40 @@ class LaLigaFantasyClient:
                 err_body = resp.json() if resp.content else resp.text[:500]
             except Exception:
                 err_body = resp.text[:500] if resp.text else ""
-            logger.warning("POST %s → %s | body: %s | response: %s", url, resp.status_code, json_body, err_body)
+            expected_codes_norm = {
+                str(code).strip().replace("_", ".")
+                for code in (expected_error_codes or set())
+                if str(code).strip()
+            }
+            err_code = ""
+            err_message = ""
+            if isinstance(err_body, dict):
+                err_code = str(
+                    err_body.get("errorCode", "") or err_body.get("code", "")
+                ).strip()
+                err_message = str(err_body.get("message", "")).strip()
+            err_code_norm = err_code.replace("_", ".")
+            expected_by_code = bool(expected_codes_norm) and err_code_norm in expected_codes_norm
+            expected_by_msg = bool(expected_error_substrings) and any(
+                frag.lower() in err_message.lower()
+                for frag in expected_error_substrings
+            )
+            if expected_by_code or expected_by_msg:
+                logger.info(
+                    "POST esperado para fallback %s → %s | body: %s | response: %s",
+                    url,
+                    resp.status_code,
+                    json_body,
+                    err_body,
+                )
+            else:
+                logger.warning(
+                    "POST %s → %s | body: %s | response: %s",
+                    url,
+                    resp.status_code,
+                    json_body,
+                    err_body,
+                )
         resp.raise_for_status()
         return resp.json() if resp.content else {}
 
@@ -721,7 +761,50 @@ class LaLigaFantasyClient:
 
         def _place_bid(market_id: str, money: int) -> dict:
             url = f"{BASE_URL}/api/v3/league/{self.league_id}/market/{market_id}/bid"
-            return self._post(url, {"money": int(money)})
+            return self._post(
+                url,
+                {"money": int(money)},
+                expected_error_codes={"030.01.09", "030_01_09"},
+                expected_error_substrings=("pending bid",),
+            )
+
+        def _edit_bid(market_info: dict, money: int) -> dict:
+            bid_id = str(market_info.get("bid_id") or "")
+            if not bid_id:
+                raise ValueError("No hay bid_id para editar puja existente.")
+            edit_money = _compute_bid_money(int(money), market_info)
+            edit_url = (
+                f"{BASE_URL}/api/v3/league/{self.league_id}/market/"
+                f"{market_info['item_id']}/bid/{bid_id}"
+            )
+            logger.info(
+                "Puja existente detectada: editando bid %s para item %s...",
+                bid_id,
+                market_info["item_id"],
+            )
+            headers = {
+                **self._auth_headers(),
+                "Content-Type": "application/json",
+            }
+            resp = self.session.put(
+                edit_url,
+                json={"money": int(edit_money)},
+                headers=headers,
+            )
+            if not resp.ok:
+                try:
+                    err_body = resp.json() if resp.content else resp.text[:500]
+                except Exception:
+                    err_body = resp.text[:500] if resp.text else ""
+                logger.warning(
+                    "PUT %s → %s | body: %s | response: %s",
+                    edit_url,
+                    resp.status_code,
+                    {"money": int(edit_money)},
+                    err_body,
+                )
+            resp.raise_for_status()
+            return resp.json() if resp.content else {}
 
         def _http_error_info(exc: requests.exceptions.HTTPError) -> tuple[int | None, str]:
             status = None
@@ -764,6 +847,10 @@ class LaLigaFantasyClient:
                 amount, bid_money,
             )
 
+        # Si ya hay puja nuestra en ese item, editar directamente evita 400 innecesario.
+        if str(market_info.get("bid_id") or "").strip():
+            return _edit_bid(market_info, bid_money)
+
         last_exc: requests.exceptions.HTTPError | None = None
         try:
             return _place_bid(market_info["item_id"], bid_money)
@@ -798,39 +885,13 @@ class LaLigaFantasyClient:
             # Si ya existe puja previa, editarla.
             bid_id = str(market_info.get("bid_id") or "")
             if bid_id:
-                edit_money = _compute_bid_money(bid_money, market_info)
-                edit_url = (
-                    f"{BASE_URL}/api/v3/league/{self.league_id}/market/"
-                    f"{market_info['item_id']}/bid/{bid_id}"
-                )
-                logger.info(
-                    "Fallback puja: editando bid existente %s para item %s...",
-                    bid_id, market_info["item_id"],
-                )
                 try:
-                    headers = {
-                        **self._auth_headers(),
-                        "Content-Type": "application/json",
-                    }
-                    resp = self.session.put(
-                        edit_url,
-                        json={"money": int(edit_money)},
-                        headers=headers,
+                    logger.info(
+                        "Fallback puja: intentando edición de bid existente %s para item %s...",
+                        bid_id,
+                        market_info["item_id"],
                     )
-                    if not resp.ok:
-                        try:
-                            err_body = resp.json() if resp.content else resp.text[:500]
-                        except Exception:
-                            err_body = resp.text[:500] if resp.text else ""
-                        logger.warning(
-                            "PUT %s → %s | body: %s | response: %s",
-                            edit_url,
-                            resp.status_code,
-                            {"money": int(edit_money)},
-                            err_body,
-                        )
-                    resp.raise_for_status()
-                    return resp.json() if resp.content else {}
+                    return _edit_bid(market_info, bid_money)
                 except requests.exceptions.HTTPError as exc_edit:
                     last_exc = exc_edit
 

@@ -1032,6 +1032,7 @@ def _run_langchain_agent_cmd(
             res = run_agent_objective(
                 league_id=league_id,
                 objective=REPORT_PLAN_OBJECTIVE,
+                phase="pre",
                 llm_model=os.getenv("LANGCHAIN_LLM_MODEL", "gpt-5-mini"),
                 temperature=float(os.getenv("LANGCHAIN_TEMPERATURE", "0.1")),
                 max_iterations=max(1, int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20"))),

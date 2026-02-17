@@ -211,6 +211,7 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
         return run_agent_objective(
             league_id=league_id,
             objective=custom_objective,
+            phase=phase,
             model_type=MODEL_TYPE,
             llm_model=args.llm_model,
             temperature=args.temperature,
@@ -245,6 +246,7 @@ def _run_pre_informe_plus_compraventa(
     res = run_agent_objective(
         league_id=league_id,
         objective=REPORT_PLAN_OBJECTIVE,
+        phase="pre",
         llm_model=args.llm_model,
         temperature=args.temperature,
         max_iterations=args.max_iterations,

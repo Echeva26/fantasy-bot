@@ -255,6 +255,7 @@ def run_agent_objective(
     *,
     league_id: str,
     objective: str,
+    phase: str = "full",
     model_type: str = MODEL_TYPE,
     llm_model: str = "gpt-5-mini",
     temperature: float = 0.1,
@@ -266,6 +267,7 @@ def run_agent_objective(
         league_id=league_id,
         model_type=model_type,
         dry_run=dry_run,
+        phase=phase,
     )
     executor = build_agent_executor(
         runtime,
@@ -300,6 +302,7 @@ def run_agent_objective(
     return {
         "league_id": league_id,
         "objective": objective,
+        "phase": phase,
         "dry_run": dry_run,
         "model_type": model_type,
         "llm_model": llm_model,
@@ -325,6 +328,7 @@ def run_agent_phase(
     return run_agent_objective(
         league_id=league_id,
         objective=PHASE_OBJECTIVES[phase_key],
+        phase=phase_key,
         model_type=model_type,
         llm_model=llm_model,
         temperature=temperature,
@@ -389,6 +393,7 @@ def main() -> None:
     result = run_agent_objective(
         league_id=league_id,
         objective=objective,
+        phase=args.phase,
         model_type=MODEL_TYPE,
         llm_model=args.llm_model,
         temperature=args.temperature,

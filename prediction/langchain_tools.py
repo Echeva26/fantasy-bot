@@ -80,6 +80,7 @@ class FantasyAgentRuntime:
     league_id: str
     model_type: str = MODEL_TYPE
     dry_run: bool = False
+    phase: str = "full"
     _snapshot: dict | None = field(default=None, init=False, repr=False)
     _pred_df: pd.DataFrame | None = field(default=None, init=False, repr=False)
     _first_match_ts: int = field(default=0, init=False, repr=False)
@@ -98,6 +99,14 @@ class FantasyAgentRuntime:
                 MODEL_TYPE,
             )
         self.model_type = MODEL_TYPE
+        phase = (self.phase or "full").strip().lower()
+        if phase not in {"pre", "post", "full"}:
+            logger.warning(
+                "Fase no soportada '%s' en runtime LangChain; usando 'full'.",
+                self.phase,
+            )
+            phase = "full"
+        self.phase = phase
 
     def invalidate(self) -> None:
         self._snapshot = None
@@ -216,6 +225,22 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         raise RuntimeError(
             "LangChain no está instalado. Instala dependencias con: pip install -r requirements.txt"
         ) from exc
+
+    def _block_if_post(action: str) -> str | None:
+        if runtime.phase != "post":
+            return None
+        return _as_json(
+            {
+                "ok": False,
+                "blocked": True,
+                "phase": runtime.phase,
+                "action": action,
+                "reason": (
+                    "Accion bloqueada en fase POST. "
+                    "En POST solo se permiten accept_closed_offers y autoset_best_lineup_tool."
+                ),
+            }
+        )
 
     @tool
     def snapshot_summary(force_refresh: bool = False) -> str:
@@ -417,6 +442,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
     @tool
     def execute_simulated_plan(force_refresh: bool = False) -> str:
         """Ejecuta el plan simulado (ventas fase1 + compras). Respeta `dry_run` del runtime."""
+        blocked = _block_if_post("execute_simulated_plan")
+        if blocked:
+            return blocked
         try:
             snapshot = runtime.get_snapshot(force_refresh=force_refresh)
             plan, _, _ = runtime.get_transfer_plan(force_refresh=force_refresh)
@@ -485,6 +513,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
     @tool
     def sell_player_phase1_tool(player_team_id: str, sale_price: int) -> str:
         """Publica un jugador propio en mercado (fase1). Requiere `player_team_id`."""
+        blocked = _block_if_post("sell_player_phase1_tool")
+        if blocked:
+            return blocked
         if runtime.dry_run:
             return _as_json(
                 {
@@ -505,6 +536,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
     @tool
     def place_bid_tool(market_item_id: str, amount: int, player_id: int = 0) -> str:
         """Hace/actualiza una puja en mercado libre."""
+        blocked = _block_if_post("place_bid_tool")
+        if blocked:
+            return blocked
         if runtime.dry_run:
             return _as_json(
                 {
@@ -530,6 +564,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
     @tool
     def buyout_player_tool(player_team_id: str, clause_to_pay: int = 0) -> str:
         """Ejecuta un clausulazo sobre un `player_team_id` rival."""
+        blocked = _block_if_post("buyout_player_tool")
+        if blocked:
+            return blocked
         if runtime.dry_run:
             return _as_json(
                 {
@@ -563,6 +600,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         Debe usarse de forma moderada: prioriza jugadores clave y expuestos
         (valor de mercado cercano a la cláusula).
         """
+        blocked = _block_if_post("increase_clause_tool")
+        if blocked:
+            return blocked
         ptid = str(player_team_id or "").strip()
         amount = _safe_int(value_to_increase, 0)
         if not ptid:
