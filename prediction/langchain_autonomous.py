@@ -17,13 +17,13 @@ from pathlib import Path
 from threading import Event
 from zoneinfo import ZoneInfo
 
-from laliga_fantasy_client import load_token
+from laliga_fantasy_client import TOKEN_FILE, load_token
 from prediction.league_selection import load_selected_league, resolve_league_id
 from prediction.langchain_agent import run_agent_objective, run_agent_phase
 from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.predict import get_next_round, get_sofascore_season_id
-from prediction.telegram_notify import send_telegram_message
+from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
 from prediction.token_bot import (
     REPORT_PLAN_OBJECTIVE,
     _build_clause_actions_from_report,
@@ -80,14 +80,40 @@ def _notify(text: str) -> None:
 
 
 def _token_ok() -> bool:
-    return bool(load_token())
+    token_max_age = float(os.getenv("TOKEN_MAX_AGE_HOURS", "23"))
+    status, _ = _token_status(max_age_hours=token_max_age)
+    return status == "ok"
+
+
+def _token_status(max_age_hours: float = 23.0) -> tuple[str, float | None]:
+    """
+    Devuelve (status, age_h) con status: "ok" | "missing" | "expired" | "invalid".
+    """
+    if not TOKEN_FILE.exists():
+        return "missing", None
+    try:
+        data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))
+        saved_at_raw = data.get("saved_at")
+        if not saved_at_raw:
+            return "invalid", None
+        saved_at = datetime.fromisoformat(saved_at_raw)
+        if saved_at.tzinfo is None:
+            saved_at = saved_at.replace(tzinfo=timezone.utc)
+        age_h = (datetime.now(timezone.utc) - saved_at).total_seconds() / 3600.0
+        if age_h >= max_age_hours:
+            return "expired", age_h
+        return "ok", age_h
+    except Exception:
+        return "invalid", None
 
 
 def _maybe_alert_token_issue(state: dict, cooldown_minutes: int) -> dict:
     now_utc = datetime.now(timezone.utc)
     new_state = dict(state)
 
-    if _token_ok():
+    token_max_age = float(os.getenv("TOKEN_MAX_AGE_HOURS", "23"))
+    status, age_h = _token_status(max_age_hours=token_max_age)
+    if status == "ok":
         new_state.pop("token_alert_at", None)
         return new_state
 
@@ -99,10 +125,15 @@ def _maybe_alert_token_issue(state: dict, cooldown_minutes: int) -> dict:
     )
 
     if should_alert:
-        msg = (
-            "Fantasy LangChain Agent: token ausente/expirado.\n"
-            "Renueva token enviándolo al bot de Telegram antes del próximo ciclo."
-        )
+        if status == "expired":
+            msg = (
+                f"Fantasy LangChain Agent: TOKEN CADUCADO (edad ~{(age_h or 0.0):.1f}h)"
+                + GUIDA_RENOVACION_TOKEN
+            )
+        elif status == "missing":
+            msg = "Fantasy LangChain Agent: TOKEN AUSENTE" + GUIDA_RENOVACION_TOKEN
+        else:
+            msg = "Fantasy LangChain Agent: TOKEN INVALIDO" + GUIDA_RENOVACION_TOKEN
         logger.warning(msg.replace("\n", " | "))
         _notify(msg)
         new_state["token_alert_at"] = now_utc.isoformat()
