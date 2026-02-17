@@ -59,6 +59,20 @@ def _parse_iso_dt(raw: str | None) -> datetime | None:
         return None
 
 
+def _parse_market_key_local(raw: str | None, tz: ZoneInfo | timezone) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        else:
+            dt = dt.astimezone(tz)
+        return dt
+    except Exception:
+        return None
+
+
 def _load_state(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -510,6 +524,10 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 for key in (
                     "last_pre_market_key",
                     "last_post_market_key",
+                    "pending_post_market_key",
+                    "pending_post_close_local",
+                    "pending_post_local",
+                    "pending_post_set_at",
                     "market_key",
                     "market_close_local",
                     "market_pre_local",
@@ -618,23 +636,67 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                     state["last_pre_market_key"] = market_key
                     state["last_pre_run_at"] = now_utc.isoformat()
                     state["last_pre_output"] = output[:2000]
+                    # POST debe ejecutarse para el MISMO ciclo que lanzó PRE,
+                    # aunque el mercado refresque y cambie de market_key.
+                    state["pending_post_market_key"] = market_key
+                    state["pending_post_close_local"] = close_local.isoformat()
+                    state["pending_post_local"] = post_local.isoformat()
+                    state["pending_post_set_at"] = now_utc.isoformat()
 
-                # POST: 10 min después del cierre
-                if (
-                    now_local >= post_local
-                    and str(state.get("last_post_market_key", "")) != market_key
-                ):
-                    logger.info("Lanzando fase POST (market_key=%s)...", market_key)
-                    res = _run_phase("post", args, league_id)
-                    output = res.get("output", "")
-                    state["last_post_market_key"] = market_key
-                    state["last_post_run_at"] = now_utc.isoformat()
-                    state["last_post_output"] = output[:2000]
-                    _notify(
-                        "Fantasy LangChain (POST) completado\n"
-                        f"Tools: {len(res.get('steps', []))}\n"
-                        f"Resumen:\n{output[:1200]}"
-                    )
+            # POST: ejecutar sobre el ciclo pendiente generado por PRE.
+            pending_post_key = str(state.get("pending_post_market_key", "")).strip()
+            if not pending_post_key:
+                # Recuperación defensiva: si PRE sí corrió pero no quedó pendiente
+                # (estado generado por versiones anteriores), rearmar POST.
+                last_pre_key = str(state.get("last_pre_market_key", "")).strip()
+                last_post_key = str(state.get("last_post_market_key", "")).strip()
+                if last_pre_key and last_pre_key != last_post_key:
+                    recovered_close_local = _parse_market_key_local(last_pre_key, tz)
+                    if recovered_close_local:
+                        recovered_post_local = recovered_close_local + timedelta(minutes=10)
+                        state["pending_post_market_key"] = last_pre_key
+                        state["pending_post_close_local"] = recovered_close_local.isoformat()
+                        state["pending_post_local"] = recovered_post_local.isoformat()
+                        state["pending_post_set_at"] = now_utc.isoformat()
+                        pending_post_key = last_pre_key
+                        logger.info(
+                            "Recuperado POST pendiente desde last_pre_market_key=%s",
+                            last_pre_key,
+                        )
+
+            pending_post_key = str(state.get("pending_post_market_key", "")).strip()
+            pending_post_close_local = _parse_iso_dt(state.get("pending_post_close_local"))
+            pending_post_local = _parse_iso_dt(state.get("pending_post_local"))
+            # Compatibilidad defensiva con estados antiguos sin close guardado.
+            if pending_post_local and not pending_post_close_local:
+                pending_post_close_local = pending_post_local - timedelta(minutes=10)
+            if (
+                pending_post_key
+                and pending_post_close_local
+                and pending_post_local
+                and now_local >= pending_post_close_local
+                and now_local >= pending_post_local
+                and str(state.get("last_post_market_key", "")) != pending_post_key
+            ):
+                logger.info(
+                    "Lanzando fase POST pendiente (pending_market_key=%s)...",
+                    pending_post_key,
+                )
+                res = _run_phase("post", args, league_id)
+                output = res.get("output", "")
+                state["last_post_market_key"] = pending_post_key
+                state["last_post_run_at"] = now_utc.isoformat()
+                state["last_post_output"] = output[:2000]
+                state.pop("pending_post_market_key", None)
+                state.pop("pending_post_close_local", None)
+                state.pop("pending_post_local", None)
+                state.pop("pending_post_set_at", None)
+                _notify(
+                    "Fantasy LangChain (POST) completado\n"
+                    f"Ciclo: {pending_post_key}\n"
+                    f"Tools: {len(res.get('steps', []))}\n"
+                    f"Resumen:\n{output[:1200]}"
+                )
 
             # 2) Programación de alineación exacta: 23h55 antes
             state, lineup_err = _refresh_lineup_target(state)
