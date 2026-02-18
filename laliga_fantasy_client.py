@@ -709,6 +709,7 @@ class LaLigaFantasyClient:
                 "sale_price": None,
                 "market_value": None,
                 "bid_money": None,
+                "number_of_bids": None,
             }
 
             try:
@@ -732,6 +733,7 @@ class LaLigaFantasyClient:
                     "sale_price": _to_int(it.get("salePrice")),
                     "market_value": _to_int(pm.get("marketValue")),
                     "bid_money": bid_money,
+                    "number_of_bids": _to_int(it.get("numberOfBids")),
                 }
 
             # 1) Intentar por ID exacto.
@@ -748,8 +750,37 @@ class LaLigaFantasyClient:
 
             return fallback
 
+        def _external_bids_count(market_info: dict) -> int:
+            total_bids = _to_int(market_info.get("number_of_bids")) or 0
+            if total_bids <= 0:
+                return 0
+            own_bid = bool(str(market_info.get("bid_id") or "").strip())
+            if own_bid:
+                # Si ya tenemos puja en ese item, una de las pujas es nuestra.
+                return max(0, total_bids - 1)
+            return total_bids
+
+        def _fallback_competitive_bonus(competitors: int, market_info: dict) -> int:
+            """
+            Bonus defensivo cuando llega una puja mínima en un item competido.
+            Rango: 2M - 4M.
+            """
+            market_value = _to_int(market_info.get("market_value")) or 0
+
+            # Calidad aproximada por valor (fallback sin xP explícita en esta capa).
+            value_component = 0
+            if market_value > 8_000_000:
+                span = max(1, 25_000_000 - 8_000_000)
+                value_component = int(
+                    round(min(1_500_000, ((market_value - 8_000_000) / span) * 1_500_000))
+                )
+
+            pressure_component = min(500_000, max(0, competitors - 1) * 250_000)
+            bonus = 2_000_000 + value_component + pressure_component
+            return max(2_000_000, min(4_000_000, bonus))
+
         def _compute_bid_money(requested: int, market_info: dict) -> int:
-            money = int(requested)
+            requested_money = int(requested)
             sale_price = _to_int(market_info.get("sale_price")) or 0
             market_value = _to_int(market_info.get("market_value")) or 0
             current_bid = _to_int(market_info.get("bid_money")) or 0
@@ -757,7 +788,33 @@ class LaLigaFantasyClient:
             minimum = max(sale_price, market_value)
             if current_bid > 0:
                 minimum = max(minimum, current_bid + 1)
-            return max(money, minimum)
+
+            money = max(requested_money, minimum)
+
+            # Si ya hay pujas de terceros, evitamos pujar al mínimo para competir.
+            competitors = _external_bids_count(market_info)
+            if competitors > 0:
+                requested_premium = max(0, requested_money - minimum)
+                # Si el caller (agente/plan) ya decidió una prima >=2M, la respetamos.
+                if requested_premium < 2_000_000:
+                    competitive_bonus = _fallback_competitive_bonus(competitors, market_info)
+                    competitive_target = ((minimum + competitive_bonus + 9_999) // 10_000) * 10_000
+                else:
+                    competitive_target = money
+
+                if competitive_target > money:
+                    logger.info(
+                        "Puja competitiva: %s puja(s) de terceros detectadas "
+                        "en item %s. Ajustando %s -> %s (prima %s).",
+                        competitors,
+                        market_info.get("item_id", "?"),
+                        money,
+                        competitive_target,
+                        competitive_target - minimum,
+                    )
+                    money = competitive_target
+
+            return money
 
         def _place_bid(market_id: str, money: int) -> dict:
             url = f"{BASE_URL}/api/v3/league/{self.league_id}/market/{market_id}/bid"

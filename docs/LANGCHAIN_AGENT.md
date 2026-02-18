@@ -10,6 +10,7 @@ El agente IA gestiona tu equipo de LaLiga Fantasy de forma autonoma:
 - Detecta automaticamente la hora de mercado desde la expiracion de jugadores publicados en la liga.
 - Ejecuta PRE siempre 10 minutos antes del cierre real de mercado (flujo conjunto de `/informe` + `/compraventa` del ciclo actual).
 - Ejecuta POST siempre 10 minutos despues del cierre real de mercado.
+- Incluye comando manual `/ventas` para forzar fase 2 (aceptar ofertas de liga pendientes tras cierre).
 - Guarda alineacion exactamente 23h55 antes del inicio de jornada.
 - Permite optimizacion manual inmediata de alineacion con `/optimizar`.
 - Puede subir clausulas de jugadores propios con criterio de moderacion (solo clave + expuestos).

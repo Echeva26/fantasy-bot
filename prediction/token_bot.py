@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from laliga_fantasy_client import LaLigaFantasyClient, TOKEN_FILE, load_token, save_token
+from prediction.advisor_execute import run_aceptar_ofertas
 from prediction.langchain_agent import run_agent_objective
 from prediction.league_selection import (
     load_selected_league,
@@ -1205,6 +1206,48 @@ def _run_optimize_lineup_cmd(
     return f"No se pudo optimizar la alineacion: {reason}"
 
 
+def _run_pending_sales_cmd(
+    *,
+    bot_token: str,
+    chat_id: str,
+) -> str:
+    """
+    Acepta ofertas de liga pendientes (fase 2 de ventas) una vez cerrado mercado.
+    Equivale a `python -m prediction.advisor_execute --aceptar-ofertas`.
+    """
+    send_telegram_message(bot_token, chat_id, "Ejecutando ventas pendientes (fase 2)...")
+
+    league_id, league_err = _resolve_operational_league_id()
+    if not league_id:
+        return f"Error de liga: {league_err}"
+
+    status, _ = _token_status(max_age_hours=float(os.getenv("TOKEN_MAX_AGE_HOURS", "23")))
+    if status != "ok":
+        return f"Error: token no valido ({status}). Renuevalo con /help."
+
+    selected = load_selected_league() or {}
+    league_name = str(selected.get("league_name", "")).strip() or league_id
+
+    try:
+        accepted = int(run_aceptar_ofertas(argparse.Namespace(league=league_id)))
+    except Exception as exc:
+        logger.exception("Error en /ventas: %s", exc)
+        return f"Error ejecutando /ventas: {type(exc).__name__}: {exc}"
+
+    if accepted > 0:
+        return (
+            "VENTAS EJECUTADAS\n"
+            f"Liga: {league_name}\n"
+            f"Ofertas de liga aceptadas: {accepted}\n"
+            "Estado: fase 2 de ventas completada."
+        )
+
+    return (
+        "No hay ventas pendientes para aceptar ahora.\n"
+        "Si acabas de publicar ventas, espera al cierre de mercado y vuelve a usar /ventas."
+    )
+
+
 def _handle_text(
     text: str,
     *,
@@ -1222,6 +1265,7 @@ def _handle_text(
             "• /liga <nombre> - Seleccionar liga activa\n"
             "• /informe - Generar informe IA y cachear plan del ciclo\n"
             "• /compraventa - Ejecutar en real el plan del ultimo /informe (mismo ciclo)\n\n"
+            "• /ventas - Aceptar ofertas de liga pendientes (fase 2 tras cierre)\n"
             "• /optimizar - Guardar ahora la mejor alineacion por xP\n\n"
             "Para renovar token: envia JWT (eyJ...) o URL de jwt.ms con id_token.",
         )
@@ -1257,6 +1301,16 @@ def _handle_text(
             )
         else:
             msg = "Comando /compraventa requiere contexto de bot."
+        return False, msg
+
+    if t.startswith("/ventas"):
+        if bot_token and chat_id:
+            msg = _run_pending_sales_cmd(
+                bot_token=bot_token,
+                chat_id=chat_id,
+            )
+        else:
+            msg = "Comando /ventas requiere contexto de bot."
         return False, msg
 
     if t.startswith("/optimizar"):
@@ -1305,6 +1359,7 @@ def _set_bot_commands(bot_token: str) -> None:
     commands = [
         {"command": "informe", "description": "Informe IA y plan cacheado (ciclo actual)"},
         {"command": "compraventa", "description": "Ejecutar plan cacheado del ultimo /informe"},
+        {"command": "ventas", "description": "Aceptar ofertas de liga pendientes (fase 2)"},
         {"command": "optimizar", "description": "Optimizar y guardar ahora la alineacion"},
         {"command": "ligas", "description": "Listar ligas disponibles"},
         {"command": "liga", "description": "Seleccionar liga por nombre"},

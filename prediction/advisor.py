@@ -67,6 +67,85 @@ def load_snapshot_from_file(path: str | Path) -> dict:
 
 # ─── Utilidad: ventana de clausulazos ─────────────────────────
 CLAUSULAZO_LOCKOUT_HOURS = 24  # Clausulazos se bloquean 24h antes del primer partido
+BID_COMPETITION_MIN_RAISE_EUR = 2_000_000
+BID_COMPETITION_MAX_RAISE_EUR = 4_000_000
+BID_COMPETITION_ROUND_STEP_EUR = 10_000
+BID_COMPETITION_REFERENCE_XP_LOW = 4.0
+BID_COMPETITION_REFERENCE_XP_HIGH = 9.0
+BID_COMPETITION_REFERENCE_VALUE_LOW = 8_000_000
+BID_COMPETITION_REFERENCE_VALUE_HIGH = 25_000_000
+BID_COMPETITION_BID_PRESSURE_STEP_EUR = 250_000
+BID_COMPETITION_BID_PRESSURE_CAP_EUR = 750_000
+
+
+def _round_up_to_step(value: int, step: int) -> int:
+    if step <= 0:
+        return int(value)
+    n = int(value)
+    if n <= 0:
+        return 0
+    return ((n + step - 1) // step) * step
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def compute_competitive_bid_amount(
+    *,
+    base_amount: int,
+    market_value: int = 0,
+    external_bids: int = 0,
+    expected_points: float = 0.0,
+) -> int:
+    """
+    Ajusta la puja si ya hay competencia en el mercado.
+
+    Regla:
+    - Sin pujas de terceros: mantener base (mínimo legal).
+    - Con pujas de terceros: sumar un incremento absoluto entre 2M y 4M,
+      adaptado al xP y valor del jugador.
+    """
+    amount = max(int(base_amount or 0), int(market_value or 0))
+    competitors = max(0, int(external_bids or 0))
+    if competitors <= 0:
+        return amount
+
+    xp = float(expected_points or 0.0)
+    xp_norm = _clamp01(
+        (xp - BID_COMPETITION_REFERENCE_XP_LOW)
+        / max(0.1, BID_COMPETITION_REFERENCE_XP_HIGH - BID_COMPETITION_REFERENCE_XP_LOW)
+    )
+
+    value_ref = max(amount, int(market_value or 0))
+    value_norm = _clamp01(
+        (value_ref - BID_COMPETITION_REFERENCE_VALUE_LOW)
+        / max(
+            1.0,
+            BID_COMPETITION_REFERENCE_VALUE_HIGH - BID_COMPETITION_REFERENCE_VALUE_LOW,
+        )
+    )
+
+    # Bonus principal en rango [2M, 4M] según contexto del jugador.
+    premium_abs = (
+        BID_COMPETITION_MIN_RAISE_EUR
+        + int(round(1_250_000 * xp_norm))
+        + int(round(750_000 * value_norm))
+    )
+
+    # Más presión de mercado => acercar al tope.
+    if competitors > 1:
+        pressure_bonus = min(
+            BID_COMPETITION_BID_PRESSURE_CAP_EUR,
+            (competitors - 1) * BID_COMPETITION_BID_PRESSURE_STEP_EUR,
+        )
+        premium_abs += int(pressure_bonus)
+
+    premium_abs = max(
+        BID_COMPETITION_MIN_RAISE_EUR,
+        min(BID_COMPETITION_MAX_RAISE_EUR, premium_abs),
+    )
+    return _round_up_to_step(amount + premium_abs, BID_COMPETITION_ROUND_STEP_EUR)
 
 
 def clausulazos_available(first_match_ts: int) -> tuple[bool, float]:
@@ -571,7 +650,21 @@ def simulate_transfer_plan(
         coste = compra.get("coste", 0)
         if vm <= 0:
             return True
-        return coste <= vm * MAX_SOBREPRECIO
+        if coste <= vm * MAX_SOBREPRECIO:
+            return True
+
+        # Excepción controlada en subastas competidas:
+        # permitimos sobreprecio moderado cuando hay competencia y buen xP.
+        pujas = int(compra.get("pujas_detectadas", 0) or 0)
+        incremento = int(compra.get("incremento_competitivo", 0) or 0)
+        xp = float(compra.get("xP", 0) or 0.0)
+        return (
+            pujas > 0
+            and incremento >= BID_COMPETITION_MIN_RAISE_EUR
+            and incremento <= BID_COMPETITION_MAX_RAISE_EUR
+            and xp >= 4.5
+            and coste <= vm * 1.45
+        )
 
     def _crear_fichaje(compra: dict) -> dict:
         return {
@@ -603,11 +696,23 @@ def simulate_transfer_plan(
     for p in available["mercado"]:
         precio_venta = p.get("precio_venta", 0) or 0
         valor_mercado = p.get("valor_mercado", 0) or 0
+        pujas_detectadas = int(p.get("pujas", 0) or 0)
+        coste_base = max(precio_venta, valor_mercado)
+        xp_compra = float(p.get("xP", 0) or 0.0)
+        coste_competitivo = compute_competitive_bid_amount(
+            base_amount=coste_base,
+            market_value=valor_mercado,
+            external_bids=pujas_detectadas,
+            expected_points=xp_compra,
+        )
         pool_compras.append({
             **p,
             "tipo_op": "mercado",
-            # La API puede exigir como mínimo el valor de mercado actual.
-            "coste": max(precio_venta, valor_mercado),
+            # Si hay pujas de terceros, subimos la oferta para competir.
+            "coste_base": coste_base,
+            "pujas_detectadas": pujas_detectadas,
+            "incremento_competitivo": max(0, int(coste_competitivo - coste_base)),
+            "coste": coste_competitivo,
         })
     if allow_clausulazos:
         for p in available["clausulazos"]:
@@ -733,6 +838,9 @@ def simulate_transfer_plan(
                 "equipo_real": compra.get("equipo_real", "?"),
                 "xP": compra.get("xP", 0),
                 "coste": compra["coste"],
+                "coste_base": compra.get("coste_base", compra["coste"]),
+                "pujas_detectadas": compra.get("pujas_detectadas", 0),
+                "incremento_competitivo": compra.get("incremento_competitivo", 0),
                 "propietario": compra.get("propietario", compra.get("vendedor", "")),
             },
             "saldo_antes": saldo_antes,
@@ -793,7 +901,11 @@ def generate_report(
                      f"**{horas_al_partido:.0f}h**). "
                      f"Clausulazos **BLOQUEADOS**. Solo mercado de pujas (hasta cierre).")
         L.append(f"")
-    L.append(f"> **Jugadores alcanzables:** solo clausulazos (si abiertos) y mercado de pujas. No se recomienda si el coste supera el valor de mercado en >15% (evitar sobreprecio).")
+    L.append(
+        f"> **Jugadores alcanzables:** solo clausulazos (si abiertos) y mercado de pujas. "
+        f"En pujas competidas se puede aplicar un incremento estratégico de **2M a 4M** "
+        f"según xP y contexto del jugador."
+    )
     L.append(f"")
 
     movs = transfer_plan["movimientos"]
@@ -933,6 +1045,15 @@ def generate_report(
                         f"   - Precio: **{fm(compra['coste'])}** "
                         f"(mercado, {compra.get('propietario') or compra.get('tipo', '?')})"
                     )
+                    pujas_detectadas = int(compra.get("pujas_detectadas", 0) or 0)
+                    coste_base = int(compra.get("coste_base", compra["coste"]) or compra["coste"])
+                    incremento = int(compra.get("incremento_competitivo", 0) or 0)
+                    if pujas_detectadas > 0 and compra["coste"] > coste_base:
+                        L.append(
+                            f"   - Ajuste competitivo: {pujas_detectadas} puja(s) detectada(s). "
+                            f"Base {fm(coste_base)} -> oferta {fm(compra['coste'])} "
+                            f"(+{fm(incremento)})"
+                        )
 
                 L.append(f"   - xP que ganas: **{compra['xP']:.1f}**")
                 L.append(f"   - Saldo: {fm(mov['saldo_antes'])} → **{fm(mov['saldo_despues'])}**")

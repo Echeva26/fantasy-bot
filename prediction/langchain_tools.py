@@ -21,6 +21,7 @@ from prediction.advisor import (
     analyze_available_players,
     analyze_my_team,
     clausulazos_available,
+    compute_competitive_bid_amount,
     get_predictions,
     load_snapshot,
     simulate_transfer_plan,
@@ -371,7 +372,14 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
         items = []
         for p in available.get("mercado", []):
-            coste = max(p.get("precio_venta", 0) or 0, p.get("valor_mercado", 0) or 0)
+            coste_base = max(p.get("precio_venta", 0) or 0, p.get("valor_mercado", 0) or 0)
+            pujas_detectadas = _safe_int(p.get("pujas"), 0)
+            coste = compute_competitive_bid_amount(
+                base_amount=coste_base,
+                market_value=_safe_int(p.get("valor_mercado"), 0),
+                external_bids=pujas_detectadas,
+                expected_points=_safe_float(p.get("xP"), 0.0),
+            )
             items.append(
                 {
                     "tipo": "mercado",
@@ -380,6 +388,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
                     "nombre": p.get("nombre"),
                     "posicion": p.get("posicion"),
                     "equipo_real": p.get("equipo_real"),
+                    "coste_base": coste_base,
+                    "pujas_detectadas": pujas_detectadas,
+                    "incremento_competitivo": max(0, _safe_int(coste) - _safe_int(coste_base)),
                     "coste": coste,
                     "xP": p.get("xP"),
                     "rival_next": p.get("rival_next"),

@@ -14,7 +14,7 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 - Puede proteger plantilla subiendo clausulas de jugadores clave cuando estan expuestos a clausulazo.
 - Si el token falta o caduca, te avisa por Telegram para renovarlo.
 
-### Operativa (PRE, POST, /informe, /compraventa y /optimizar)
+### Operativa (PRE, POST, /informe, /compraventa, /ventas y /optimizar)
 
 - PRE (automatico, 10 min antes del cierre):
   - Lo lanza el daemon LangChain.
@@ -36,6 +36,11 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
   - Solo se permite si ese `/informe` es del mismo ciclo de mercado.
   - Si el ciclo cambió, bloquea la ejecución y obliga a lanzar `/informe` de nuevo para evitar operar con plan deprecado.
   - Si el plan incluye subida de clausula, aplica la regla fija: por cada 1M invertido sube 2M la clausula.
+
+- /ventas (manual en Telegram):
+  - Ejecuta la fase 2 de ventas: aceptar ofertas de la liga para jugadores ya publicados y con mercado cerrado.
+  - Equivale a `--aceptar-ofertas` y se puede lanzar cuando quieras, independientemente de `/compraventa`.
+  - Si aún no cerró mercado o no hay ofertas pendientes, no hace cambios.
 
 - /optimizar (manual en Telegram):
   - Recalcula y guarda en ese momento la mejor alineacion por xP.
