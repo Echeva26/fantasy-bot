@@ -67,6 +67,57 @@ def _get(url: str, headers: dict, retries: int = 3) -> dict | list:
     return {}
 
 
+def fetch_fantasy_players_raw(league_id: str = "") -> list[dict]:
+    """
+    Obtiene jugadores de Fantasy con fallback robusto:
+    1) Endpoint público /api/v3/players
+    2) Endpoint autenticado de liga /api/v3/players/league/{league_id}
+    """
+    # 1) Intento público (históricamente estable para entrenamiento/predicción)
+    try:
+        players = _get(f"{FANTASY_API}/api/v3/players", FANTASY_HEADERS)
+        if isinstance(players, list) and players:
+            return players
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if getattr(exc, "response", None) else "?"
+        logger.warning(
+            "Endpoint público /api/v3/players falló (%s). Probando fallback autenticado.",
+            status,
+        )
+    except Exception as exc:
+        logger.warning(
+            "No se pudo usar endpoint público /api/v3/players: %s. Probando fallback autenticado.",
+            exc,
+        )
+
+    # 2) Fallback autenticado por liga
+    try:
+        from laliga_fantasy_client import LaLigaFantasyClient
+        from prediction.league_selection import resolve_league_id
+
+        lid = str(league_id or "").strip() or resolve_league_id("")
+        client = LaLigaFantasyClient.from_saved_token(league_id=lid)
+        if not client.league_id:
+            leagues = client.get_leagues() or []
+            if not leagues:
+                raise RuntimeError("Sin ligas disponibles para el token actual.")
+            client.league_id = str(leagues[0].get("id", "")).strip()
+
+        players = client.get_players_raw() or []
+        if not isinstance(players, list) or not players:
+            raise RuntimeError("Respuesta vacía al consultar jugadores de liga.")
+
+        logger.info(
+            "Jugadores cargados por fallback autenticado (league_id=%s).",
+            client.league_id,
+        )
+        return players
+    except Exception as exc:
+        raise RuntimeError(
+            "No se pudo obtener la lista de jugadores ni por endpoint público ni autenticado."
+        ) from exc
+
+
 # ─── 1. Jugadores de LaLiga Fantasy ──────────────────────────
 def collect_fantasy_players() -> list[dict]:
     """
@@ -74,7 +125,7 @@ def collect_fantasy_players() -> list[dict]:
     Solo devuelve los activos (con puntos > 0).
     """
     logger.info("Obteniendo lista de jugadores de LaLiga Fantasy...")
-    players = _get(f"{FANTASY_API}/api/v3/players", FANTASY_HEADERS)
+    players = fetch_fantasy_players_raw()
     active = [p for p in players if p.get("points", 0) > 0]
     logger.info("Jugadores activos: %d / %d", len(active), len(players))
     return active

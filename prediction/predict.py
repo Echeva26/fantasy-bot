@@ -24,13 +24,12 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from prediction.collect_data import (
-    FANTASY_API,
-    FANTASY_HEADERS,
     SOFASCORE_API,
     SOFASCORE_HEADERS,
     TOURNAMENT_ID,
     POS_MAP,
     _get,
+    fetch_fantasy_players_raw,
     get_sofascore_season_id,
     collect_odds_for_round,
 )
@@ -208,8 +207,8 @@ def build_prediction_features(
     # 5. Odds
     odds_by_event = collect_odds_for_round(next_matches)
 
-    # 6. Get player list with market value
-    players = _get(f"{FANTASY_API}/api/v3/players", FANTASY_HEADERS)
+    # 6. Get player list with market value (con fallback autenticado si falla público)
+    players = fetch_fantasy_players_raw()
     active = [p for p in players if p.get("points", 0) > 0]
 
     # Max market value for normalization
