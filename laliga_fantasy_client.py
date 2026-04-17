@@ -36,7 +36,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
@@ -211,12 +211,20 @@ def google_login_flow(redirect_url: str | None = None) -> dict:
 # ===========================================================================
 class LaLigaFantasyPublic:
     """
-    Endpoints de la API que NO requieren autenticación.
-    Funcionan sin token, sin proxy, sin parchear nada.
+    Endpoints de la API que no requieren autenticación y compatibilidad
+    con métodos antiguos de jugadores.
 
-    Datos disponibles:
-        - Todos los jugadores de LaLiga (675+)
-        - Detalle completo de cada jugador (stats por jornada)
+    En la API actual, los endpoints de jugadores dejaron de ser públicos
+    y devuelven 404 sin token. Los métodos de jugadores se mantienen por
+    compatibilidad y hacen fallback al cliente autenticado si hay token.
+
+    Datos públicos comprobados:
+        - Jornada actual
+        - Calendario
+
+    Datos con fallback autenticado:
+        - Jugadores de la liga
+        - Detalle completo de cada jugador
         - Historial de valor de mercado de cada jugador
 
     Datos que SÍ requieren token (usar LaLigaFantasyClient):
@@ -232,11 +240,56 @@ class LaLigaFantasyPublic:
         resp.raise_for_status()
         return resp.json()
 
+    def _get_authenticated_client(self) -> "LaLigaFantasyClient | None":
+        token = load_token()
+        if not token:
+            return None
+
+        league_id = os.getenv("LALIGA_LEAGUE_ID", "").strip()
+        if not league_id:
+            try:
+                from prediction.league_selection import resolve_league_id
+
+                league_id = resolve_league_id("")
+            except Exception:
+                league_id = ""
+
+        client = LaLigaFantasyClient.from_token(token, league_id=league_id, save=False)
+        if not client.league_id:
+            leagues = client.get_leagues() or []
+            if leagues:
+                client.league_id = str(leagues[0].get("id", "")).strip()
+        return client
+
+    def _fallback_authenticated(self, action: str, exc: Exception) -> Any:
+        client = self._get_authenticated_client()
+        if not client:
+            raise RuntimeError(
+                "Este endpoint ya no es público y no hay token válido para fallback autenticado."
+            ) from exc
+        if not client.league_id:
+            raise RuntimeError(
+                "Este endpoint ya no es público y no se pudo resolver league_id para fallback autenticado."
+            ) from exc
+        return getattr(client, action)
+
+    def get_current_week(self) -> dict:
+        """GET /api/v3/week/current (público)."""
+        url = f"{BASE_URL}/api/v3/week/current"
+        return self._get(url)
+
+    def get_calendar(self) -> list[dict]:
+        """GET /api/v3/calendar (público)."""
+        url = f"{BASE_URL}/api/v3/calendar"
+        data = self._get(url)
+        return data if isinstance(data, list) else []
+
     def get_players_raw(self) -> list[dict]:
         """
-        GET /api/v3/players  (PÚBLICO - sin token)
+        GET /api/v3/players  (legacy; actualmente 404 sin token)
 
-        Devuelve TODOS los jugadores de LaLiga con datos básicos.
+        Si el endpoint público falla con 404, usa fallback autenticado:
+        GET /api/v3/players/league/{league_id}.
 
         Response por elemento:
             {
@@ -258,8 +311,17 @@ class LaLigaFantasyPublic:
             }
         """
         url = f"{BASE_URL}/api/v3/players"
-        logger.info("Obteniendo todos los jugadores (endpoint público)...")
-        return self._get(url)
+        logger.info("Obteniendo todos los jugadores (endpoint público legacy)...")
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint público /api/v3/players devuelve 404; usando fallback autenticado."
+            )
+            return self._fallback_authenticated("get_players_raw", exc)()
 
     def get_players(self) -> list[dict]:
         """Versión formateada de todos los jugadores."""
@@ -267,7 +329,10 @@ class LaLigaFantasyPublic:
 
     def get_player_detail(self, player_id: int) -> dict:
         """
-        GET /api/v3/player/{player_id}  (PÚBLICO - sin token)
+        GET /api/v3/player/{player_id} (legacy; actualmente 404 sin token)
+
+        Si el endpoint público falla con 404, usa el mismo endpoint con
+        cliente autenticado.
 
         Detalle completo de un jugador: stats por jornada, equipo, etc.
 
@@ -298,12 +363,25 @@ class LaLigaFantasyPublic:
             }
         """
         url = f"{BASE_URL}/api/v3/player/{player_id}"
-        logger.info("Obteniendo detalle del jugador %s (público)...", player_id)
-        return self._get(url)
+        logger.info("Obteniendo detalle del jugador %s (endpoint legacy)...", player_id)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint público /api/v3/player/%s devuelve 404; usando fallback autenticado.",
+                player_id,
+            )
+            return self._fallback_authenticated("get_player_detail", exc)(player_id)
 
     def get_price_history(self, player_id: int) -> list[dict]:
         """
-        GET /api/v3/player/{player_id}/market-value  (PÚBLICO - sin token)
+        GET /api/v3/player/{player_id}/market-value (legacy; actualmente 404 sin token)
+
+        Si el endpoint público falla con 404, usa el mismo endpoint con
+        cliente autenticado.
 
         Historial completo de valor de mercado del jugador.
 
@@ -319,7 +397,17 @@ class LaLigaFantasyPublic:
             ]
         """
         url = f"{BASE_URL}/api/v3/player/{player_id}/market-value"
-        return self._get(url)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint público /api/v3/player/%s/market-value devuelve 404; usando fallback autenticado.",
+                player_id,
+            )
+            return self._fallback_authenticated("get_price_history", exc)(player_id)
 
     def get_all_price_histories(self, player_ids: list[int] | None = None, max_workers: int = 5) -> list[dict]:
         """
@@ -1248,6 +1336,10 @@ class LaLigaFantasyClient:
         GET /api/v3/leagues/{league_id}/ranking/
         Ranking de la liga.
 
+        En la API actual este endpoint puede devolver 404. En ese caso se
+        usa fallback actualizado:
+        GET /api/v4/leagues/{league_id}/teams
+
         Response por elemento:
             {
                 "team": {"id": "abc123", "manager": {"managerName": "...", ...}},
@@ -1258,7 +1350,48 @@ class LaLigaFantasyClient:
         """
         url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/ranking/"
         logger.info("Obteniendo ranking...")
-        return self._get(url)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint ranking v3 devuelve 404; usando fallback v4 /leagues/{league_id}/teams."
+            )
+            return self._get_ranking_from_teams_v4()
+
+    def _get_ranking_from_teams_v4(self) -> list[dict]:
+        """Construye ranking compatible desde GET /api/v4/leagues/{league_id}/teams."""
+        url = f"{BASE_URL}/api/v4/leagues/{self.league_id}/teams"
+        teams = self._get(url)
+        if not isinstance(teams, list):
+            raise RuntimeError("Respuesta inesperada en fallback ranking v4: no es lista.")
+
+        ranking: list[dict] = []
+        for idx, team in enumerate(teams, 1):
+            if not isinstance(team, dict):
+                continue
+            position = _to_int(team.get("position")) or idx
+            entry = {
+                "team": {
+                    "id": str(team.get("id", "")),
+                    "manager": team.get("manager", {}) or {},
+                    "teamValue": _to_int(team.get("teamValue")),
+                    "teamMoney": _to_int(team.get("teamMoney")),
+                    "banned": bool(team.get("banned", False)),
+                },
+                "points": _to_int(team.get("teamPoints")),
+                "rank": position,
+                "position": position,
+                "previousPosition": _to_int(team.get("previousPosition")),
+                "fixture_points": _to_int(team.get("fixture_points")),
+                "startingWeek": team.get("startingWeek"),
+            }
+            ranking.append(entry)
+
+        ranking.sort(key=lambda x: (_to_int(x.get("position")) or 9999, -(_to_int(x.get("points")) or 0)))
+        return ranking
 
     def get_manager_ids(self) -> list[str]:
         ranking = self.get_ranking_raw()
@@ -1288,7 +1421,20 @@ class LaLigaFantasyClient:
         """
         url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/teams/{manager_id}"
         logger.info("Obteniendo plantilla del mánager %s...", manager_id)
-        return self._get(url)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint plantilla v3 devuelve 404 para team_id=%s; usando fallback v4.",
+                manager_id,
+            )
+            v4 = self.get_team_raw_v4(manager_id)
+            if v4 is not None:
+                return v4
+            raise
 
     def get_team_raw_v4(self, team_id: str) -> dict | None:
         """

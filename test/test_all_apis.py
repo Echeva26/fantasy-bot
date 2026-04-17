@@ -70,52 +70,56 @@ def run_public_tests():
 
     player_ids: list[int] = []
 
-    @test("Público: get_players_raw")
+    @test("Público: get_current_week")
     def t1():
-        data = api.get_players_raw()
-        assert isinstance(data, list), f"Esperaba lista, recibí {type(data)}"
-        assert len(data) > 0, "Lista vacía"
-        first = data[0]
-        assert "id" in first or "nickname" in first, f"Campos inesperados: {list(first.keys())[:5]}"
-        # Guardar IDs para otros tests
-        for p in data[:5]:
-            pid = p.get("id")
-            if pid:
-                player_ids.append(int(pid))
-        return f"{len(data)} jugadores"
+        data = api.get_current_week()
+        assert isinstance(data, dict), f"Esperaba dict, recibí {type(data)}"
+        assert "weekNumber" in data or "nextWeek" in data, f"Campos inesperados: {list(data.keys())[:5]}"
+        return f"jornada={data.get('weekNumber', '?')}, live={data.get('isLive', '?')}"
     t1()
 
-    @test("Público: get_players (formateado)")
+    @test("Público: get_calendar")
     def t2():
-        data = api.get_players()
+        data = api.get_calendar()
         assert isinstance(data, list), f"Esperaba lista, recibí {type(data)}"
-        assert len(data) > 0, "Lista vacía"
-        first = data[0]
-        expected_keys = {"player_id", "name", "position", "status", "market_value"}
-        actual = set(first.keys())
-        missing = expected_keys - actual
-        assert not missing, f"Faltan campos: {missing}"
-        return f"{len(data)} jugadores, campos: {sorted(first.keys())}"
+        return f"{len(data)} partidos en calendario"
     t2()
 
-    @test("Público: get_player_detail")
+    @test("Legacy jugadores: get_players_raw con fallback autenticado")
     def t3():
-        if not player_ids:
-            raise Exception("No hay player_ids de test anterior")
-        pid = player_ids[0]
-        data = api.get_player_detail(pid)
-        assert isinstance(data, dict), f"Esperaba dict, recibí {type(data)}"
-        return f"Jugador ID {pid}: {data.get('nickname', '?')}"
+        global skipped
+        try:
+            data = api.get_players_raw()
+            assert isinstance(data, list), f"Esperaba lista, recibí {type(data)}"
+            assert len(data) > 0, "Lista vacía"
+            for p in data[:5]:
+                pid = p.get("id")
+                if pid:
+                    player_ids.append(int(pid))
+            return f"{len(data)} jugadores"
+        except Exception as e:
+            if "ya no es público" in str(e) or "token válido" in str(e):
+                skipped += 1
+                return f"{YELLOW}REQUIERE TOKEN (endpoint público deprecado){RESET}"
+            raise
     t3()
 
-    @test("Público: get_price_history")
+    @test("Legacy jugadores: get_player_detail con fallback autenticado")
     def t4():
+        global skipped
         if not player_ids:
-            raise Exception("No hay player_ids de test anterior")
+            skipped += 1
+            return f"{YELLOW}SKIP: sin player_ids; requiere token para fallback{RESET}"
         pid = player_ids[0]
-        data = api.get_price_history(pid)
-        assert isinstance(data, list), f"Esperaba lista, recibí {type(data)}"
-        return f"Jugador {pid}: {len(data)} registros de precio"
+        try:
+            data = api.get_player_detail(pid)
+            assert isinstance(data, dict), f"Esperaba dict, recibí {type(data)}"
+            return f"Jugador ID {pid}: {data.get('nickname', '?')}"
+        except Exception as e:
+            if "ya no es público" in str(e) or "token válido" in str(e):
+                skipped += 1
+                return f"{YELLOW}REQUIERE TOKEN (endpoint público deprecado){RESET}"
+            raise
     t4()
 
     return player_ids
