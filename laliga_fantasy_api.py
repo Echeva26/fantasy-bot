@@ -724,26 +724,21 @@ class LaLigaFantasyAPI:
         GET /api/v3/leagues/{league_id}/news/{page}
         Devuelve una página de noticias/actividad de la liga.
 
-        Response JSON (ejemplo):
-            [
-                {
-                    "id": "99999",
-                    "title": "Operación de mercado",
-                    "msg": "JuanManager ha comprado a Vinicius a LaLiga por 15.000.000 €",
-                    "publicationDate": "2026-02-10T10:30:00+01:00",
-                    ...
-                },
-                {
-                    "id": "99998",
-                    "title": "Noticia",
-                    "msg": "...",
-                    ...
-                },
-                ...
-            ]
+        NOTA: Este endpoint devuelve 404 desde ~Feb 2026.
+        Se mantiene por retrocompatibilidad; devuelve [] si 404.
         """
         url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/news/{page}"
-        return self._get(url)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            resp = getattr(exc, "response", None)
+            if resp is not None and resp.status_code == 404:
+                logger.warning(
+                    "Endpoint de noticias /news/%s devuelve 404 "
+                    "(deprecado desde ~Feb 2026).", page,
+                )
+                return []
+            raise
 
     def get_activity_page(self, page: int) -> list[dict]:
         """

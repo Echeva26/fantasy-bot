@@ -234,31 +234,31 @@ class LaLigaFantasyPublic:
 
     def get_players_raw(self) -> list[dict]:
         """
-        GET /api/v3/players  (PÚBLICO - sin token)
+        GET /api/v5/players  (PÚBLICO - sin token)
 
         Devuelve TODOS los jugadores de LaLiga con datos básicos.
+        NOTA: Migrado de /api/v3/players (404 desde ~Feb 2026) a /api/v5/players.
 
-        Response por elemento:
+        Response por elemento (v5):
             {
                 "id": "68",
-                "nickname": "Unai Simón",
                 "positionId": "1",
-                "playerStatus": "ok",
-                "marketValue": "9174877",
-                "points": 134,
-                "averagePoints": 5.82,
+                "nickname": "Unai Simón",
                 "lastSeasonPoints": "166",
-                "team": {
-                    "id": "3",
-                    "name": "Athletic Club",
-                    "slug": "athletic-club",
-                    "badgeColor": "https://..."
-                },
-                "images": {...}
+                "playerStatus": "ok",
+                "marketValue": "6535733",
+                "points": 164,
+                "averagePoints": 5.65,
+                "image": "https://assets-fantasy.llt-services.com/players/...",
+                "teamId": "3"
             }
+
+        Diferencias vs v3:
+            - "team" objeto → "teamId" string
+            - "images" objeto → "image" string (URL única)
         """
-        url = f"{BASE_URL}/api/v3/players"
-        logger.info("Obteniendo todos los jugadores (endpoint público)...")
+        url = f"{BASE_URL}/api/v5/players"
+        logger.info("Obteniendo todos los jugadores (endpoint público v5)...")
         return self._get(url)
 
     def get_players(self) -> list[dict]:
@@ -818,12 +818,24 @@ class LaLigaFantasyClient:
 
         def _place_bid(market_id: str, money: int) -> dict:
             url = f"{BASE_URL}/api/v3/league/{self.league_id}/market/{market_id}/bid"
-            return self._post(
-                url,
-                {"money": int(money)},
-                expected_error_codes={"030.01.09", "030_01_09"},
-                expected_error_substrings=("pending bid",),
-            )
+            try:
+                return self._post(
+                    url,
+                    {"amount": int(money)},
+                    expected_error_codes={"030.01.09", "030_01_09"},
+                    expected_error_substrings=("pending bid",),
+                )
+            except requests.exceptions.HTTPError as exc:
+                resp = getattr(exc, "response", None)
+                if resp is not None and resp.status_code == 400:
+                    logger.info("Fallback bid: reintentando con campo 'money'...")
+                    return self._post(
+                        url,
+                        {"money": int(money)},
+                        expected_error_codes={"030.01.09", "030_01_09"},
+                        expected_error_substrings=("pending bid",),
+                    )
+                raise
 
         def _edit_bid(market_info: dict, money: int) -> dict:
             bid_id = str(market_info.get("bid_id") or "")
@@ -845,9 +857,16 @@ class LaLigaFantasyClient:
             }
             resp = self.session.put(
                 edit_url,
-                json={"money": int(edit_money)},
+                json={"amount": int(edit_money)},
                 headers=headers,
             )
+            if resp.status_code == 400:
+                logger.info("Fallback edit_bid: reintentando con campo 'money'...")
+                resp = self.session.put(
+                    edit_url,
+                    json={"money": int(edit_money)},
+                    headers=headers,
+                )
             if not resp.ok:
                 try:
                     err_body = resp.json() if resp.content else resp.text[:500]
@@ -857,7 +876,7 @@ class LaLigaFantasyClient:
                     "PUT %s → %s | body: %s | response: %s",
                     edit_url,
                     resp.status_code,
-                    {"money": int(edit_money)},
+                    {"amount": int(edit_money)},
                     err_body,
                 )
             resp.raise_for_status()
@@ -892,9 +911,8 @@ class LaLigaFantasyClient:
                 market_info["item_id"], market_info["discr"],
             )
             try:
-                return self._post(offer_url, {"money": int(offer_money)})
+                return self._post(offer_url, {"amount": int(offer_money)})
             except requests.exceptions.HTTPError:
-                # Si falla, continuamos con flujo de puja por compatibilidad.
                 pass
 
         bid_money = _compute_bid_money(int(amount), market_info)
@@ -964,7 +982,7 @@ class LaLigaFantasyClient:
                     market_info["item_id"], market_info["discr"],
                 )
                 try:
-                    return self._post(offer_url, {"money": int(offer_money)})
+                    return self._post(offer_url, {"amount": int(offer_money)})
                 except requests.exceptions.HTTPError as exc_offer:
                     last_exc = exc_offer
 
@@ -974,7 +992,7 @@ class LaLigaFantasyClient:
                 alt_url = f"{BASE_URL}/api/v3/league/{self.league_id}/market/bid"
                 alt_body = {
                     "marketItemId": str(market_info["item_id"]),
-                    "money": int(bid_money),
+                    "amount": int(bid_money),
                 }
                 logger.info(
                     "Fallback legado puja: POST /market/bid para item %s...",
@@ -1002,30 +1020,39 @@ class LaLigaFantasyClient:
 
         PUT /api/v3/teams/{teamId}/lineup
 
-        Body (según APK UpdateLineupRequest):
+        Campos requeridos (confirmado por la API al enviar body vacío):
           - tactical_formation: [DEF, MED, DEL]
           - goalkeeper: "playerTeamId"
           - defender: ["playerTeamId", ...]
           - midfield: ["playerTeamId", ...]
           - striker: ["playerTeamId", ...]
-          - captain: "playerTeamId" (opcional)
-          - coach: "playerTeamId" (opcional)
+
+        Campos opcionales:
+          - captain: "playerTeamId"
+          - coach: "playerTeamId"
         """
         tid = str(team_id)
+        gk = str(goalkeeper_id)
+        defs = [str(x) for x in defenders_ids]
+        mids = [str(x) for x in midfielders_ids]
+        fwds = [str(x) for x in strikers_ids]
+        formation = [int(x) for x in tactical_formation]
+
+        url = f"{BASE_URL}/api/v3/teams/{tid}/lineup"
+
         body = {
-            "tactical_formation": [int(x) for x in tactical_formation],
-            "goalkeeper": str(goalkeeper_id),
-            "defender": [str(x) for x in defenders_ids],
-            "midfield": [str(x) for x in midfielders_ids],
-            "striker": [str(x) for x in strikers_ids],
+            "tactical_formation": formation,
+            "goalkeeper": gk,
+            "defender": defs,
+            "midfield": mids,
+            "striker": fwds,
         }
         if captain_team_id:
             body["captain"] = str(captain_team_id)
         if coach_id:
             body["coach"] = str(coach_id)
 
-        url = f"{BASE_URL}/api/v3/teams/{tid}/lineup"
-        logger.info("Actualizando alineación del team %s...", tid)
+        logger.info("Actualizando alineación del team %s ...", tid)
         return self._put(url, body)
 
     def get_team_lineup(
@@ -1036,8 +1063,11 @@ class LaLigaFantasyClient:
         """
         Obtiene la alineación de un equipo.
 
-        GET /api/v3/teams/{teamId}/lineup
-        GET /api/v4/teams/{teamId}/lineup/week/{weekNumber} (si week_number)
+        GET /api/v3/teams/{teamId}/lineup  (alineación actual)
+        GET /api/v4/teams/{teamId}/lineup/week/{weekNumber}  (jornada específica)
+
+        Nota: /api/v3/teams/{teamId}/lineup/week/{wn} → 404 desde ~Feb 2026.
+              Solo v4 soporta /week/{weekNumber}.
         """
         tid = str(team_id)
         if week_number is not None:
@@ -1245,19 +1275,31 @@ class LaLigaFantasyClient:
     # -------------------------------------------------------------------
     def get_ranking_raw(self) -> list[dict]:
         """
-        GET /api/v3/leagues/{league_id}/ranking/
         Ranking de la liga.
 
-        Response por elemento:
+        Intenta /api/v5 (sin trailing slash) y cae a /api/v4 y /api/v3 si falla.
+        NOTA: v3 devuelve 404 desde ~Mar 2026; v5 funciona sin trailing slash.
+
+        Response por elemento (misma estructura en v3/v4/v5):
             {
                 "team": {"id": "abc123", "manager": {"managerName": "...", ...}},
                 "points": 350,
-                "rank": 1,
+                "position": 1,
                 ...
             }
         """
-        url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/ranking/"
         logger.info("Obteniendo ranking...")
+        for ver in ("v5", "v4", "v3"):
+            url = f"{BASE_URL}/api/{ver}/leagues/{self.league_id}/ranking"
+            try:
+                data = self._get(url)
+                if isinstance(data, list):
+                    return data
+            except requests.exceptions.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None) if getattr(exc, "response", None) else None
+                logger.warning("Ranking %s → %s, probando siguiente versión...", ver, status)
+                continue
+        url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/ranking/"
         return self._get(url)
 
     def get_manager_ids(self) -> list[str]:
@@ -1304,13 +1346,17 @@ class LaLigaFantasyClient:
 
     def get_league_me_raw(self) -> dict | None:
         """
-        GET /api/v3/leagues/{leagueId}/me
-        Mi equipo en liga. Puede incluir playerTeamId en jugadores.
-        Devuelve None si el endpoint falla.
+        Obtiene info de "mi equipo" en la liga.
+
+        NOTA: /api/v3/leagues/{leagueId}/me ahora solo acepta DELETE
+        (desde ~Feb 2026). GET devuelve 405 Method Not Allowed.
+
+        Fallback: usa get_team_raw_v4() con find_my_team_id() como alternativa.
+        Devuelve None si no se puede obtener.
         """
         try:
-            url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/me"
-            return self._get(url)
+            my_team_id = self.find_my_team_id()
+            return self.get_team_raw_v4(my_team_id)
         except Exception:
             return None
 
@@ -1397,7 +1443,11 @@ class LaLigaFantasyClient:
         GET /api/v3/leagues/{league_id}/news/{page}
         Noticias/actividad (paginado).
 
-        Response:
+        NOTA: Este endpoint devuelve 404 desde ~Feb 2026 en todas las versiones
+        (v3, v4, v5). Se mantiene el código por si vuelve a activarse, pero
+        actualmente no funciona.
+
+        Response (cuando funcionaba):
             [
                 {
                     "id": "99999",
@@ -1410,7 +1460,17 @@ class LaLigaFantasyClient:
             ]
         """
         url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/news/{page}"
-        return self._get(url)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            resp = getattr(exc, "response", None)
+            if resp is not None and resp.status_code == 404:
+                logger.warning(
+                    "Endpoint de noticias /news/%s devuelve 404 "
+                    "(deprecado desde ~Feb 2026).", page,
+                )
+                return []
+            raise
 
     def get_activity_page(self, page: int) -> list[dict]:
         raw = self.get_activity_page_raw(page)
@@ -1455,6 +1515,8 @@ def _to_int(value) -> int | None:
 
 
 def _format_player(p: dict) -> dict:
+    team_obj = p.get("team")
+    team_id = p.get("teamId") or (team_obj.get("id") if isinstance(team_obj, dict) else None)
     return {
         "player_id": _to_int(p.get("id")),
         "name": p.get("nickname"),
@@ -1464,6 +1526,7 @@ def _format_player(p: dict) -> dict:
         "market_value": _to_int(p.get("marketValue")),
         "points_last_season": _to_int(p.get("lastSeasonPoints")),
         "avg_points": _to_int(p.get("averagePoints")),
+        "team_id": str(team_id) if team_id else None,
     }
 
 

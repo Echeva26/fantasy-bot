@@ -245,7 +245,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def snapshot_summary(force_refresh: bool = False) -> str:
-        """Obtiene resumen del estado actual de la liga y del equipo del manager."""
+        """Obtiene el contexto global actual: liga, equipo, saldo, posición en la clasificación
+        y tamaño del mercado. LLAMA ESTO PRIMERO para saber el estado antes de tomar decisiones.
+        CRÍTICO: comprueba que saldo_disponible sea positivo (si es negativo antes de jornada = 0 puntos)."""
         snapshot = runtime.get_snapshot(force_refresh=force_refresh)
         mi = snapshot.get("mi_equipo", {})
         payload = {
@@ -265,7 +267,12 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def my_squad(force_refresh: bool = False) -> str:
-        """Lista jugadores de mi plantilla con ids útiles para mercado y alineación."""
+        """Lista TODOS los jugadores de tu plantilla con xP, estado, cláusula y valor de mercado.
+        Ordenados por xP descendente. Usa esto para identificar:
+        - Jugadores con xP alta (candidatos a capitán y titulares fijos)
+        - Jugadores lesionados/sancionados (candidatos a venta)
+        - Jugadores con cláusula expuesta (ratio_valor_vs_clausula ≥ 0.85 → subir cláusula)
+        - Huecos en la alineación por posición"""
         team_analysis = runtime.get_team_analysis(force_refresh=force_refresh)
         players = sorted(
             team_analysis.get("jugadores", []),
@@ -301,7 +308,11 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def predictions_top(limit: int = 25, position: str = "", force_refresh: bool = False) -> str:
-        """Muestra predicciones xP top para la próxima jornada. `position` opcional: POR/DEF/MED/DEL."""
+        """Muestra los jugadores con mayor xP predicha (modelo XGBoost) para la próxima jornada.
+        Filtra por posición con POR/DEF/MED/DEL. Usa esto para:
+        - Identificar candidatos a capitán (top 1-3 del ranking general)
+        - Buscar fichajes potenciales por posición
+        - Comparar si tus titulares están entre los top de su posición"""
         pred_df, first_match_ts = runtime.get_predictions(force_refresh=force_refresh)
         if pred_df.empty:
             return _as_json({"count": 0, "items": [], "first_match_ts": first_match_ts})
@@ -323,10 +334,10 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def player_outlook(player_query: str, force_refresh: bool = False) -> str:
-        """
-        Busca información de un jugador por nombre o player_id:
-        rival próximo, local/visitante, xP y estado.
-        """
+        """Busca información detallada de un jugador por nombre o player_id.
+        Devuelve: rival próximo, si juega local/visitante, xP predicha y estado.
+        Útil para evaluar un fichaje concreto o verificar la situación de un jugador
+        antes de venderlo, comprarlo o ponerlo de capitán."""
         query = (player_query or "").strip().lower()
         if not query:
             return _as_json({"count": 0, "items": [], "error": "player_query vacío"})
@@ -365,7 +376,10 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def market_opportunities(limit: int = 30, force_refresh: bool = False) -> str:
-        """Devuelve oportunidades de compra del mercado (pujas) y clausulazos disponibles."""
+        """Devuelve las mejores oportunidades de fichaje: pujas en mercado libre Y clausulazos.
+        Cada item incluye coste estimado (con incremento competitivo si hay otras pujas), xP,
+        rival próximo y si juega de local. Los clausulazos solo aparecen si están disponibles
+        (ventana temporal adecuada). Recuerda: las pujas son secretas y gana la más alta."""
         available = runtime.get_available(force_refresh=force_refresh)
         _, first_match_ts = runtime.get_predictions(force_refresh=force_refresh)
         claus_ok, hours_to_match = clausulazos_available(first_match_ts)
@@ -432,7 +446,10 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def simulate_transfer_plan(force_refresh: bool = False) -> str:
-        """Simula plan de ventas/compras recomendado por el motor actual del repositorio."""
+        """Simula el plan óptimo de transferencias (ventas + compras) calculado por el motor XGBoost.
+        Muestra: xP actual vs xP post-plan, saldo antes y después, y cada movimiento con justificación.
+        LLAMA ESTO ANTES de execute_simulated_plan para revisar si el plan es bueno.
+        Si el plan empeora el xP o deja saldo negativo, NO ejecutes."""
         team_analysis = runtime.get_team_analysis(force_refresh=force_refresh)
         plan, claus_ok, hours_to_match = runtime.get_transfer_plan(force_refresh=force_refresh)
         payload = {
@@ -452,7 +469,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def execute_simulated_plan(force_refresh: bool = False) -> str:
-        """Ejecuta el plan simulado (ventas fase1 + compras). Respeta `dry_run` del runtime."""
+        """Ejecuta el plan previamente simulado: ventas fase1 + compras/pujas.
+        ¡SOLO llama DESPUÉS de simulate_transfer_plan y verificar que el plan es positivo!
+        Respeta dry_run. Tras ejecutar, invalida el caché para obtener datos frescos."""
         blocked = _block_if_post("execute_simulated_plan")
         if blocked:
             return blocked
@@ -480,7 +499,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def accept_closed_offers() -> str:
-        """Ejecuta fase2 de ventas: aceptar ofertas de liga ya cerradas."""
+        """Acepta ofertas de liga ya cerradas (fase2 de ventas).
+        Tras publicar un jugador en mercado (fase1), la liga puede ofrecer ~±5% del valor.
+        Esta herramienta acepta esas ofertas pendientes. Debe ejecutarse en fase POST."""
         if runtime.dry_run:
             return _as_json(
                 {
@@ -503,7 +524,11 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         force: bool = False,
         after_market_time: str = "08:10",
     ) -> str:
-        """Calcula y guarda automáticamente la mejor alineación por xP."""
+        """Calcula y guarda la MEJOR alineación posible maximizando la suma de xP del once.
+        Prueba todas las formaciones válidas y elige la que da más xP total.
+        Recuerda: -4 pt por cada posición vacía, así que SIEMPRE alinea 11 jugadores.
+        El capitán debería ser el jugador con mayor xP (duplica puntos).
+        Usa force=True si necesitas guardar fuera de la ventana normal."""
         try:
             result = autoset_best_lineup(
                 league_id=runtime.league_id,
@@ -523,7 +548,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def sell_player_phase1_tool(player_team_id: str, sale_price: int) -> str:
-        """Publica un jugador propio en mercado (fase1). Requiere `player_team_id`."""
+        """Publica un jugador en el mercado (fase1 de venta). El sale_price es el precio de salida.
+        La liga ofertará ~±5% del valor de mercado. La venta se confirma en la siguiente fase
+        (accept_closed_offers). Vende jugadores con xP baja, lesionados o para liberar saldo."""
         blocked = _block_if_post("sell_player_phase1_tool")
         if blocked:
             return blocked
@@ -546,7 +573,10 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def place_bid_tool(market_item_id: str, amount: int, player_id: int = 0) -> str:
-        """Hace/actualiza una puja en mercado libre."""
+        """Realiza o actualiza una puja por un jugador en el mercado libre.
+        Las pujas son SECRETAS: gana la más alta, empate = primera puja.
+        El amount debe ser competitivo: si hay muchas pujas detectadas, incrementa.
+        Usa market_opportunities para obtener el market_item_id y el coste recomendado."""
         blocked = _block_if_post("place_bid_tool")
         if blocked:
             return blocked
@@ -574,7 +604,10 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def buyout_player_tool(player_team_id: str, clause_to_pay: int = 0) -> str:
-        """Ejecuta un clausulazo sobre un `player_team_id` rival."""
+        """Ejecuta un CLAUSULAZO: compra inmediata de un jugador rival pagando su cláusula.
+        No requiere aprobación del rival. Es instantáneo.
+        Usa esto para robar jugadores clave con cláusula baja respecto a su valor/xP.
+        CUIDADO: es caro. Verifica que el saldo post-compra no quede negativo."""
         blocked = _block_if_post("buyout_player_tool")
         if blocked:
             return blocked
@@ -604,13 +637,11 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         value_to_increase: int,
         force: bool = False,
     ) -> str:
-        """
-        Aumenta la cláusula de un jugador propio.
-
-        Regla económica: 1M invertido sube 2M de cláusula (factor fijo 2.0).
-        Debe usarse de forma moderada: prioriza jugadores clave y expuestos
-        (valor de mercado cercano a la cláusula).
-        """
+        """Sube la cláusula de rescisión de un jugador PROPIO para protegerlo de clausulazos rivales.
+        Regla económica: 1M invertido → cláusula sube 2M (factor 2.0). Máximo: 400% del valor base.
+        Solo úsalo en jugadores top-7 xP cuyo ratio valor_mercado/cláusula ≥ 0.88 (expuestos).
+        Si el jugador no cumple estos criterios, será bloqueado (usa force=True solo con justificación).
+        CUIDADO: el dinero invertido en cláusulas se recupera solo al 50% si la bajas después."""
         blocked = _block_if_post("increase_clause_tool")
         if blocked:
             return blocked
@@ -725,7 +756,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def current_lineup() -> str:
-        """Obtiene la alineación actual guardada en la API para mi equipo."""
+        """Obtiene la alineación actualmente guardada en la API.
+        Úsala para verificar: formación, titulares, capitán y si hay posiciones vacías.
+        Recuerda: -4 pt por posición vacía y el capitán duplica sus puntos."""
         try:
             snapshot = runtime.get_snapshot(force_refresh=False)
             team_id = str(snapshot.get("mi_equipo", {}).get("team_id", ""))

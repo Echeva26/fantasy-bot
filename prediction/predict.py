@@ -33,6 +33,7 @@ from prediction.collect_data import (
     get_sofascore_season_id,
     collect_odds_for_round,
 )
+from prediction.fantasy_team_resolve import fantasy_team_name_for_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ def build_prediction_features(
     pred_rows = []
     for p in active:
         pid = p["id"]
-        team_name = p.get("team", {}).get("name", "")
+        team_name = fantasy_team_name_for_mapping(p)
         ss_team_id = team_mapping.get(team_name)
 
         if ss_team_id is None or ss_team_id not in fixture_index:
