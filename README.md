@@ -1,10 +1,13 @@
-# Fantasy Bot IA (LangChain)
+# Fantasy Bot IA (LangGraph)
 
 ## 1. Que hace el bot
 
-El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
+El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7 con un
+grafo LangGraph por ciclos.
 
 - Usa herramientas del repo + API real de LaLiga Fantasy para analizar plantilla, mercado y expected points.
+- Lee noticias/scrapes locales desde `scrapes/` con `news_reader_tool` para lesiones, sanciones, apercibidos y valores de mercado.
+- Orquesta el ciclo como nodos: contexto -> analista -> ojeador -> manager -> ejecutor.
 - El modelo de prediccion es fijo: `xgboost`.
 - La liga se elige en Telegram por nombre: `/ligas` y `/liga <nombre>`.
 - Al elegir la liga, el bot detecta automaticamente la hora real de cierre del mercado leyendo la expiracion de jugadores publicados.
@@ -14,16 +17,44 @@ El bot gestiona tu equipo de LaLiga Fantasy de forma autonoma 24/7.
 - Puede proteger plantilla subiendo clausulas de jugadores clave cuando estan expuestos a clausulazo.
 - Si el token falta o caduca, te avisa por Telegram para renovarlo.
 
+### Arquitectura LangGraph
+
+El estado global viaja por el grafo con plantilla, saldo, puntos, mercado,
+predicciones, noticias, informes y acciones.
+
+1. `contexto`
+   - Ejecuta `snapshot_summary`, `my_squad`, `market_opportunities`, `news_reader_tool`, `simulate_transfer_plan` y `current_lineup`.
+   - Carga plantilla, presupuesto, puntos, mercado disponible, xP y noticias locales.
+2. `analista`
+   - Sub-agente LLM especializado en la plantilla propia.
+   - Propone a quien alinear, sentar, vender o proteger con clausula.
+3. `ojeador`
+   - Sub-agente LLM especializado en mercado y clausulazos.
+   - Detecta chollos, jugadores a evitar y riesgos de mercado.
+4. `manager`
+   - LLM principal.
+   - Recibe contexto, informe del analista, informe del ojeador y acciones propuestas por el motor.
+   - Valida saldo, fase operativa y limites antes de decidir.
+5. `ejecutor`
+   - Ejecuta o simula herramientas reales: ventas, pujas, clausulazos, subidas de clausula, ofertas cerradas y alineacion.
+   - Respeta `dry-run` y bloqueos por fase.
+
+Puedes volver al ejecutor anterior con:
+
+```env
+FANTASY_AGENT_ENGINE=legacy
+```
+
 ### Operativa (PRE, POST, /informe, /compraventa, /ventas y /optimizar)
 
 - PRE (automatico, 10 min antes del cierre):
-  - Lo lanza el daemon LangChain.
+  - Lo lanza el daemon autónomo.
   - Ejecuta el mismo flujo que `/informe` + `/compraventa` en ese ciclo.
   - Primero genera el plan del ciclo en simulacion y despues ejecuta en real ese plan (si el daemon no esta en `dry-run`).
   - Incluye ventas, pujas, clausulazos y subidas de clausula cuando aplique.
 
 - POST (automatico, 10 min despues del cierre):
-  - Lo lanza el daemon LangChain.
+  - Lo lanza el daemon autónomo.
   - Ejecuta tareas de post-cierre (por ejemplo aceptar ofertas cerradas) y ajustes de gestion.
 
 - /informe (manual en Telegram):
@@ -59,6 +90,7 @@ cp .env.example .env
 
 ```env
 OPENAI_API_KEY=...
+FANTASY_AGENT_ENGINE=langgraph
 LANGCHAIN_LLM_MODEL=gpt-5-mini
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...

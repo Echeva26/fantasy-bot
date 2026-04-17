@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -66,6 +68,15 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _norm_text(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    raw = "".join(
+        ch for ch in unicodedata.normalize("NFKD", raw)
+        if not unicodedata.combining(ch)
+    )
+    return " ".join(raw.split())
 
 
 def _clause_exposure_ratio(market_value: Any, clause_value: Any) -> float | None:
@@ -431,6 +442,143 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         )
 
     @tool
+    def news_reader_tool(limit: int = 30) -> str:
+        """
+        Lector RAG local de noticias y scrapes recientes.
+
+        Lee el JSON más nuevo de `scrapes/` y devuelve lesiones, sanciones,
+        apercibidos y movimientos de mercado relevantes para mi plantilla y
+        jugadores disponibles.
+        """
+        scrapes_dir = Path(__file__).parent.parent / "scrapes"
+        if not scrapes_dir.exists():
+            return _as_json(
+                {
+                    "ok": False,
+                    "source": "scrapes",
+                    "reason": "No existe el directorio scrapes/. Ejecuta python -m scrapers.scrape_all.",
+                    "items": [],
+                }
+            )
+
+        files = sorted(
+            [p for p in scrapes_dir.iterdir() if p.is_file() and p.suffix == ".json"],
+            reverse=True,
+        )
+        if not files:
+            return _as_json(
+                {
+                    "ok": False,
+                    "source": "scrapes",
+                    "reason": "No hay snapshots JSON en scrapes/. Ejecuta python -m scrapers.scrape_all.",
+                    "items": [],
+                }
+            )
+
+        latest = files[0]
+        try:
+            data = json.loads(latest.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return _as_json(
+                {
+                    "ok": False,
+                    "source_file": str(latest),
+                    "reason": f"No se pudo leer el scrape: {type(exc).__name__}: {exc}",
+                    "items": [],
+                }
+            )
+
+        snapshot = runtime.get_snapshot(force_refresh=False)
+        my_players = snapshot.get("mi_equipo", {}).get("plantilla", []) or []
+        market_players = snapshot.get("mercado", []) or []
+        names: set[str] = set()
+        for p in my_players:
+            names.add(_norm_text(p.get("nombre") or p.get("player_name") or p.get("name")))
+        for p in market_players:
+            names.add(_norm_text(p.get("nombre") or p.get("player_name") or p.get("name")))
+        names.discard("")
+
+        def _is_relevant(row: dict) -> bool:
+            row_name = _norm_text(row.get("nombre") or row.get("name"))
+            if not row_name:
+                return False
+            if row_name in names:
+                return True
+            return any(row_name in n or n in row_name for n in names if len(n) >= 5)
+
+        items: list[dict] = []
+        ff = data.get("futbolfantasy", {}) if isinstance(data, dict) else {}
+        if isinstance(ff, dict):
+            for row in ff.get("lesionados", []) or []:
+                if isinstance(row, dict) and _is_relevant(row):
+                    items.append(
+                        {
+                            "tipo": "lesion",
+                            "nombre": row.get("nombre"),
+                            "equipo": row.get("equipo"),
+                            "estado": row.get("estado"),
+                            "probabilidad_titular": row.get("probabilidad_titular"),
+                            "detalle": row.get("lesion") or row.get("info_retorno"),
+                            "info_retorno": row.get("info_retorno"),
+                            "url": row.get("url_parte"),
+                        }
+                    )
+            for row in ff.get("sancionados", []) or []:
+                if isinstance(row, dict) and _is_relevant(row):
+                    items.append(
+                        {
+                            "tipo": "sancion",
+                            "nombre": row.get("nombre"),
+                            "motivo": row.get("motivo"),
+                            "ciclo": row.get("ciclo"),
+                            "jornadas_tarjetas": row.get("jornadas_tarjetas"),
+                        }
+                    )
+            for row in ff.get("apercibidos", []) or []:
+                if isinstance(row, dict) and _is_relevant(row):
+                    items.append(
+                        {
+                            "tipo": "apercibido",
+                            "nombre": row.get("nombre"),
+                            "motivo": row.get("motivo") or row.get("ciclo"),
+                            "jornadas_tarjetas": row.get("jornadas_tarjetas"),
+                        }
+                    )
+
+        mv = data.get("market_values", {}) if isinstance(data, dict) else {}
+        mercado = mv.get("mercado", {}) if isinstance(mv, dict) else {}
+        if isinstance(mercado, dict):
+            for bucket in ("subidas", "bajadas"):
+                for row in mercado.get(bucket, []) or []:
+                    if isinstance(row, dict) and _is_relevant(row):
+                        items.append(
+                            {
+                                "tipo": f"valor_{bucket[:-1]}",
+                                "nombre": row.get("nombre") or row.get("name"),
+                                "equipo": row.get("equipo") or row.get("team"),
+                                "valor": row.get("valor") or row.get("market_value"),
+                                "variacion": row.get("variacion") or row.get("change"),
+                            }
+                        )
+
+        n = max(1, min(int(limit), 200))
+        return _as_json(
+            {
+                "ok": True,
+                "source": "scrapes",
+                "source_file": str(latest),
+                "scraped_at": data.get("scraped_at") if isinstance(data, dict) else None,
+                "counts": {
+                    "lesionados": len(ff.get("lesionados", []) or []) if isinstance(ff, dict) else 0,
+                    "sancionados": len(ff.get("sancionados", []) or []) if isinstance(ff, dict) else 0,
+                    "apercibidos": len(ff.get("apercibidos", []) or []) if isinstance(ff, dict) else 0,
+                    "relevantes": len(items),
+                },
+                "items": items[:n],
+            }
+        )
+
+    @tool
     def simulate_transfer_plan(force_refresh: bool = False) -> str:
         """Simula plan de ventas/compras recomendado por el motor actual del repositorio."""
         team_analysis = runtime.get_team_analysis(force_refresh=force_refresh)
@@ -743,6 +891,7 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         predictions_top,
         player_outlook,
         market_opportunities,
+        news_reader_tool,
         simulate_transfer_plan,
         execute_simulated_plan,
         accept_closed_offers,

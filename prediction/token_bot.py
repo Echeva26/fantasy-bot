@@ -45,7 +45,7 @@ EXECUTABLE_TOOLS = {
 REPORT_PLAN_OBJECTIVE = (
     "Genera el informe del ciclo actual y un plan EJECUTABLE de compraventa.\n"
     "Reglas obligatorias:\n"
-    "1) Usa snapshot_summary, my_squad, market_opportunities y simulate_transfer_plan.\n"
+    "1) Usa snapshot_summary, my_squad, market_opportunities, news_reader_tool y simulate_transfer_plan.\n"
     "2) Simula EXACTAMENTE las operaciones finales llamando las herramientas:\n"
     "   sell_player_phase1_tool, place_bid_tool, buyout_player_tool, increase_clause_tool.\n"
     "3) Respeta el orden real de ejecución y no uses accept_closed_offers.\n"

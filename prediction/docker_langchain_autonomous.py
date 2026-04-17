@@ -1,8 +1,8 @@
 """
-Runner Docker para agente LangChain autónomo.
+Runner Docker para agente LangGraph/LangChain autónomo.
 
 Lanza en un solo proceso:
-- Daemon LangChain (scheduler PRE/POST)
+- Daemon autónomo (scheduler PRE/POST)
 - Bot de Telegram para renovación de token (opcional)
 """
 
@@ -30,7 +30,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Runner Docker LangChain: daemon + token bot"
+        description="Runner Docker: daemon LangGraph + token bot"
     )
     parser.add_argument(
         "--league",
@@ -59,6 +59,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20")),
+    )
+    parser.add_argument(
+        "--agent-engine",
+        choices=["langgraph", "legacy"],
+        default=(
+            os.getenv("FANTASY_AGENT_ENGINE")
+            or os.getenv("LANGCHAIN_AGENT_ENGINE")
+            or "langgraph"
+        ),
+        help="Motor del agente autónomo. Por defecto usa LangGraph.",
     )
     parser.add_argument(
         "--pre-objective",
@@ -106,6 +116,7 @@ def main() -> None:
         llm_model=args.llm_model,
         temperature=args.temperature,
         max_iterations=args.max_iterations,
+        agent_engine=args.agent_engine,
         pre_objective=args.pre_objective,
         post_objective=args.post_objective,
         dry_run=args.dry_run,

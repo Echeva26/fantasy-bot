@@ -1,5 +1,5 @@
 """
-Agente LangChain para gestión autónoma de LaLiga Fantasy.
+Agente LangGraph/LangChain para gestión autónoma de LaLiga Fantasy.
 
 Ejemplos:
   python -m prediction.langchain_agent --phase pre
@@ -262,7 +262,33 @@ def run_agent_objective(
     max_iterations: int = 20,
     dry_run: bool = False,
     verbose: bool = False,
+    engine: str | None = None,
 ) -> dict:
+    engine_key = (
+        engine
+        or os.getenv("FANTASY_AGENT_ENGINE")
+        or os.getenv("LANGCHAIN_AGENT_ENGINE")
+        or "langgraph"
+    ).strip().lower()
+    if engine_key in {"langgraph", "graph"}:
+        from prediction.langgraph_agent import run_graph_objective
+
+        return run_graph_objective(
+            league_id=league_id,
+            objective=objective,
+            phase=phase,
+            model_type=model_type,
+            llm_model=llm_model,
+            temperature=temperature,
+            max_iterations=max_iterations,
+            dry_run=dry_run,
+            verbose=verbose,
+        )
+    if engine_key not in {"legacy", "langchain"}:
+        raise ValueError(
+            f"Motor de agente inválido: {engine_key}. Usa langgraph o legacy."
+        )
+
     runtime = FantasyAgentRuntime(
         league_id=league_id,
         model_type=model_type,
@@ -306,6 +332,7 @@ def run_agent_objective(
         "dry_run": dry_run,
         "model_type": model_type,
         "llm_model": llm_model,
+        "engine": "legacy",
         "output": _extract_output(response),
         "steps": steps,
     }
@@ -321,6 +348,7 @@ def run_agent_phase(
     max_iterations: int = 20,
     dry_run: bool = False,
     verbose: bool = False,
+    engine: str | None = None,
 ) -> dict:
     phase_key = (phase or "pre").strip().lower()
     if phase_key not in PHASE_OBJECTIVES:
@@ -335,11 +363,12 @@ def run_agent_phase(
         max_iterations=max_iterations,
         dry_run=dry_run,
         verbose=verbose,
+        engine=engine,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Agente LangChain para LaLiga Fantasy")
+    parser = argparse.ArgumentParser(description="Agente LangGraph para LaLiga Fantasy")
     parser.add_argument(
         "--league",
         default="",
@@ -354,7 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-model",
         default=os.getenv("LANGCHAIN_LLM_MODEL", "gpt-5-mini"),
-        help="Modelo LLM usado por LangChain.",
+        help="Modelo LLM usado por el agente.",
     )
     parser.add_argument(
         "--temperature",
@@ -365,6 +394,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20")),
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["langgraph", "legacy"],
+        default=(
+            os.getenv("FANTASY_AGENT_ENGINE")
+            or os.getenv("LANGCHAIN_AGENT_ENGINE")
+            or "langgraph"
+        ),
+        help="Motor del agente. Por defecto usa LangGraph; legacy conserva el agent executor anterior.",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -400,15 +439,17 @@ def main() -> None:
         max_iterations=max(1, args.max_iterations),
         dry_run=bool(args.dry_run),
         verbose=bool(args.verbose),
+        engine=args.engine,
     )
 
     print()
     print("=" * 72)
-    print("LANGCHAIN FANTASY AGENT")
+    print("FANTASY AGENT")
     print("=" * 72)
     print(f"Liga: {result['league_id']}")
     print(f"Objetivo: {result['objective']}")
     print(f"Dry run: {result['dry_run']}")
+    print(f"Motor: {result.get('engine', args.engine)}")
     print("-" * 72)
     print(result["output"])
     print("-" * 72)

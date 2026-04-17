@@ -1,5 +1,5 @@
 """
-Daemon autónomo para el agente LangChain.
+Daemon autónomo para el agente LangGraph/LangChain.
 
 Ejemplo:
   python -m prediction.langchain_autonomous
@@ -218,6 +218,7 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
             max_iterations=args.max_iterations,
             dry_run=args.dry_run,
             verbose=args.verbose,
+            engine=getattr(args, "agent_engine", None),
         )
     return run_agent_phase(
         league_id=league_id,
@@ -228,6 +229,7 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
         max_iterations=args.max_iterations,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        engine=getattr(args, "agent_engine", None),
     )
 
 
@@ -252,6 +254,7 @@ def _run_pre_informe_plus_compraventa(
         max_iterations=args.max_iterations,
         dry_run=True,
         verbose=args.verbose,
+        engine=getattr(args, "agent_engine", None),
     )
 
     output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
@@ -733,7 +736,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Daemon autónomo con agente LangChain")
+    parser = argparse.ArgumentParser(description="Daemon autónomo con agente LangGraph")
     parser.add_argument(
         "--league",
         default="",
@@ -761,6 +764,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20")),
+    )
+    parser.add_argument(
+        "--agent-engine",
+        choices=["langgraph", "legacy"],
+        default=(
+            os.getenv("FANTASY_AGENT_ENGINE")
+            or os.getenv("LANGCHAIN_AGENT_ENGINE")
+            or "langgraph"
+        ),
+        help="Motor del agente autónomo. Por defecto usa LangGraph.",
     )
     parser.add_argument(
         "--pre-objective",
