@@ -219,6 +219,14 @@ def run_private_tests(client: LaLigaFantasyClient, player_ids: list[int]):
         return f"{len(ids)} managers: {ids[:3]}..."
     t8()
 
+    @test("Privado: get_my_team_money")
+    def t_money():
+        money = client.get_my_team_money()
+        assert isinstance(money, int), f"Esperaba int, recibí {type(money)}"
+        assert money >= 0, f"Saldo inválido: {money}"
+        return f"saldo={money:,} €"
+    t_money()
+
     @test("Privado: get_team_raw (primer manager)")
     def t9():
         if not manager_ids:

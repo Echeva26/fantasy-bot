@@ -324,7 +324,11 @@ def _run_pre_informe_plus_compraventa(
         _save_report_plan_cache(cache_payload)
         return out
 
-    summary = _execute_cached_actions(league_id=league_id, actions=actions)
+    summary = _execute_cached_actions(
+        league_id=league_id,
+        actions=actions,
+        fallback_balance=sim_summary.get("saldo_actual"),
+    )
     cache_payload["executed_at"] = _now_iso()
     cache_payload["execution_summary"] = summary
     _save_report_plan_cache(cache_payload)

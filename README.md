@@ -19,6 +19,8 @@ grafo LangGraph por ciclos.
 
 ### Arquitectura LangGraph
 
+![Esquema de arquitectura del Fantasy Bot IA](docs/fantasy-bot-flow.svg)
+
 El estado global viaja por el grafo con plantilla, saldo, puntos, mercado,
 predicciones, noticias, informes y acciones.
 

@@ -1535,6 +1535,66 @@ class LaLigaFantasyClient:
             f"en la liga {self.league_id}."
         )
 
+    def get_team_money(self, team_id: str) -> int:
+        """
+        Obtiene el saldo actual de un equipo.
+
+        La API ha movido este dato entre endpoints varias veces. Probamos el
+        endpoint específico de saldo primero y después reutilizamos respuestas
+        de equipo/liga que también suelen incluir `teamMoney`.
+        """
+        tid = str(team_id or "").strip()
+        if not tid:
+            raise ValueError("team_id vacío.")
+
+        attempts: list[tuple[str, Any]] = []
+
+        money_urls = [
+            f"{BASE_URL}/api/v3/teams/{tid}/money",
+            f"{BASE_URL}/api/v3/leagues/{self.league_id}/teams/{tid}/money",
+        ]
+        for url in money_urls:
+            try:
+                money = _extract_money_value(self._get(url))
+                if money is not None:
+                    return int(money)
+            except Exception as exc:
+                attempts.append((url, exc))
+
+        for label, getter in (
+            ("league_me", self.get_league_me_raw),
+            ("team_v4", lambda: self.get_team_raw_v4(tid)),
+            ("team_v3", lambda: self.get_team_raw(tid)),
+        ):
+            try:
+                money = _extract_money_value(getter())
+                if money is not None:
+                    return int(money)
+            except Exception as exc:
+                attempts.append((label, exc))
+
+        try:
+            ranking = self.get_ranking_raw()
+            for entry in ranking:
+                team = entry.get("team", {}) if isinstance(entry, dict) else {}
+                if str(team.get("id", "")).strip() != tid:
+                    continue
+                money = _extract_money_value(team)
+                if money is not None:
+                    return int(money)
+        except Exception as exc:
+            attempts.append(("ranking", exc))
+
+        detail = "; ".join(f"{label}: {type(exc).__name__}" for label, exc in attempts[-4:])
+        raise RuntimeError(
+            "No se pudo leer saldo actual desde API de liga."
+            + (f" Intentos fallidos: {detail}" if detail else "")
+        )
+
+    def get_my_team_money(self) -> int:
+        """Obtiene el saldo actual del equipo del usuario autenticado."""
+        return self.get_team_money(self.find_my_team_id())
+
     # -------------------------------------------------------------------
     # Actividad del mercado
     # -------------------------------------------------------------------
@@ -1597,6 +1657,50 @@ def _to_int(value) -> int | None:
             return int(value)
         except ValueError:
             return None
+    return None
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        parsed = _to_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_money_value(payload: Any) -> int | None:
+    """
+    Extrae saldo de respuestas de la API con formatos distintos.
+
+    Ejemplos vistos/esperados:
+    - {"money": 123}
+    - {"teamMoney": "123"}
+    - {"team": {"teamMoney": 123}}
+    - {"data": {"money": 123}}
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (int, float, str)):
+        return _to_int(payload)
+    if isinstance(payload, dict):
+        for key in (
+            "teamMoney",
+            "money",
+            "availableMoney",
+            "available_money",
+            "balance",
+            "saldo",
+            "saldo_disponible",
+        ):
+            if key in payload:
+                money = _to_int(payload.get(key))
+                if money is not None:
+                    return money
+        for key in ("team", "data", "result", "me"):
+            if key in payload:
+                money = _extract_money_value(payload.get(key))
+                if money is not None:
+                    return money
     return None
 
 
@@ -1724,10 +1828,12 @@ def get_league_snapshot(client: LaLigaFantasyClient) -> dict:
     logger.info("Obteniendo mi equipo...")
     my_team_raw = client.get_team_raw(my_team_id)
     my_team = my_ranking_entry.get("team", {})
+    my_team_v4 = client.get_team_raw_v4(my_team_id)
+    my_league_me_raw = client.get_league_me_raw()
 
     # Obtener player_team_id desde v4, league/me o mercado (v3 teams no lo incluye)
     v4_player_ids: dict[int, str] = {}  # player_id -> player_team_id
-    for src in [client.get_team_raw_v4(my_team_id), client.get_league_me_raw()]:
+    for src in [my_team_v4, my_league_me_raw]:
         if not src:
             continue
         players = src.get("players", src.get("squad", []))
@@ -1810,11 +1916,26 @@ def get_league_snapshot(client: LaLigaFantasyClient) -> dict:
 
         plantilla.append(player_data)
 
+    saldo_disponible = _first_int(
+        my_team_raw.get("teamMoney"),
+        my_team.get("teamMoney"),
+        (my_team_v4 or {}).get("teamMoney") if isinstance(my_team_v4, dict) else None,
+        (my_league_me_raw or {}).get("teamMoney") if isinstance(my_league_me_raw, dict) else None,
+        _extract_money_value(my_team_v4),
+        _extract_money_value(my_league_me_raw),
+    )
+    if saldo_disponible is None:
+        try:
+            saldo_disponible = client.get_team_money(my_team_id)
+        except Exception as exc:
+            logger.warning("No se pudo resolver saldo_disponible del snapshot: %s", exc)
+            saldo_disponible = 0
+
     mi_equipo = {
         "manager_id": my_manager_id,
         "manager_name": user_info.get("managerName", ""),
         "team_id": my_team_id,
-        "saldo_disponible": _to_int(my_team_raw.get("teamMoney")),
+        "saldo_disponible": int(saldo_disponible),
         "valor_equipo": _to_int(my_team.get("teamValue")),
         "puntos": my_team.get("teamPoints"),
         "posicion": my_ranking_entry.get("position"),

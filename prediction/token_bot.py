@@ -626,11 +626,27 @@ def _build_compraventa_message(
         "",
         f"Acciones planificadas: {summary.get('actions_total', 0)}",
         f"Acciones OK: {summary.get('actions_ok', 0)}",
+        f"Acciones saltadas: {summary.get('actions_skipped', 0)}",
         f"Ventas fase1: {summary.get('ventas', 0)}",
         f"Pujas: {summary.get('pujas', 0)}",
         f"Clausulazos: {summary.get('clausulazos', 0)}",
         f"Subidas de cláusula: {summary.get('clausulas_subidas', 0)}",
     ]
+
+    saldo_actual = summary.get("saldo_actual")
+    saldo_restante = summary.get("saldo_restante_estimado")
+    if saldo_actual is not None:
+        source = str(summary.get("saldo_source", "")).strip()
+        source_txt_balance = "API" if source == "api" else "cache del informe" if source == "cache" else source
+        lines.extend(
+            [
+                f"Saldo validado: {_money_short(saldo_actual)}"
+                + (f" ({source_txt_balance})" if source_txt_balance else ""),
+                f"Saldo restante estimado: {_money_short(saldo_restante)}",
+            ]
+        )
+    if summary.get("saldo_warning"):
+        lines.append(f"Aviso saldo: {_compact_text(summary.get('saldo_warning'), 220)}")
 
     details = summary.get("details", [])
     if isinstance(details, list) and details:
@@ -678,23 +694,68 @@ def _save_report_plan_cache(payload: dict, path: Path = REPORT_PLAN_CACHE_FILE) 
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
-def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
+def _action_cash_cost(tool: str, payload: dict) -> int:
+    if tool == "place_bid_tool":
+        return _safe_int(payload.get("amount"), 0)
+    if tool == "buyout_player_tool":
+        return _safe_int(payload.get("clause_to_pay"), 0)
+    if tool == "increase_clause_tool":
+        return _safe_int(payload.get("value_to_increase"), 0)
+    return 0
+
+
+def _resolve_current_balance(
+    client: LaLigaFantasyClient,
+    fallback_balance: object = None,
+) -> tuple[int | None, str, str]:
+    try:
+        return int(client.get_my_team_money()), "api", ""
+    except Exception as exc:
+        fallback = _safe_int(fallback_balance, -1)
+        if fallback >= 0:
+            return fallback, "cache", f"{type(exc).__name__}: {exc}"
+        return None, "unknown", f"{type(exc).__name__}: {exc}"
+
+
+def _execute_cached_actions(
+    league_id: str,
+    actions: list[dict],
+    *,
+    fallback_balance: object = None,
+) -> dict:
     client = LaLigaFantasyClient.from_saved_token(league_id=league_id)
+    current_balance, balance_source, balance_warning = _resolve_current_balance(
+        client,
+        fallback_balance=fallback_balance,
+    )
     summary = {
         "actions_total": len(actions),
         "actions_ok": 0,
+        "actions_skipped": 0,
         "ventas": 0,
         "pujas": 0,
         "clausulazos": 0,
         "clausulas_subidas": 0,
+        "saldo_actual": current_balance,
+        "saldo_source": balance_source,
+        "saldo_warning": balance_warning,
         "details": [],
         "errors": [],
     }
+    remaining_balance = current_balance
 
     for idx, action in enumerate(actions, 1):
         tool = str(action.get("tool", "")).strip()
         payload = _tool_input_dict(action.get("tool_input"))
         label = str(action.get("label", "")).strip() or _format_action_label(tool, payload)
+        cash_cost = _action_cash_cost(tool, payload)
+        if remaining_balance is not None and cash_cost > remaining_balance:
+            summary["actions_skipped"] += 1
+            summary["details"].append(
+                f"[SKIP] {idx}. {label} -> saldo insuficiente "
+                f"({_money_short(remaining_balance)} disponible, {_money_short(cash_cost)} requerido)"
+            )
+            continue
         try:
             if tool == "sell_player_phase1_tool":
                 player_team_id = str(payload.get("player_team_id", "")).strip()
@@ -721,6 +782,8 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
                 )
                 summary["actions_ok"] += 1
                 summary["pujas"] += 1
+                if remaining_balance is not None:
+                    remaining_balance -= cash_cost
                 summary["details"].append(f"[OK] {idx}. {label}")
                 continue
 
@@ -736,6 +799,8 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
                 )
                 summary["actions_ok"] += 1
                 summary["clausulazos"] += 1
+                if remaining_balance is not None:
+                    remaining_balance -= cash_cost
                 summary["details"].append(f"[OK] {idx}. {label}")
                 continue
 
@@ -751,6 +816,8 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
                 )
                 summary["actions_ok"] += 1
                 summary["clausulas_subidas"] += 1
+                if remaining_balance is not None:
+                    remaining_balance -= cash_cost
                 summary["details"].append(f"[OK] {idx}. {label}")
                 continue
 
@@ -762,6 +829,7 @@ def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
             summary["errors"].append(msg)
             summary["details"].append(f"[ERROR] {idx}. {label} -> {type(exc).__name__}: {exc}")
 
+    summary["saldo_restante_estimado"] = remaining_balance
     return summary
 
 
@@ -1117,7 +1185,13 @@ def _run_langchain_agent_cmd(
                 "Genera un nuevo /informe y revisa que incluya plan de compraventa."
             )
 
-        summary = _execute_cached_actions(league_id=league_id, actions=actions)
+        sim_summary = cache.get("simulation_summary", {})
+        sim_summary = sim_summary if isinstance(sim_summary, dict) else {}
+        summary = _execute_cached_actions(
+            league_id=league_id,
+            actions=actions,
+            fallback_balance=sim_summary.get("saldo_actual"),
+        )
         cache["executed_at"] = _now_iso()
         cache["execution_summary"] = summary
         _save_report_plan_cache(cache)
