@@ -22,8 +22,8 @@ from laliga_fantasy_client import LaLigaFantasyClient
 from prediction.advisor import (
     analyze_available_players,
     analyze_my_team,
-    clausulazos_available,
     compute_competitive_bid_amount,
+    current_week_clausulazos_available,
     get_predictions,
     load_snapshot,
     simulate_transfer_plan,
@@ -168,7 +168,10 @@ class FantasyAgentRuntime:
             team_analysis = self.get_team_analysis(force_refresh=force_refresh)
             available = self.get_available(force_refresh=force_refresh)
             _, first_match_ts = self.get_predictions(force_refresh=force_refresh)
-            claus_ok, hours_to_match = clausulazos_available(first_match_ts)
+            claus_ok, hours_to_match, _ = current_week_clausulazos_available(
+                first_match_ts,
+                fail_closed=False,
+            )
             self._transfer_plan = simulate_transfer_plan(
                 team_analysis=team_analysis,
                 available=available,
@@ -256,8 +259,9 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     def _block_if_buyout_locked(action: str = "buyout_player_tool") -> str | None:
         try:
-            _, first_match_ts = runtime.get_predictions(force_refresh=False)
-            claus_ok, hours_to_match = clausulazos_available(first_match_ts)
+            claus_ok, hours_to_match, source = current_week_clausulazos_available(
+                fail_closed=True,
+            )
         except Exception as exc:
             return _as_json(
                 {
@@ -279,6 +283,7 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
                 "blocked": True,
                 "action": action,
                 "hours_to_first_match": round(hours_to_match, 1),
+                "source": source,
                 "reason": (
                     "Clausulazos bloqueados: LaLiga Fantasy no permite comprar "
                     "jugadores mediante clausulazo desde 24h antes del inicio de "
@@ -412,7 +417,10 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         """Devuelve oportunidades de compra del mercado (pujas) y clausulazos disponibles."""
         available = runtime.get_available(force_refresh=force_refresh)
         _, first_match_ts = runtime.get_predictions(force_refresh=force_refresh)
-        claus_ok, hours_to_match = clausulazos_available(first_match_ts)
+        claus_ok, hours_to_match, claus_source = current_week_clausulazos_available(
+            first_match_ts,
+            fail_closed=False,
+        )
 
         items = []
         for p in available.get("mercado", []):
@@ -470,6 +478,7 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
                 "count": min(len(items), n),
                 "hours_to_first_match": round(hours_to_match, 1),
                 "clausulazos_available": claus_ok,
+                "clausulazos_window_source": claus_source,
                 "items": items[:n],
             }
         )
@@ -619,6 +628,7 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         payload = {
             "clausulazos_available": claus_ok,
             "hours_to_first_match": round(hours_to_match, 1),
+            "clausulazos_window_source": "laliga_calendar_or_fallback",
             "summary": {
                 "xp_once_actual": team_analysis.get("xp_total_once"),
                 "xp_once_post": plan.get("xp_total_post"),

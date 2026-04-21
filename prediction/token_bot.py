@@ -23,8 +23,7 @@ import requests
 from laliga_fantasy_client import LaLigaFantasyClient, TOKEN_FILE, load_token, save_token
 from prediction.advisor import (
     CLAUSULAZO_LOCKOUT_HOURS,
-    clausulazos_available,
-    get_predictions as get_advisor_predictions,
+    current_week_clausulazos_available,
 )
 from prediction.advisor_execute import run_aceptar_ofertas
 from prediction.langchain_agent import run_agent_objective
@@ -757,30 +756,22 @@ def _resolve_current_balance(
 
 
 def _buyout_window_for_execution() -> dict:
-    try:
-        _, first_match_ts = get_advisor_predictions("xgboost")
-        available, hours_to_match = clausulazos_available(int(first_match_ts))
-    except Exception as exc:
-        return {
-            "available": False,
-            "hours_to_first_match": None,
-            "reason": (
-                "No se pudo validar la ventana de clausulazos; por seguridad "
-                "se bloquean los clausulazos del plan cacheado."
-            ),
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+    available, hours_to_match, source = current_week_clausulazos_available(
+        fail_closed=True,
+    )
 
     if available:
         return {
             "available": True,
             "hours_to_first_match": round(float(hours_to_match), 1),
+            "source": source,
             "reason": "",
         }
 
     return {
         "available": False,
         "hours_to_first_match": round(float(hours_to_match), 1),
+        "source": source,
         "reason": (
             f"Regla 24h: LaLiga Fantasy no permite comprar mediante clausulazo "
             f"desde {CLAUSULAZO_LOCKOUT_HOURS}h antes del primer partido de la jornada."

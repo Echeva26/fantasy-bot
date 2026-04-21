@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from prediction.advisor import (
     analyze_available_players,
     analyze_my_team,
-    clausulazos_available,
+    current_week_clausulazos_available,
     generate_report,
     get_predictions,
     load_snapshot,
@@ -67,7 +67,10 @@ def run_advisor_pipeline(args: argparse.Namespace) -> dict:
         snapshot = load_snapshot(args.league)
     pred_df, first_match_ts = get_predictions(MODEL_TYPE)
     jornada = int(pred_df["jornada"].iloc[0]) if not pred_df.empty else "?"
-    clausulazos_ok, horas_al_partido = clausulazos_available(first_match_ts)
+    clausulazos_ok, horas_al_partido, _ = current_week_clausulazos_available(
+        first_match_ts,
+        fail_closed=False,
+    )
     team_analysis = analyze_my_team(snapshot, pred_df)
     mi_equipo = snapshot["mi_equipo"]
     available = analyze_available_players(
@@ -150,7 +153,10 @@ def execute_movements(
     if plan_incluye_clausulazo:
         try:
             _, first_match_ts = get_predictions(MODEL_TYPE)
-            clausulazos_ok, horas_al_partido = clausulazos_available(first_match_ts)
+            clausulazos_ok, horas_al_partido, _ = current_week_clausulazos_available(
+                first_match_ts,
+                fail_closed=True,
+            )
         except Exception as exc:
             clausulazos_ok = False
             horas_al_partido = 0.0

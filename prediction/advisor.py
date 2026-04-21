@@ -174,6 +174,83 @@ def clausulazos_available(first_match_ts: int) -> tuple[bool, float]:
     return disponible, round(horas, 1)
 
 
+def _parse_api_datetime(raw: object) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def get_laliga_calendar_first_match_ts() -> tuple[int, str]:
+    """
+    Obtiene el primer partido de la jornada actual desde la API de LaLiga Fantasy.
+
+    Esta es la fuente operativa para la regla de clausulazos, porque es la misma
+    competición que aplica el bloqueo 24h. No depende de Sofascore ni de que se
+    regeneren predicciones.
+    """
+    from laliga_fantasy_client import LaLigaFantasyPublic
+
+    api = LaLigaFantasyPublic()
+    current_week = api.get_current_week() or {}
+    calendar = api.get_calendar() or []
+
+    dates: list[datetime] = []
+    for item in calendar:
+        if not isinstance(item, dict):
+            continue
+        dt = _parse_api_datetime(
+            item.get("matchDate")
+            or item.get("date")
+            or item.get("time")
+            or item.get("startDate")
+        )
+        if dt:
+            dates.append(dt)
+
+    if not dates:
+        raise RuntimeError("No se encontraron fechas de partido en /api/v3/calendar.")
+
+    week = current_week.get("weekNumber") or current_week.get("nextWeek") or "?"
+    return int(min(dates).timestamp()), f"laliga_calendar_week_{week}"
+
+
+def current_week_clausulazos_available(
+    fallback_first_match_ts: int = 0,
+    *,
+    fail_closed: bool = False,
+) -> tuple[bool, float, str]:
+    """
+    Determina la ventana de clausulazos para la jornada actual.
+
+    Prioridad:
+    1. Calendario oficial de LaLiga Fantasy.
+    2. Si `fail_closed=True`, cerrado por seguridad si el calendario falla.
+    3. Timestamp de predicciones como fallback solo para simulación/informes.
+    4. Si no hay ninguna fuente: abierto por compatibilidad.
+    """
+    try:
+        first_match_ts, source = get_laliga_calendar_first_match_ts()
+        ok, hours = clausulazos_available(first_match_ts)
+        return ok, hours, source
+    except Exception as exc:
+        calendar_error = f"{type(exc).__name__}: {exc}"
+
+    if fail_closed:
+        return False, 0.0, f"unverified_fail_closed: {calendar_error}"
+
+    if int(fallback_first_match_ts or 0) > 0:
+        ok, hours = clausulazos_available(int(fallback_first_match_ts))
+        return ok, hours, f"predictions_fallback_after_calendar_error: {calendar_error}"
+
+    return True, 999.0, f"unverified_open_compat: {calendar_error}"
+
+
 # ─── 2. Generar predicciones xP ──────────────────────────────
 def get_predictions(model_type: str = MODEL_TYPE) -> tuple[pd.DataFrame, int]:
     """
@@ -1188,12 +1265,16 @@ def main():
     print(f"  Jugadores con predicción: {len(pred_df)}")
 
     # 2b. Comprobar ventana de clausulazos
-    clausulazos_ok, horas_al_partido = clausulazos_available(first_match_ts)
+    clausulazos_ok, horas_al_partido, claus_source = current_week_clausulazos_available(
+        first_match_ts,
+        fail_closed=False,
+    )
     if first_match_ts > 0:
         from datetime import datetime as _dt, timezone as _tz
         first_dt = _dt.fromtimestamp(first_match_ts, tz=_tz.utc)
         print(f"  Primer partido: {first_dt.strftime('%d/%m %H:%M UTC')} "
               f"(en {horas_al_partido:.0f}h)")
+        print(f"  Fuente ventana clausulazos: {claus_source}")
     if clausulazos_ok:
         print(f"  Clausulazos: DISPONIBLES")
     else:
