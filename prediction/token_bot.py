@@ -21,6 +21,11 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from laliga_fantasy_client import LaLigaFantasyClient, TOKEN_FILE, load_token, save_token
+from prediction.advisor import (
+    CLAUSULAZO_LOCKOUT_HOURS,
+    clausulazos_available,
+    get_predictions as get_advisor_predictions,
+)
 from prediction.advisor_execute import run_aceptar_ofertas
 from prediction.langchain_agent import run_agent_objective
 from prediction.league_selection import (
@@ -53,7 +58,11 @@ REPORT_PLAN_OBJECTIVE = (
     "5) Si propones subir cláusula, sé moderado: solo jugadores clave y expuestos.\n"
     "   Regla fija: cada 1M invertido sube 2M la cláusula.\n"
     "6) Si recomiendas proteger jugadores, DEBES materializarlo llamando increase_clause_tool.\n"
-    "7) Devuelve resumen breve y claro en español."
+    "7) REGLA CRÍTICA: no se puede comprar ningún jugador mediante clausulazo "
+    "desde 24h antes del inicio de la jornada. Si faltan 24h o menos para el "
+    "primer partido, NO llames buyout_player_tool y descarta todos los "
+    "clausulazos; usa solo pujas de mercado, ventas o subidas de cláusula.\n"
+    "8) Devuelve resumen breve y claro en español."
 )
 
 
@@ -648,6 +657,22 @@ def _build_compraventa_message(
     if summary.get("saldo_warning"):
         lines.append(f"Aviso saldo: {_compact_text(summary.get('saldo_warning'), 220)}")
 
+    buyout_window = summary.get("clausulazos_window", {})
+    if isinstance(buyout_window, dict) and not bool(buyout_window.get("available", True)):
+        hours = buyout_window.get("hours_to_first_match")
+        hours_txt = (
+            f" Quedan {_safe_float(hours):.1f}h para el primer partido."
+            if hours not in (None, "")
+            else ""
+        )
+        skipped = _safe_int(summary.get("clausulazos_bloqueados_24h"), 0)
+        lines.append(
+            "Regla clausulazos: BLOQUEADOS desde 24h antes de jornada."
+            f"{hours_txt}"
+        )
+        if skipped:
+            lines.append(f"Clausulazos saltados por regla 24h: {skipped}")
+
     details = summary.get("details", [])
     if isinstance(details, list) and details:
         lines.append("")
@@ -717,6 +742,38 @@ def _resolve_current_balance(
         return None, "unknown", f"{type(exc).__name__}: {exc}"
 
 
+def _buyout_window_for_execution() -> dict:
+    try:
+        _, first_match_ts = get_advisor_predictions("xgboost")
+        available, hours_to_match = clausulazos_available(int(first_match_ts))
+    except Exception as exc:
+        return {
+            "available": False,
+            "hours_to_first_match": None,
+            "reason": (
+                "No se pudo validar la ventana de clausulazos; por seguridad "
+                "se bloquean los clausulazos del plan cacheado."
+            ),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    if available:
+        return {
+            "available": True,
+            "hours_to_first_match": round(float(hours_to_match), 1),
+            "reason": "",
+        }
+
+    return {
+        "available": False,
+        "hours_to_first_match": round(float(hours_to_match), 1),
+        "reason": (
+            f"Regla 24h: LaLiga Fantasy no permite comprar mediante clausulazo "
+            f"desde {CLAUSULAZO_LOCKOUT_HOURS}h antes del primer partido de la jornada."
+        ),
+    }
+
+
 def _execute_cached_actions(
     league_id: str,
     actions: list[dict],
@@ -736,6 +793,8 @@ def _execute_cached_actions(
         "pujas": 0,
         "clausulazos": 0,
         "clausulas_subidas": 0,
+        "clausulazos_bloqueados_24h": 0,
+        "clausulazos_window": {},
         "saldo_actual": current_balance,
         "saldo_source": balance_source,
         "saldo_warning": balance_warning,
@@ -743,12 +802,32 @@ def _execute_cached_actions(
         "errors": [],
     }
     remaining_balance = current_balance
+    buyout_window = (
+        _buyout_window_for_execution()
+        if any(str(a.get("tool", "")).strip() == "buyout_player_tool" for a in actions if isinstance(a, dict))
+        else {"available": True, "hours_to_first_match": None, "reason": ""}
+    )
+    summary["clausulazos_window"] = buyout_window
 
     for idx, action in enumerate(actions, 1):
         tool = str(action.get("tool", "")).strip()
         payload = _tool_input_dict(action.get("tool_input"))
         label = str(action.get("label", "")).strip() or _format_action_label(tool, payload)
         cash_cost = _action_cash_cost(tool, payload)
+        if tool == "buyout_player_tool" and not bool(buyout_window.get("available")):
+            summary["actions_skipped"] += 1
+            summary["clausulazos_bloqueados_24h"] += 1
+            hours = buyout_window.get("hours_to_first_match")
+            hours_txt = (
+                f" Quedan {float(hours):.1f}h para el primer partido."
+                if isinstance(hours, (int, float))
+                else ""
+            )
+            summary["details"].append(
+                f"[SKIP] {idx}. {label} -> clausulazos bloqueados por regla 24h."
+                f"{hours_txt}"
+            )
+            continue
         if remaining_balance is not None and cash_cost > remaining_balance:
             summary["actions_skipped"] += 1
             summary["details"].append(

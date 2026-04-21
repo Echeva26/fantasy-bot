@@ -139,6 +139,25 @@ def execute_movements(
     errores: list[str] = []
     compras_saltadas_saldo = 0  # Para informar al usuario
     compras_saltadas_faltan_datos = 0
+    compras_saltadas_clausulazo_24h = 0
+    plan_incluye_clausulazo = any(
+        (mov.get("compra") or {}).get("tipo") == "clausulazo"
+        for mov in transfer_plan.get("movimientos", [])
+        if isinstance(mov, dict)
+    )
+    clausulazos_ok = True
+    horas_al_partido = 999.0
+    if plan_incluye_clausulazo:
+        try:
+            _, first_match_ts = get_predictions(MODEL_TYPE)
+            clausulazos_ok, horas_al_partido = clausulazos_available(first_match_ts)
+        except Exception as exc:
+            clausulazos_ok = False
+            horas_al_partido = 0.0
+            errores.append(
+                "Clausulazos bloqueados: no se pudo validar la ventana 24h "
+                f"({type(exc).__name__}: {exc})"
+            )
 
     # Jugadores que ya están en venta: plantilla + mercado (no volver a publicar)
     team_id = str(mi_equipo.get("team_id", ""))
@@ -187,6 +206,13 @@ def execute_movements(
             continue
 
         # Verificar datos necesarios
+        if c.get("tipo") == "clausulazo" and not clausulazos_ok:
+            compras_saltadas_clausulazo_24h += 1
+            print(
+                f"    [SKIP] Clausulazo {c.get('nombre', '?')}: bloqueado por regla 24h "
+                f"(primer partido en {horas_al_partido:.1f}h)"
+            )
+            continue
         if c.get("tipo") == "clausulazo" and not c.get("player_team_id"):
             compras_saltadas_faltan_datos += 1
             continue
@@ -225,8 +251,15 @@ def execute_movements(
             print(f"    [ERROR] {msg}")
 
     # Explicar por qué no se ejecutaron compras
-    if compras == 0 and (compras_saltadas_saldo or compras_saltadas_faltan_datos):
+    if compras == 0 and (
+        compras_saltadas_saldo
+        or compras_saltadas_faltan_datos
+        or compras_saltadas_clausulazo_24h
+    ):
         print()
+        if compras_saltadas_clausulazo_24h:
+            print("  ℹ Clausulazos no ejecutados: bloqueados desde 24h antes de la jornada.")
+            print("    En esa ventana solo se permiten pujas de mercado, ventas o subir cláusulas.")
         if compras_saltadas_saldo:
             print("  ℹ Compras no ejecutadas: saldo insuficiente.")
             print("    El dinero de las ventas llegará tras ejecutar --aceptar-ofertas")

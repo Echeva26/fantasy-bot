@@ -37,6 +37,10 @@ Reglas operativas:
 6. Después de acciones ejecutadas, verifica estado de nuevo con herramientas.
 7. La subida de cláusula debe ser moderada: solo jugadores clave y expuestos a clausulazo.
 8. Regla fija de cláusulas: por cada 1M invertido, la cláusula sube 2M (factor 2.0).
+9. Regla crítica de clausulazos: no se puede comprar ningún jugador mediante
+   clausulazo desde 24h antes del inicio de la jornada. Si faltan 24h o menos
+   para el primer partido, descarta todos los buyout_player_tool/clausulazos y
+   usa solo mercado de pujas, ventas o subidas de cláusula.
 
 Formato de salida final:
 - Responde en español.

@@ -23,6 +23,7 @@ from prediction.langchain_agent import run_agent_objective, run_agent_phase
 from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.predict import get_next_round, get_sofascore_season_id
+from prediction.telegram_messages import build_agent_cycle_message
 from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
 from prediction.token_bot import (
     REPORT_PLAN_OBJECTIVE,
@@ -86,11 +87,11 @@ def _save_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
-def _notify(text: str) -> None:
+def _notify(text: str, *, parse_mode: str | None = None) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if token and chat_id:
-        send_telegram_message(token, chat_id, text)
+        send_telegram_message(token, chat_id, text, parse_mode=parse_mode)
 
 
 def _token_ok() -> bool:
@@ -611,9 +612,15 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                         res = _run_phase("pre", args, league_id)
                         output = str(res.get("output", "") or "")
                         _notify(
-                            "Fantasy LangChain (PRE) completado\n"
-                            f"Tools: {len(res.get('steps', []))}\n"
-                            f"Resumen:\n{output[:1200]}"
+                            build_agent_cycle_message(
+                                phase="PRE",
+                                market_key=market_key,
+                                tools_count=len(res.get("steps", [])),
+                                output=output,
+                                steps=res.get("steps", []),
+                                league_name=league_name,
+                            ),
+                            parse_mode="HTML",
                         )
                     else:
                         # Flujo estándar solicitado: PRE = /informe + /compraventa.
@@ -691,6 +698,8 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                     "Lanzando fase POST pendiente (pending_market_key=%s)...",
                     pending_post_key,
                 )
+                selected = load_selected_league() or {}
+                league_name = str(selected.get("league_name", "")).strip() or league_id
                 res = _run_phase("post", args, league_id)
                 output = res.get("output", "")
                 state["last_post_market_key"] = pending_post_key
@@ -701,10 +710,15 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 state.pop("pending_post_local", None)
                 state.pop("pending_post_set_at", None)
                 _notify(
-                    "Fantasy LangChain (POST) completado\n"
-                    f"Ciclo: {pending_post_key}\n"
-                    f"Tools: {len(res.get('steps', []))}\n"
-                    f"Resumen:\n{output[:1200]}"
+                    build_agent_cycle_message(
+                        phase="POST",
+                        market_key=pending_post_key,
+                        tools_count=len(res.get("steps", [])),
+                        output=output,
+                        steps=res.get("steps", []),
+                        league_name=league_name,
+                    ),
+                    parse_mode="HTML",
                 )
 
             # 2) Programación de alineación exacta: 23h55 antes

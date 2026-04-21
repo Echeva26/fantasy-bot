@@ -66,7 +66,7 @@ def load_snapshot_from_file(path: str | Path) -> dict:
 
 
 # ─── Utilidad: ventana de clausulazos ─────────────────────────
-CLAUSULAZO_LOCKOUT_HOURS = 24  # Clausulazos se bloquean 24h antes del primer partido
+CLAUSULAZO_LOCKOUT_HOURS = 24  # Regla: prohibidos desde 24h antes del primer partido
 BID_COMPETITION_MIN_RAISE_EUR = 2_000_000
 BID_COMPETITION_MAX_RAISE_EUR = 4_000_000
 BID_COMPETITION_ROUND_STEP_EUR = 10_000
@@ -153,9 +153,10 @@ def clausulazos_available(first_match_ts: int) -> tuple[bool, float]:
     Determina si los clausulazos están disponibles según la fecha del
     primer partido de la jornada.
 
-    En LaLiga Fantasy, los clausulazos se bloquean ~24h antes del
-    inicio de la jornada. Solo quedan disponibles las compras de
-    mercado y las pujas.
+    En LaLiga Fantasy, los clausulazos están prohibidos desde 24h antes
+    del inicio de la jornada. Si quedan 24h o menos para el primer
+    partido, solo quedan disponibles ventas, subidas de cláusula y
+    compras de mercado mediante pujas.
 
     Returns:
         (disponible: bool, horas_restantes: float)

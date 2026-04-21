@@ -88,7 +88,13 @@ def _chunk_text(text: str, size: int = TELEGRAM_MAX_LEN) -> Iterable[str]:
     return chunks
 
 
-def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
+def send_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> None:
     """
     Envía un mensaje por Telegram Bot API.
     No levanta excepción al usuario final si falla: deja warning en logs.
@@ -99,15 +105,15 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     for part in _chunk_text(text):
         try:
-            resp = requests.post(
-                url,
-                json={
-                    "chat_id": str(chat_id),
-                    "text": part,
-                    "disable_web_page_preview": True,
-                },
-                timeout=25,
-            )
+            payload = {
+                "chat_id": str(chat_id),
+                "text": part,
+                "disable_web_page_preview": True,
+            }
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
+
+            resp = requests.post(url, json=payload, timeout=25)
             if not resp.ok:
                 logger.warning(
                     "Telegram sendMessage failed: %s %s",

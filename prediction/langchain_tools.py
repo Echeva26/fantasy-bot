@@ -254,6 +254,39 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
             }
         )
 
+    def _block_if_buyout_locked(action: str = "buyout_player_tool") -> str | None:
+        try:
+            _, first_match_ts = runtime.get_predictions(force_refresh=False)
+            claus_ok, hours_to_match = clausulazos_available(first_match_ts)
+        except Exception as exc:
+            return _as_json(
+                {
+                    "ok": False,
+                    "blocked": True,
+                    "action": action,
+                    "reason": (
+                        "No se pudo validar la ventana de clausulazos; por seguridad "
+                        "no se ejecuta ningún clausulazo real."
+                    ),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        if claus_ok:
+            return None
+        return _as_json(
+            {
+                "ok": False,
+                "blocked": True,
+                "action": action,
+                "hours_to_first_match": round(hours_to_match, 1),
+                "reason": (
+                    "Clausulazos bloqueados: LaLiga Fantasy no permite comprar "
+                    "jugadores mediante clausulazo desde 24h antes del inicio de "
+                    "la jornada. Usa mercado de pujas, ventas o subidas de cláusula."
+                ),
+            }
+        )
+
     @tool
     def snapshot_summary(force_refresh: bool = False) -> str:
         """Obtiene resumen del estado actual de la liga y del equipo del manager."""
@@ -722,8 +755,11 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
 
     @tool
     def buyout_player_tool(player_team_id: str, clause_to_pay: int = 0) -> str:
-        """Ejecuta un clausulazo sobre un `player_team_id` rival."""
+        """Ejecuta un clausulazo sobre un `player_team_id` rival. Prohibido desde 24h antes de jornada."""
         blocked = _block_if_post("buyout_player_tool")
+        if blocked:
+            return blocked
+        blocked = _block_if_buyout_locked("buyout_player_tool")
         if blocked:
             return blocked
         if runtime.dry_run:

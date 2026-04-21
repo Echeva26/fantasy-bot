@@ -11,6 +11,7 @@ grafo LangGraph por ciclos.
 - El modelo de prediccion es fijo: `xgboost`.
 - La liga se elige en Telegram por nombre: `/ligas` y `/liga <nombre>`.
 - Al elegir la liga, el bot detecta automaticamente la hora real de cierre del mercado leyendo la expiracion de jugadores publicados.
+- Regla crítica: los clausulazos están prohibidos desde 24h antes del primer partido de la jornada; en esa ventana el bot debe saltarlos y operar solo con pujas de mercado, ventas o subidas de cláusula.
 - PRE mercado: se ejecuta siempre 10 minutos antes del cierre real.
 - POST mercado: se ejecuta siempre 10 minutos despues del cierre real.
 - Guarda la alineacion exactamente 23 horas y 55 minutos antes del inicio de la jornada.
@@ -63,11 +64,13 @@ FANTASY_AGENT_ENGINE=legacy
   - Ejecuta el agente IA en simulacion (`dry-run`), sin tocar mercado real.
   - Genera un informe del ciclo actual.
   - Guarda un plan ejecutable en cache para ese ciclo de mercado (ventas, pujas, clausulazos y subida de clausula).
+  - Si faltan 24h o menos para la jornada, no debe cachear clausulazos.
 
 - /compraventa (manual en Telegram):
   - Ejecuta en real exactamente el plan cacheado del ultimo `/informe`.
   - Solo se permite si ese `/informe` es del mismo ciclo de mercado.
   - Si el ciclo cambió, bloquea la ejecución y obliga a lanzar `/informe` de nuevo para evitar operar con plan deprecado.
+  - Antes de ejecutar revalida la regla de 24h: si el plan cacheado contiene clausulazos y la jornada está a 24h o menos, los salta sin llamar a la API.
   - Si el plan incluye subida de clausula, aplica la regla fija: por cada 1M invertido sube 2M la clausula.
 
 - /ventas (manual en Telegram):

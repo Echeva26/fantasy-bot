@@ -17,6 +17,7 @@ pero el motor por defecto es `langgraph`.
 - Incluye comando manual `/ventas` para forzar fase 2 (aceptar ofertas de liga pendientes tras cierre).
 - Guarda alineacion exactamente 23h55 antes del inicio de jornada.
 - Permite optimizacion manual inmediata de alineacion con `/optimizar`.
+- Regla crítica de mercado: desde 24h antes del primer partido de la jornada no se puede comprar a nadie mediante clausulazo. El agente debe descartar `buyout_player_tool` y limitarse a pujas, ventas o subidas de cláusula.
 - Puede subir clausulas de jugadores propios con criterio de moderacion (solo clave + expuestos).
 - Regla fija de clausula: por cada 1M invertido, sube 2M la clausula.
 - Si el token no esta valido, avisa por Telegram para renovarlo.
