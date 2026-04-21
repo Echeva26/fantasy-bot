@@ -14,6 +14,8 @@ _ACTION_TOOLS = {
     "increase_clause_tool",
 }
 
+TELEGRAM_PARSE_MODE = "HTML"
+
 
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
@@ -272,6 +274,94 @@ def _bullet_rows(items: list[str], limit: int) -> list[str]:
     if len(items) > limit:
         rows.append(f"• +{len(items) - limit} más")
     return rows
+
+
+def _plain_rows(items: list[Any], limit: int = 8) -> list[str]:
+    rows: list[str] = []
+    for item in items[:limit]:
+        text = _compact_text(item, 220)
+        if text:
+            rows.append(f"• {_h(text)}")
+    if len(items) > limit:
+        rows.append(f"• +{len(items) - limit} más")
+    return rows
+
+
+def build_standard_message(
+    *,
+    title: str,
+    status: str = "",
+    league_name: str = "",
+    market_key: str = "",
+    sections: list[tuple[str, list[Any] | Any]] | None = None,
+    footer: str = "",
+) -> str:
+    header = [f"<b>{_h(title)}</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    if league_name:
+        header.append(f"🏆 <b>Liga:</b> {_h(league_name)}")
+    if market_key:
+        header.append(f"🕒 <b>Ciclo:</b> <code>{_h(market_key)}</code>")
+    if status:
+        header.append(f"📌 <b>Estado:</b> {_h(status)}")
+
+    blocks = ["\n".join(header)]
+    for name, content in sections or []:
+        if isinstance(content, list):
+            rows = _plain_rows(content)
+        else:
+            text = _compact_text(content, 800)
+            rows = [f"• {_h(text)}"] if text else []
+        blocks.append(_section(name, rows))
+
+    if footer:
+        blocks.append(_section("Siguiente paso", [f"• {_h(_compact_text(footer, 260))}"]))
+    return "\n\n".join(blocks).strip()
+
+
+def build_progress_message(title: str, detail: str = "") -> str:
+    sections = [("Proceso", [detail])] if detail else []
+    return build_standard_message(title=title, status="En curso", sections=sections)
+
+
+def build_error_message(title: str, detail: Any, *, footer: str = "") -> str:
+    return build_standard_message(
+        title=f"⚠️ {title}",
+        status="Requiere atención",
+        sections=[("Detalle", [_compact_text(detail, 500)])],
+        footer=footer,
+    )
+
+
+def build_help_message() -> str:
+    return build_standard_message(
+        title="🤖 Fantasy Bot · Ayuda",
+        status="Comandos disponibles",
+        sections=[
+            (
+                "Mercado",
+                [
+                    "/informe · Genera informe IA y cachea el plan del ciclo",
+                    "/compraventa · Ejecuta el último plan cacheado del ciclo",
+                    "/ventas · Acepta ofertas de liga pendientes tras el cierre",
+                ],
+            ),
+            (
+                "Equipo",
+                [
+                    "/optimizar · Guarda ahora la mejor alineación por xP",
+                    "/ligas · Lista tus ligas disponibles",
+                    "/liga <nombre> · Selecciona la liga activa",
+                    "/status · Revisa token y liga activa",
+                ],
+            ),
+            (
+                "Token",
+                [
+                    "Para renovar token, envía el JWT o la URL completa de jwt.ms con id_token.",
+                ],
+            ),
+        ],
+    )
 
 
 def build_agent_cycle_message(

@@ -23,7 +23,12 @@ from prediction.langchain_agent import run_agent_objective, run_agent_phase
 from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.predict import get_next_round, get_sofascore_season_id
-from prediction.telegram_messages import build_agent_cycle_message
+from prediction.telegram_messages import (
+    TELEGRAM_PARSE_MODE,
+    build_agent_cycle_message,
+    build_error_message,
+    build_standard_message,
+)
 from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
 from prediction.token_bot import (
     REPORT_PLAN_OBJECTIVE,
@@ -141,16 +146,25 @@ def _maybe_alert_token_issue(state: dict, cooldown_minutes: int) -> dict:
 
     if should_alert:
         if status == "expired":
-            msg = (
-                f"Fantasy LangChain Agent: TOKEN CADUCADO (edad ~{(age_h or 0.0):.1f}h)"
-                + GUIDA_RENOVACION_TOKEN
+            msg = build_standard_message(
+                title="🔐 Token LaLiga",
+                status=f"Caducado · edad ~{(age_h or 0.0):.1f}h",
+                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
             )
         elif status == "missing":
-            msg = "Fantasy LangChain Agent: TOKEN AUSENTE" + GUIDA_RENOVACION_TOKEN
+            msg = build_standard_message(
+                title="🔐 Token LaLiga",
+                status="Ausente",
+                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
+            )
         else:
-            msg = "Fantasy LangChain Agent: TOKEN INVALIDO" + GUIDA_RENOVACION_TOKEN
+            msg = build_standard_message(
+                title="🔐 Token LaLiga",
+                status="Inválido",
+                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
+            )
         logger.warning(msg.replace("\n", " | "))
-        _notify(msg)
+        _notify(msg, parse_mode=TELEGRAM_PARSE_MODE)
         new_state["token_alert_at"] = now_utc.isoformat()
 
     return new_state
@@ -169,8 +183,13 @@ def _maybe_alert_missing_league(state: dict, cooldown_minutes: int) -> dict:
 
     if should_alert:
         _notify(
-            "Fantasy LangChain Agent: no hay liga seleccionada.\n"
-            "Usa el bot de Telegram: /ligas y /liga <nombre>."
+            build_standard_message(
+                title="🏆 Liga activa",
+                status="No seleccionada",
+                sections=[("Estado", ["No hay liga seleccionada para operar."])],
+                footer="Usa /ligas y /liga <nombre> en Telegram.",
+            ),
+            parse_mode=TELEGRAM_PARSE_MODE,
         )
         new_state["league_alert_at"] = now_utc.isoformat()
 
@@ -190,8 +209,11 @@ def _maybe_alert_market_unknown(state: dict, cooldown_minutes: int, err: str) ->
 
     if should_alert:
         _notify(
-            "Fantasy LangChain Agent: no pude calcular la hora del mercado ahora.\n"
-            f"Detalle: {err}"
+            build_error_message(
+                "Horario de mercado",
+                f"No pude calcular la hora del mercado ahora. Detalle: {err}",
+            ),
+            parse_mode=TELEGRAM_PARSE_MODE,
         )
         new_state["market_alert_at"] = now_utc.isoformat()
 
@@ -499,10 +521,21 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
         startup_league_desc = "pendiente (usa /ligas y /liga en Telegram)"
 
     _notify(
-        "Fantasy LangChain daemon iniciado\n"
-        f"Liga: {startup_league_desc}\n"
-        "PRE/POST: automáticos a 10 min antes/después del cierre real de mercado\n"
-        "Alineación: 23h55 antes del inicio de jornada"
+        build_standard_message(
+            title="🤖 Fantasy Bot iniciado",
+            status="Scheduler activo",
+            sections=[
+                ("Liga", [startup_league_desc]),
+                (
+                    "Automatizaciones",
+                    [
+                        "PRE/POST: 10 min antes/después del cierre real de mercado",
+                        "Alineación: 23h55 antes del inicio de jornada",
+                    ],
+                ),
+            ],
+        ),
+        parse_mode=TELEGRAM_PARSE_MODE,
     )
     logger.info(
         "LangChain daemon iniciado liga_inicial=%s llm=%s model_fijo=%s",
@@ -528,7 +561,14 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 sel = load_selected_league() or {}
                 league_name = sel.get("league_name", "")
                 if league_name:
-                    _notify(f"Fantasy LangChain Agent: liga activa\n{league_name}")
+                    _notify(
+                        build_standard_message(
+                            title="🏆 Liga activa",
+                            status="Actualizada",
+                            league_name=league_name,
+                        ),
+                        parse_mode=TELEGRAM_PARSE_MODE,
+                    )
 
                 # Reset de ciclo por cambio de liga
                 for key in (
@@ -595,7 +635,14 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 post_local = schedule["post_local"]
 
                 if market_changed:
-                    _notify("Horario de mercado detectado\n" + schedule_message(schedule))
+                    _notify(
+                        build_standard_message(
+                            title="🕒 Horario de mercado",
+                            status="Detectado",
+                            sections=[("Programación", schedule_message(schedule).splitlines())],
+                        ),
+                        parse_mode=TELEGRAM_PARSE_MODE,
+                    )
 
                 # PRE: 10 min antes del cierre y antes del cierre
                 if (
@@ -620,7 +667,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                                 steps=res.get("steps", []),
                                 league_name=league_name,
                             ),
-                            parse_mode="HTML",
+                            parse_mode=TELEGRAM_PARSE_MODE,
                         )
                     else:
                         # Flujo estándar solicitado: PRE = /informe + /compraventa.
@@ -633,20 +680,32 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                         output = str(pre_run.get("output", "") or "")
                         report_text = str(pre_run.get("report_text", "") or "").strip()
                         if report_text:
-                            _notify(report_text)
+                            _notify(report_text, parse_mode=TELEGRAM_PARSE_MODE)
                         if pre_run.get("executed"):
                             resume_text = str(pre_run.get("compraventa_text", "") or "").strip()
                             if resume_text:
-                                _notify(resume_text)
+                                _notify(resume_text, parse_mode=TELEGRAM_PARSE_MODE)
                         elif args.dry_run:
                             _notify(
-                                "Fantasy LangChain (PRE)\n"
-                                "Dry-run activo: plan generado y cacheado sin ejecución real."
+                                build_standard_message(
+                                    title="📊 PRE mercado",
+                                    status="Dry-run",
+                                    league_name=league_name,
+                                    market_key=market_key,
+                                    sections=[("Resultado", ["Plan generado y cacheado sin ejecución real."])],
+                                ),
+                                parse_mode=TELEGRAM_PARSE_MODE,
                             )
                         else:
                             _notify(
-                                "Fantasy LangChain (PRE)\n"
-                                "El informe no dejó acciones ejecutables para este ciclo."
+                                build_standard_message(
+                                    title="📊 PRE mercado",
+                                    status="Sin acciones ejecutables",
+                                    league_name=league_name,
+                                    market_key=market_key,
+                                    sections=[("Resultado", ["El informe no dejó acciones ejecutables para este ciclo."])],
+                                ),
+                                parse_mode=TELEGRAM_PARSE_MODE,
                             )
 
                     state["last_pre_market_key"] = market_key
@@ -718,7 +777,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                         steps=res.get("steps", []),
                         league_name=league_name,
                     ),
-                    parse_mode="HTML",
+                    parse_mode=TELEGRAM_PARSE_MODE,
                 )
 
             # 2) Programación de alineación exacta: 23h55 antes
@@ -731,7 +790,14 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 dry_run=args.dry_run,
             )
             if lineup_msg.startswith("Fantasy LangChain LINEUP"):
-                _notify(lineup_msg)
+                _notify(
+                    build_standard_message(
+                        title="🧩 Alineación programada",
+                        status="Ejecutada",
+                        sections=[("Resultado", lineup_msg.splitlines()[1:])],
+                    ),
+                    parse_mode=TELEGRAM_PARSE_MODE,
+                )
             elif lineup_msg:
                 logger.info(lineup_msg)
 
@@ -746,7 +812,10 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
             return
         except Exception as exc:
             logger.exception("Error en bucle LangChain daemon: %s", exc)
-            _notify(f"Fantasy LangChain daemon ERROR\n{type(exc).__name__}: {exc}")
+            _notify(
+                build_error_message("Daemon LangChain", f"{type(exc).__name__}: {exc}"),
+                parse_mode=TELEGRAM_PARSE_MODE,
+            )
             if stop_event:
                 stop_event.wait(timeout=POLL_SECONDS)
             else:
