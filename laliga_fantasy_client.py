@@ -1100,21 +1100,122 @@ class LaLigaFantasyClient:
           - coach: "playerTeamId" (opcional)
         """
         tid = str(team_id)
-        body = {
-            "tactical_formation": [int(x) for x in tactical_formation],
-            "goalkeeper": str(goalkeeper_id),
-            "defender": [str(x) for x in defenders_ids],
-            "midfield": [str(x) for x in midfielders_ids],
-            "striker": [str(x) for x in strikers_ids],
+        formation = [int(x) for x in tactical_formation]
+        goalkeeper = str(goalkeeper_id)
+        defenders = [str(x) for x in defenders_ids]
+        midfielders = [str(x) for x in midfielders_ids]
+        strikers = [str(x) for x in strikers_ids]
+        captain = str(captain_team_id) if captain_team_id else ""
+
+        primary_body = {
+            "tactical_formation": formation,
+            "goalkeeper": goalkeeper,
+            "defender": defenders,
+            "midfield": midfielders,
+            "striker": strikers,
         }
-        if captain_team_id:
-            body["captain"] = str(captain_team_id)
+        if captain:
+            primary_body["captain"] = captain
         if coach_id:
-            body["coach"] = str(coach_id)
+            primary_body["coach"] = str(coach_id)
+
+        bodies: list[tuple[str, dict]] = [("snake_case", primary_body)]
+        if captain:
+            body_no_captain = dict(primary_body)
+            body_no_captain.pop("captain", None)
+            bodies.append(("snake_case_sin_capitan", body_no_captain))
+
+        formation_txt = "-".join(str(x) for x in formation)
+        string_formation_body = dict(primary_body)
+        string_formation_body["tactical_formation"] = formation_txt
+        bodies.append(("snake_case_formacion_texto", string_formation_body))
+        if captain:
+            string_formation_no_captain = dict(string_formation_body)
+            string_formation_no_captain.pop("captain", None)
+            bodies.append(("snake_case_formacion_texto_sin_capitan", string_formation_no_captain))
+
+        camel_body = {
+            "tacticalFormation": formation,
+            "goalkeeper": goalkeeper,
+            "defender": defenders,
+            "midfield": midfielders,
+            "striker": strikers,
+        }
+        if captain:
+            camel_body["captain"] = captain
+        if coach_id:
+            camel_body["coach"] = str(coach_id)
+        bodies.append(("camel_case", camel_body))
+        if captain:
+            camel_no_captain = dict(camel_body)
+            camel_no_captain.pop("captain", None)
+            bodies.append(("camel_case_sin_capitan", camel_no_captain))
+
+        camel_string_formation_body = dict(camel_body)
+        camel_string_formation_body["tacticalFormation"] = formation_txt
+        bodies.append(("camel_case_formacion_texto", camel_string_formation_body))
+        if captain:
+            camel_string_formation_no_captain = dict(camel_string_formation_body)
+            camel_string_formation_no_captain.pop("captain", None)
+            bodies.append(("camel_case_formacion_texto_sin_capitan", camel_string_formation_no_captain))
+
+        legacy_body = {
+            "tactical_formation": [int(x) for x in tactical_formation],
+            "goalkeeper": int(goalkeeper) if goalkeeper.isdigit() else goalkeeper,
+            "defender": [int(x) if str(x).isdigit() else x for x in defenders],
+            "midfield": [int(x) if str(x).isdigit() else x for x in midfielders],
+            "striker": [int(x) if str(x).isdigit() else x for x in strikers],
+        }
+        if captain:
+            legacy_body["captain"] = int(captain) if captain.isdigit() else captain
+        if coach_id:
+            coach = str(coach_id)
+            legacy_body["coach"] = int(coach) if coach.isdigit() else coach
+        bodies.append(("numeric_ids", legacy_body))
 
         url = f"{BASE_URL}/api/v3/teams/{tid}/lineup"
         logger.info("Actualizando alineación del team %s...", tid)
-        return self._put(url, body)
+
+        headers = {
+            **self._auth_headers(),
+            "Content-Type": "application/json",
+        }
+        last_error: dict = {}
+        retry_statuses = {400, 404, 405, 422}
+        for label, body in bodies:
+            resp = self.session.put(url, json=body, headers=headers)
+            if resp.ok:
+                if label != "snake_case":
+                    logger.info("Alineación guardada con payload fallback: %s", label)
+                return resp.json() if resp.content else {}
+
+            try:
+                err_body = resp.json() if resp.content else resp.text[:500]
+            except Exception:
+                err_body = resp.text[:500] if resp.text else ""
+            last_error = {
+                "status": resp.status_code,
+                "payload_variant": label,
+                "body": body,
+                "response": err_body,
+            }
+            logger.warning(
+                "PUT %s → %s | variante=%s | body: %s | response: %s",
+                url,
+                resp.status_code,
+                label,
+                body,
+                err_body,
+            )
+            if resp.status_code not in retry_statuses:
+                resp.raise_for_status()
+
+        raise RuntimeError(
+            "No se pudo guardar la alineación tras probar formatos compatibles. "
+            f"Último error: status={last_error.get('status')}, "
+            f"variante={last_error.get('payload_variant')}, "
+            f"respuesta={last_error.get('response')}"
+        )
 
     def get_team_lineup(
         self,
