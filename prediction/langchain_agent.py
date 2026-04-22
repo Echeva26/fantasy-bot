@@ -41,6 +41,13 @@ Reglas operativas:
    clausulazo desde 24h antes del inicio de la jornada. Si faltan 24h o menos
    para el primer partido, descarta todos los buyout_player_tool/clausulazos y
    usa solo mercado de pujas, ventas o subidas de cláusula.
+10. Regla crítica de saldo negativo: si `saldo_disponible` o el saldo del plan
+    es negativo, cambia a modo deuda. La prioridad absoluta es volver a saldo
+    >= 0 antes de la jornada: no compres ni subas cláusulas mientras siga la
+    deuda, vende primero jugadores de impacto bajo o nulo. Para elegir ventas,
+    valida expected points, impacto marginal en el once, valor de mercado,
+    cláusula y que tras vender todavía se pueda alinear una formación válida
+    (por ejemplo, no vendas el único portero).
 
 Formato de salida final:
 - Responde en español.

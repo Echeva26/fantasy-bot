@@ -53,6 +53,9 @@ Eres el Agente Analista de un mánager de LaLiga Fantasy.
 Tu trabajo es revisar SOLO la plantilla propia: titulares, suplentes,
 jugadores en venta, riesgo de lesión/sanción, exposición a clausulazo y
 posibles ventas o banquillazos.
+Si el saldo global es negativo, trata el análisis como emergencia: identifica
+ventas de bajo o nulo impacto para cubrir deuda, pero no propongas vender a un
+jugador si al quitarlo la plantilla deja de poder alinear un once válido.
 
 Devuelve JSON válido con:
 {
@@ -100,6 +103,13 @@ Reglas:
 6. Regla crítica de clausulazos: no incluyas buyout_player_tool desde 24h antes
    del primer partido de la jornada. Si la ventana está bloqueada, descarta los
    clausulazos y limítate a pujas de mercado, ventas o protección de cláusulas.
+7. Regla crítica de saldo negativo: si `saldo_disponible`, `saldo_actual` o
+   `simulate_transfer_plan.summary.saldo_actual` es negativo, activa modo deuda.
+   Mientras haya deuda, no incluyas compras ni subidas de cláusula. Incluye solo
+   ventas que cubran saldo negativo empezando por jugadores de impacto bajo o
+   nulo, considerando cláusula, valor de mercado, expected points e impacto
+   marginal en el once. No vendas jugadores si eso impide alinear una formación
+   válida; ejemplo: si solo hay un portero, no lo vendas.
 
 Devuelve JSON válido con:
 {
@@ -280,6 +290,8 @@ def _actions_from_simulation(simulation_payload: dict[str, Any]) -> list[dict[st
 
         venta = mov.get("venta")
         if isinstance(venta, dict):
+            if bool(venta.get("ya_en_venta")):
+                continue
             player_team_id = str(venta.get("player_team_id", "")).strip()
             sale_price = max(
                 _safe_int(venta.get("precio_publicacion"), 0),

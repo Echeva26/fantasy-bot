@@ -18,6 +18,7 @@ pero el motor por defecto es `langgraph`.
 - Guarda alineacion exactamente 23h55 antes del inicio de jornada.
 - Permite optimizacion manual inmediata de alineacion con `/optimizar`.
 - Regla crítica de mercado: desde 24h antes del primer partido de la jornada no se puede comprar a nadie mediante clausulazo. El agente debe descartar `buyout_player_tool` y limitarse a pujas, ventas o subidas de cláusula.
+- Regla critica de saldo: si el saldo esta negativo, el agente activa modo deuda. No compra ni sube clausulas hasta recuperar saldo >= 0; vende primero jugadores de impacto bajo o nulo, considerando xP, valor de mercado, clausula y que la plantilla siga pudiendo alinear un once valido.
 - Puede subir clausulas de jugadores propios con criterio de moderacion (solo clave + expuestos).
 - Regla fija de clausula: por cada 1M invertido, sube 2M la clausula.
 - Si el token no esta valido, avisa por Telegram para renovarlo.

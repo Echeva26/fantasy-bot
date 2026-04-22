@@ -22,6 +22,7 @@ from laliga_fantasy_client import LaLigaFantasyClient
 from prediction.advisor import (
     analyze_available_players,
     analyze_my_team,
+    sale_keeps_lineup_viable,
     compute_competitive_bid_amount,
     current_week_clausulazos_available,
     get_predictions,
@@ -192,6 +193,11 @@ class FantasyAgentRuntime:
 
 def _compress_transfer_plan(plan: dict) -> dict:
     out = {
+        "modo_deuda": plan.get("modo_deuda", False),
+        "deuda_objetivo": plan.get("deuda_objetivo"),
+        "deuda_cubierta_estimada": plan.get("deuda_cubierta_estimada"),
+        "deuda_pendiente_estimada": plan.get("deuda_pendiente_estimada"),
+        "alertas": plan.get("alertas", []),
         "saldo_final": plan.get("saldo_final"),
         "xp_total_post": plan.get("xp_total_post"),
         "formacion_post": plan.get("formacion_post"),
@@ -214,9 +220,13 @@ def _compress_transfer_plan(plan: dict) -> dict:
                 "player_id": venta.get("player_id"),
                 "player_team_id": venta.get("player_team_id"),
                 "valor_mercado": venta.get("valor_mercado"),
+                "clausula": venta.get("clausula"),
+                "ratio_clausula_valor": venta.get("ratio_clausula_valor"),
                 "precio_publicacion": venta.get("precio_publicacion"),
                 "motivo": venta.get("motivo"),
                 "xP": venta.get("xP"),
+                "impacto_xp_once": venta.get("impacto_xp_once"),
+                "ya_en_venta": venta.get("ya_en_venta"),
             }
         if compra:
             row["compra"] = {
@@ -630,6 +640,10 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
             "hours_to_first_match": round(hours_to_match, 1),
             "clausulazos_window_source": "laliga_calendar_or_fallback",
             "summary": {
+                "modo_deuda": bool(plan.get("modo_deuda", False)),
+                "deuda_objetivo": plan.get("deuda_objetivo"),
+                "deuda_cubierta_estimada": plan.get("deuda_cubierta_estimada"),
+                "deuda_pendiente_estimada": plan.get("deuda_pendiente_estimada"),
                 "xp_once_actual": team_analysis.get("xp_total_once"),
                 "xp_once_post": plan.get("xp_total_post"),
                 "xp_delta": round((plan.get("xp_total_post", 0) or 0) - (team_analysis.get("xp_total_once", 0) or 0), 1),
@@ -718,18 +732,63 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         blocked = _block_if_post("sell_player_phase1_tool")
         if blocked:
             return blocked
+        ptid = str(player_team_id or "").strip()
+        price = _safe_int(sale_price, 0)
+        if not ptid:
+            return _as_json({"ok": False, "error": "player_team_id vacío"})
+        if price <= 0:
+            return _as_json({"ok": False, "error": "sale_price debe ser > 0"})
+
+        team_analysis = runtime.get_team_analysis(force_refresh=False)
+        players = [
+            p for p in team_analysis.get("jugadores", [])
+            if isinstance(p, dict)
+        ]
+        selected = None
+        for p in players:
+            if str(p.get("player_team_id", "")).strip() == ptid:
+                selected = p
+                break
+        if not selected:
+            return _as_json(
+                {
+                    "ok": False,
+                    "error": "No se encontró ese player_team_id en tu plantilla actual.",
+                    "player_team_id": ptid,
+                }
+            )
+
+        if not sale_keeps_lineup_viable(players, int(selected.get("player_id", 0) or 0)):
+            return _as_json(
+                {
+                    "ok": False,
+                    "blocked": True,
+                    "action": "sell_player_phase1",
+                    "player_team_id": ptid,
+                    "nombre": selected.get("nombre"),
+                    "posicion": selected.get("posicion"),
+                    "xP": selected.get("xP"),
+                    "valor_mercado": selected.get("valor_mercado"),
+                    "clausula": selected.get("clausula"),
+                    "reason": (
+                        "Venta bloqueada: quitar este jugador dejaría la plantilla "
+                        "sin una alineación viable según las formaciones permitidas."
+                    ),
+                }
+            )
         if runtime.dry_run:
             return _as_json(
                 {
                     "dry_run": True,
                     "action": "sell_player_phase1",
-                    "player_team_id": player_team_id,
-                    "sale_price": int(sale_price),
+                    "player_team_id": ptid,
+                    "sale_price": price,
+                    "nombre": selected.get("nombre"),
                 }
             )
         try:
             client = runtime.get_client()
-            res = client.sell_player_phase1(player_team_id=player_team_id, price=int(sale_price))
+            res = client.sell_player_phase1(player_team_id=ptid, price=price)
             runtime.invalidate()
             return _as_json({"ok": True, "response": res})
         except Exception as exc:

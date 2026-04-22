@@ -52,11 +52,13 @@ MODEL_TYPE = "xgboost"
 
 
 def _format_money(amount: int) -> str:
-    if amount >= 1_000_000:
-        return f"{amount / 1_000_000:.1f}M"
-    if amount >= 1_000:
-        return f"{amount / 1_000:.0f}K"
-    return str(amount)
+    sign = "-" if amount < 0 else ""
+    n = abs(int(amount or 0))
+    if n >= 1_000_000:
+        return f"{sign}{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{sign}{n / 1_000:.0f}K"
+    return f"{sign}{n}"
 
 
 def run_advisor_pipeline(args: argparse.Namespace) -> dict:
@@ -106,6 +108,10 @@ def print_plan_summary(transfer_plan: dict) -> None:
         if v:
             print(f"  {mov['paso']}. VENDER: {v['nombre']} ({v['posicion']})")
             print(f"       Ingresos: {fm(v['ingresos'])} | motivo: {v['motivo']}")
+            if v.get("clausula"):
+                print(f"       Cláusula: {fm(v['clausula'])}")
+            if v.get("impacto_xp_once") is not None:
+                print(f"       Impacto once: {v['impacto_xp_once']:.1f} xP")
         if c:
             print(f"      COMPRAR: {c['nombre']} ({c['posicion']}, {c['equipo_real']})")
             print(f"       Coste: {fm(c['coste'])} ({c['tipo']}) | xP: {c['xP']:.1f}")

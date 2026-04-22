@@ -68,7 +68,12 @@ REPORT_PLAN_OBJECTIVE = (
     "desde 24h antes del inicio de la jornada. Si faltan 24h o menos para el "
     "primer partido, NO llames buyout_player_tool y descarta todos los "
     "clausulazos; usa solo pujas de mercado, ventas o subidas de cláusula.\n"
-    "8) Devuelve resumen breve y claro en español."
+    "8) REGLA CRÍTICA DE SALDO NEGATIVO: si el saldo está por debajo de 0, "
+    "activa modo deuda. No compres ni subas cláusulas hasta cubrirla. Vende "
+    "jugadores de impacto bajo o nulo, teniendo en cuenta xP, valor de mercado, "
+    "cláusula e impacto marginal en el once. No vendas a nadie si impide formar "
+    "una alineación válida; por ejemplo, no vendas el único portero.\n"
+    "9) Devuelve resumen breve y claro en español."
 )
 
 
@@ -233,6 +238,8 @@ def _extract_actions_from_simulation_payload(payload: dict) -> list[dict]:
 
         venta = mov.get("venta")
         if isinstance(venta, dict):
+            if bool(venta.get("ya_en_venta")):
+                continue
             player_team_id = str(venta.get("player_team_id", "")).strip()
             sale_price = max(
                 _safe_int(venta.get("precio_publicacion"), 0),
@@ -311,6 +318,23 @@ def _extract_executable_actions(steps: list[dict]) -> tuple[list[dict], str]:
         return simulated_actions, "simulate_transfer_plan"
 
     return [], "none"
+
+
+def _summary_requires_debt_mode(summary: dict) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if bool(summary.get("modo_deuda")):
+        return True
+    saldo_actual = summary.get("saldo_actual")
+    return saldo_actual not in (None, "") and _safe_int(saldo_actual, 0) < 0
+
+
+def _filter_debt_mode_actions(actions: list[dict]) -> list[dict]:
+    return [
+        a for a in actions
+        if isinstance(a, dict)
+        and str(a.get("tool", "")).strip() == "sell_player_phase1_tool"
+    ]
 
 
 def _extract_agent_report_payload(output: str) -> dict:
@@ -545,6 +569,10 @@ def _build_informe_message(
         "simulate_transfer_plan": "plan de simulacion del motor",
         "simulate_transfer_plan+report_clause_fallback": "plan de simulacion + clausulas sugeridas",
         "tool_calls+report_clause_fallback": "tools ejecutables + clausulas sugeridas",
+        "tool_calls+debt_filter": "tools ejecutables filtradas por modo deuda",
+        "simulate_transfer_plan+debt_filter": "plan de simulacion filtrado por modo deuda",
+        "simulate_transfer_plan+report_clause_fallback+debt_filter": "plan de simulacion filtrado por modo deuda",
+        "tool_calls+report_clause_fallback+debt_filter": "tools ejecutables filtradas por modo deuda",
         "none": "sin plan ejecutable detectado",
     }.get(action_source, action_source)
 
@@ -560,6 +588,8 @@ def _build_informe_message(
     saldo_now = summary.get("saldo_actual")
     saldo_final = summary.get("saldo_final")
     movs = summary.get("movimientos")
+    if _summary_requires_debt_mode(summary):
+        summary_rows.append("Modo deuda: activo; solo se cachean ventas hasta salir de saldo negativo")
     has_summary = any(v not in (None, "") for v in (xp_now, xp_post, saldo_now, saldo_final, movs))
     sim_rows: list[str] = []
     if has_summary:
@@ -624,6 +654,10 @@ def _build_compraventa_message(
         "simulate_transfer_plan": "plan de simulacion cacheado",
         "simulate_transfer_plan+report_clause_fallback": "plan cacheado + clausulas sugeridas",
         "tool_calls+report_clause_fallback": "tools ejecutables + clausulas sugeridas",
+        "tool_calls+debt_filter": "tools ejecutables filtradas por modo deuda",
+        "simulate_transfer_plan+debt_filter": "plan cacheado filtrado por modo deuda",
+        "simulate_transfer_plan+report_clause_fallback+debt_filter": "plan cacheado filtrado por modo deuda",
+        "tool_calls+report_clause_fallback+debt_filter": "tools ejecutables filtradas por modo deuda",
         "none": "origen no informado",
     }.get(str(action_source), str(action_source or "none"))
 
@@ -656,6 +690,8 @@ def _build_compraventa_message(
 
     buyout_window = summary.get("clausulazos_window", {})
     rule_rows: list[str] = []
+    if bool(summary.get("debt_mode")):
+        rule_rows.append("Modo deuda: activo. Se han bloqueado compras y subidas de cláusula.")
     if isinstance(buyout_window, dict) and not bool(buyout_window.get("available", True)):
         hours = buyout_window.get("hours_to_first_match")
         hours_txt = (
@@ -749,8 +785,8 @@ def _resolve_current_balance(
     try:
         return int(client.get_my_team_money()), "api", ""
     except Exception as exc:
-        fallback = _safe_int(fallback_balance, -1)
-        if fallback >= 0:
+        if fallback_balance not in (None, ""):
+            fallback = _safe_int(fallback_balance, 0)
             return fallback, "cache", f"{type(exc).__name__}: {exc}"
         return None, "unknown", f"{type(exc).__name__}: {exc}"
 
@@ -794,6 +830,7 @@ def _execute_cached_actions(
         "actions_total": len(actions),
         "actions_ok": 0,
         "actions_skipped": 0,
+        "debt_mode": current_balance is not None and current_balance < 0,
         "ventas": 0,
         "pujas": 0,
         "clausulazos": 0,
@@ -819,6 +856,13 @@ def _execute_cached_actions(
         payload = _tool_input_dict(action.get("tool_input"))
         label = str(action.get("label", "")).strip() or _format_action_label(tool, payload)
         cash_cost = _action_cash_cost(tool, payload)
+        if bool(summary.get("debt_mode")) and tool != "sell_player_phase1_tool":
+            summary["actions_skipped"] += 1
+            summary["details"].append(
+                f"[SKIP] {idx}. {label} -> modo deuda activo "
+                f"({_money_short(current_balance)}): solo se permiten ventas"
+            )
+            continue
         if tool == "buyout_player_tool" and not bool(buyout_window.get("available")):
             summary["actions_skipped"] += 1
             summary["clausulazos_bloqueados_24h"] += 1
@@ -1217,7 +1261,16 @@ def _run_langchain_agent_cmd(
             simulation_payload = _extract_latest_simulation_payload(steps)
             actions, action_source = _extract_executable_actions(steps)
             report_payload = _extract_agent_report_payload(output)
-            if not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions):
+            sim_summary = (
+                simulation_payload.get("summary")
+                if isinstance(simulation_payload.get("summary"), dict)
+                else {}
+            )
+            debt_mode = _summary_requires_debt_mode(sim_summary)
+            if (
+                not debt_mode
+                and not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions)
+            ):
                 inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
                 if inferred_clause_actions:
                     actions.extend(inferred_clause_actions)
@@ -1226,11 +1279,11 @@ def _run_langchain_agent_cmd(
                         if action_source == "tool_calls"
                         else "simulate_transfer_plan+report_clause_fallback"
                     )
-            sim_summary = (
-                simulation_payload.get("summary")
-                if isinstance(simulation_payload.get("summary"), dict)
-                else {}
-            )
+            if debt_mode:
+                filtered_actions = _filter_debt_mode_actions(actions)
+                if len(filtered_actions) != len(actions):
+                    action_source = f"{action_source}+debt_filter"
+                actions = filtered_actions
 
             cache_payload = {
                 "version": 1,

@@ -12,6 +12,7 @@ grafo LangGraph por ciclos.
 - La liga se elige en Telegram por nombre: `/ligas` y `/liga <nombre>`.
 - Al elegir la liga, el bot detecta automaticamente la hora real de cierre del mercado leyendo la expiracion de jugadores publicados.
 - Regla crítica: los clausulazos están prohibidos desde 24h antes del primer partido de la jornada; en esa ventana el bot debe saltarlos y operar solo con pujas de mercado, ventas o subidas de cláusula.
+- Regla critica de saldo: si el saldo esta negativo, el bot activa modo deuda. No compra ni sube clausulas hasta recuperar saldo >= 0; vende primero jugadores de impacto bajo o nulo, considerando xP, valor de mercado, clausula y que la plantilla siga pudiendo alinear un once valido.
 - PRE mercado: se ejecuta siempre 10 minutos antes del cierre real.
 - POST mercado: se ejecuta siempre 10 minutos despues del cierre real.
 - Guarda la alineacion exactamente 23 horas y 55 minutos antes del inicio de la jornada.

@@ -464,6 +464,68 @@ def _calcular_once(jugadores: list[dict]) -> list[dict]:
     return mejor_once
 
 
+def can_field_valid_lineup(jugadores: list[dict]) -> bool:
+    """
+    Indica si la plantilla puede formar un once válido de LaLiga Fantasy.
+
+    A diferencia de `_calcular_once`, aquí no hay fallback: debe existir una
+    formación reglamentaria con 1 POR, 2-5 DEF, 2-5 MED y 1-3 DEL.
+    """
+    disponibles = [j for j in jugadores if not j.get("no_disponible", False)]
+    counts = {
+        "POR": 0,
+        "DEF": 0,
+        "MED": 0,
+        "DEL": 0,
+    }
+    for j in disponibles:
+        pos = str(j.get("posicion", "")).strip().upper()
+        if pos in counts:
+            counts[pos] += 1
+
+    if counts["POR"] < 1:
+        return False
+    return any(
+        counts["DEF"] >= n_def
+        and counts["MED"] >= n_med
+        and counts["DEL"] >= n_del
+        for n_def, n_med, n_del in FORMACIONES_VALIDAS
+    )
+
+
+def sale_keeps_lineup_viable(jugadores: list[dict], player_id: int) -> bool:
+    """
+    Valida que vender un jugador no deje la plantilla peor para alinear.
+
+    Si ahora mismo hay un once válido, exige conservarlo. Si la plantilla ya no
+    puede alinear once completo, al menos no permite empeorar el número de
+    jugadores alineables.
+    """
+    pid = int(player_id)
+    remaining = [dict(j) for j in jugadores if int(j.get("player_id", 0) or 0) != pid]
+    if can_field_valid_lineup(jugadores):
+        return can_field_valid_lineup(remaining)
+
+    sold = next(
+        (j for j in jugadores if int(j.get("player_id", 0) or 0) == pid),
+        {},
+    )
+    sold_pos = str(sold.get("posicion", "")).strip().upper()
+    minimum_by_pos = {"POR": 1, "DEF": 2, "MED": 2, "DEL": 1}
+    if sold_pos in minimum_by_pos:
+        available_same_pos = [
+            j for j in jugadores
+            if str(j.get("posicion", "")).strip().upper() == sold_pos
+            and not j.get("no_disponible", False)
+        ]
+        if len(available_same_pos) <= minimum_by_pos[sold_pos]:
+            return False
+
+    current_once = _calcular_once([dict(j) for j in jugadores])
+    remaining_once = _calcular_once(remaining)
+    return len(remaining_once) >= len(current_once)
+
+
 # ─── 4. Obtener estados de jugadores ──────────────────────────
 ESTADOS_NO_DISPONIBLE = {"injured", "doubtful", "suspended"}
 
@@ -723,6 +785,13 @@ def simulate_transfer_plan(
     jugadores_comprados_ids: set[int] = set()
     once_actual_ids = {j["player_id"] for j in team_analysis.get("once_ideal", [])}
 
+    def _sale_income(jugador: dict) -> int:
+        return int((jugador.get("valor_mercado", 0) or 0) * VENTA_PCT)
+
+    def _sale_publication_price(jugador: dict) -> int:
+        valor_mercado = int(jugador.get("valor_mercado", 0) or 0)
+        return max(valor_mercado, int(valor_mercado * VENTA_PCT))
+
     def _es_buen_valor(compra: dict) -> bool:
         vm = compra.get("valor_mercado") or 0
         coste = compra.get("coste", 0)
@@ -768,6 +837,152 @@ def simulate_transfer_plan(
     def _xp_once(jugadores: list[dict]) -> float:
         once = _calcular_once(jugadores)
         return float(sum(j["xP"] for j in once))
+
+    def _lineup_sale_ok(jugadores: list[dict], player_id: int) -> bool:
+        return sale_keeps_lineup_viable([dict(j) for j in jugadores], player_id)
+
+    def _debt_sale_candidate(jugador: dict, jugadores_base: list[dict]) -> dict | None:
+        pid = int(jugador.get("player_id", 0) or 0)
+        if not pid:
+            return None
+        if not jugador.get("player_team_id") and not jugador.get("en_venta"):
+            return None
+        if not _lineup_sale_ok(jugadores_base, pid):
+            return None
+
+        before_xp = _xp_once([dict(j) for j in jugadores_base])
+        remaining = [dict(j) for j in jugadores_base if int(j.get("player_id", 0) or 0) != pid]
+        after_xp = _xp_once(remaining)
+        marginal_loss = max(0.0, round(before_xp - after_xp, 2))
+        player_xp = float(jugador.get("xP", 0) or 0.0)
+        market_value = int(jugador.get("valor_mercado", 0) or 0)
+        clause_value = int(jugador.get("clausula", 0) or 0)
+        clause_ratio = (clause_value / market_value) if market_value > 0 and clause_value > 0 else 0.0
+        income = _sale_income(jugador)
+        if income <= 0:
+            return None
+
+        if jugador.get("no_disponible"):
+            impact_bucket = 0
+            reason = f"No disponible ({jugador.get('estado', 'baja')})"
+        elif marginal_loss <= 0.05:
+            impact_bucket = 1
+            reason = "Impacto nulo en el once"
+        elif pid not in once_actual_ids and player_xp < 2:
+            impact_bucket = 2
+            reason = "Fuera del once y xP bajo"
+        elif player_xp < 1.5:
+            impact_bucket = 3
+            reason = "xP muy bajo"
+        else:
+            impact_bucket = 4
+            reason = "Venta necesaria para saldar deuda"
+
+        # Una cláusula alta indica que el jugador estaba protegido; no lo blinda
+        # si tiene impacto bajo, pero lo relega frente a descartes equivalentes.
+        clause_penalty = min(3.0, clause_ratio)
+        coverage_bonus = min(3.0, income / max(1, abs(int(saldo or 0))))
+        sale_priority = (
+            impact_bucket,
+            round(marginal_loss, 2),
+            round(player_xp, 2),
+            round(clause_penalty, 2),
+            -round(coverage_bonus, 2),
+            -income,
+        )
+        return {
+            **jugador,
+            "motivo_venta": reason,
+            "impacto_xp_once": marginal_loss,
+            "ingresos_estimados": income,
+            "ratio_clausula_valor": round(clause_ratio, 2) if clause_ratio else None,
+            "prioridad_deuda": sale_priority,
+        }
+
+    # ── Modo deuda: saldo negativo, prioridad absoluta a volver a saldo >= 0 ──
+    if saldo < 0:
+        deuda_objetivo = abs(int(saldo))
+        saldo_proyectado = int(saldo)
+        deuda_cubierta = 0
+        debt_movements: list[dict] = []
+        remaining_squad = [dict(j) for j in plantilla]
+
+        while saldo_proyectado < 0:
+            candidates = []
+            for jugador in remaining_squad:
+                pid = int(jugador.get("player_id", 0) or 0)
+                if not pid or pid in jugadores_vendidos_ids:
+                    continue
+                candidate = _debt_sale_candidate(jugador, remaining_squad)
+                if candidate:
+                    candidates.append(candidate)
+
+            if not candidates:
+                break
+
+            candidates.sort(key=lambda x: x["prioridad_deuda"])
+            venta = candidates[0]
+            pid = int(venta["player_id"])
+            jugadores_vendidos_ids.add(pid)
+            income = int(venta["ingresos_estimados"])
+            saldo_antes = saldo_proyectado
+            saldo_proyectado += income
+            deuda_cubierta += income
+            remaining_squad = [
+                j for j in remaining_squad
+                if int(j.get("player_id", 0) or 0) != pid
+            ]
+
+            debt_movements.append({
+                "paso": len(debt_movements) + 1,
+                "venta": {
+                    "player_id": venta["player_id"],
+                    "player_team_id": venta.get("player_team_id"),
+                    "nombre": venta["nombre"],
+                    "posicion": venta["posicion"],
+                    "xP": venta["xP"],
+                    "impacto_xp_once": venta["impacto_xp_once"],
+                    "valor_mercado": venta.get("valor_mercado", 0),
+                    "clausula": venta.get("clausula", 0),
+                    "ratio_clausula_valor": venta.get("ratio_clausula_valor"),
+                    "ingresos": income,
+                    "motivo": venta.get("motivo_venta", "?"),
+                    "precio_publicacion": _sale_publication_price(venta),
+                    "ya_en_venta": bool(venta.get("en_venta")),
+                },
+                "compra": None,
+                "saldo_antes": saldo_antes,
+                "saldo_despues": saldo_proyectado,
+                "ganancia_xp": -float(venta["impacto_xp_once"]),
+            })
+
+        once_post = _calcular_once(remaining_squad)
+        xp_total_post = sum(j["xP"] for j in once_post)
+        formacion_post = once_post[0].pop("_formacion", "4-3-3") if once_post else "4-3-3"
+        if once_post:
+            once_post[0].pop("_xp_por_formacion", None)
+
+        return {
+            "modo_deuda": True,
+            "deuda_objetivo": deuda_objetivo,
+            "deuda_cubierta_estimada": deuda_cubierta,
+            "deuda_pendiente_estimada": max(0, -saldo_proyectado),
+            "alertas": (
+                []
+                if saldo_proyectado >= 0
+                else [
+                    "No hay ventas ejecutables suficientes que cubran la deuda sin comprometer la alineación."
+                ]
+            ),
+            "movimientos": debt_movements,
+            "plantilla_final": remaining_squad,
+            "once_post": once_post,
+            "formacion_post": formacion_post,
+            "xp_total_post": round(xp_total_post, 1),
+            "saldo_final": saldo_proyectado,
+            "jugadores_vendidos": len(jugadores_vendidos_ids),
+            "jugadores_comprados": 0,
+        }
 
     # ── Pool de compras ───────────────────────────────────────
     pool_compras = []
@@ -822,7 +1037,9 @@ def simulate_transfer_plan(
             prioridad = 3
 
         if motivo:
-            ingresos = int((j.get("valor_mercado", 0) or 0) * VENTA_PCT)
+            if not _lineup_sale_ok(plantilla, pid):
+                continue
+            ingresos = _sale_income(j)
             candidatos_venta.append({
                 **j,
                 "motivo_venta": motivo,
@@ -836,6 +1053,8 @@ def simulate_transfer_plan(
         pid = venta["player_id"]
         if pid in jugadores_vendidos_ids:
             continue
+        if not _lineup_sale_ok(plantilla, pid):
+            continue
         jugadores_vendidos_ids.add(pid)
         plantilla = [j for j in plantilla if j["player_id"] != pid]
 
@@ -848,9 +1067,10 @@ def simulate_transfer_plan(
                 "posicion": venta["posicion"],
                 "xP": venta["xP"],
                 "valor_mercado": venta.get("valor_mercado", 0),
+                "clausula": venta.get("clausula", 0),
                 "ingresos": venta["ingresos_estimados"],
                 "motivo": venta.get("motivo_venta", "?"),
-                "precio_publicacion": int((venta.get("valor_mercado", 0) or 0) * VENTA_PCT),
+                "precio_publicacion": _sale_publication_price(venta),
             },
             "compra": None,
             "saldo_antes": saldo,
@@ -985,6 +1205,13 @@ def generate_report(
         f"según xP y contexto del jugador."
     )
     L.append(f"")
+    if transfer_plan.get("modo_deuda"):
+        L.append(
+            f"> **Modo deuda activado:** saldo negativo de "
+            f"**{fm(team_analysis['saldo'])}**. Se bloquean compras y subidas de cláusula "
+            f"hasta estimar saldo >= 0 con ventas que mantengan una alineación viable."
+        )
+        L.append(f"")
 
     movs = transfer_plan["movimientos"]
     xp_antes = team_analysis["xp_total_once"]
@@ -1019,6 +1246,15 @@ def generate_report(
         L.append(f"")
         for p in team_analysis["problemas"]:
             L.append(f"- **{p['jugador']}**: {p['problema']}")
+        for alerta in transfer_plan.get("alertas", []) or []:
+            L.append(f"- **Modo deuda**: {alerta}")
+        L.append(f"")
+    elif transfer_plan.get("alertas"):
+        L.append(f"---")
+        L.append(f"## Alertas")
+        L.append(f"")
+        for alerta in transfer_plan.get("alertas", []) or []:
+            L.append(f"- **Modo deuda**: {alerta}")
         L.append(f"")
 
     # ── ONCE ACTUAL ───────────────────────────────────────────
@@ -1099,7 +1335,15 @@ def generate_report(
                     f"   - Valor de mercado: {fm(venta['valor_mercado'])} "
                     f"→ ingresos estimados: **{fm(venta['ingresos'])}**"
                 )
-                L.append(f"   - xP que pierdes: {venta['xP']:.1f}")
+                if venta.get("clausula"):
+                    L.append(f"   - Cláusula actual: {fm(venta['clausula'])}")
+                if venta.get("impacto_xp_once") is not None:
+                    L.append(
+                        f"   - Impacto estimado en el once: "
+                        f"{venta['impacto_xp_once']:.1f} xP"
+                    )
+                else:
+                    L.append(f"   - xP del jugador: {venta['xP']:.1f}")
 
             if compra:
                 tipo_compra = compra["tipo"]
@@ -1211,11 +1455,13 @@ def generate_report(
 
 def _format_money(amount: int) -> str:
     """Formatea un número como dinero: 3.809.659 → 3.8M"""
-    if amount >= 1_000_000:
-        return f"{amount / 1_000_000:.1f}M"
-    elif amount >= 1_000:
-        return f"{amount / 1_000:.0f}K"
-    return str(amount)
+    sign = "-" if amount < 0 else ""
+    n = abs(int(amount or 0))
+    if n >= 1_000_000:
+        return f"{sign}{n / 1_000_000:.1f}M"
+    elif n >= 1_000:
+        return f"{sign}{n / 1_000:.0f}K"
+    return f"{sign}{n}"
 
 
 # ─── Main ─────────────────────────────────────────────────────
