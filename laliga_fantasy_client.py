@@ -1181,7 +1181,7 @@ class LaLigaFantasyClient:
             "Content-Type": "application/json",
         }
         last_error: dict = {}
-        retry_statuses = {400, 404, 405, 422}
+        retry_statuses = {400, 404, 405, 422, 500, 502, 503, 504}
         for label, body in bodies:
             resp = self.session.put(url, json=body, headers=headers)
             if resp.ok:

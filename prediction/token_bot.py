@@ -128,6 +128,22 @@ def _compact_text(text: object, limit: int = 280) -> str:
     return clean[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _exception_detail(exc: Exception, limit: int = 700) -> str:
+    base = f"{type(exc).__name__}: {exc}"
+    response = getattr(exc, "response", None)
+    if response is None:
+        return _compact_text(base, limit)
+
+    status = getattr(response, "status_code", "")
+    try:
+        body = response.json() if getattr(response, "content", None) else getattr(response, "text", "")
+    except Exception:
+        body = getattr(response, "text", "")
+    if body:
+        return _compact_text(f"{base} | status={status} | response={body}", limit)
+    return _compact_text(f"{base} | status={status}", limit)
+
+
 def _json_dict_from_text(text: object) -> dict:
     raw = str(text or "").strip()
     if not raw:
@@ -1458,7 +1474,7 @@ def _run_optimize_lineup_cmd(
         )
     except Exception as exc:
         logger.exception("Error en /optimizar: %s", exc)
-        return build_error_message("Error ejecutando /optimizar", f"{type(exc).__name__}: {exc}")
+        return build_error_message("Error ejecutando /optimizar", _exception_detail(exc))
 
     if result.get("applied"):
         formation = result.get("formation") or []
