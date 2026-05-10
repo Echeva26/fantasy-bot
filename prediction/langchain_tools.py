@@ -30,6 +30,7 @@ from prediction.advisor import (
     simulate_transfer_plan,
 )
 from prediction.advisor_execute import execute_movements, run_aceptar_ofertas
+from prediction.langsmith_config import finish_langsmith_span, langsmith_run_span
 from prediction.lineup_autoset import autoset_best_lineup
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,10 @@ def _to_builtin(value: Any) -> Any:
 
 def _as_json(payload: Any) -> str:
     return json.dumps(_to_builtin(payload), ensure_ascii=False)
+
+
+def _tool_run_name(tool_name: str) -> str:
+    return f"fantasy-bot.tool.{tool_name}"
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -633,74 +638,143 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
     @tool
     def simulate_transfer_plan(force_refresh: bool = False) -> str:
         """Simula plan de ventas/compras recomendado por el motor actual del repositorio."""
-        team_analysis = runtime.get_team_analysis(force_refresh=force_refresh)
-        plan, claus_ok, hours_to_match = runtime.get_transfer_plan(force_refresh=force_refresh)
-        payload = {
-            "clausulazos_available": claus_ok,
-            "hours_to_first_match": round(hours_to_match, 1),
-            "clausulazos_window_source": "laliga_calendar_or_fallback",
-            "summary": {
-                "modo_deuda": bool(plan.get("modo_deuda", False)),
-                "deuda_objetivo": plan.get("deuda_objetivo"),
-                "deuda_cubierta_estimada": plan.get("deuda_cubierta_estimada"),
-                "deuda_pendiente_estimada": plan.get("deuda_pendiente_estimada"),
-                "xp_once_actual": team_analysis.get("xp_total_once"),
-                "xp_once_post": plan.get("xp_total_post"),
-                "xp_delta": round((plan.get("xp_total_post", 0) or 0) - (team_analysis.get("xp_total_once", 0) or 0), 1),
-                "saldo_actual": team_analysis.get("saldo"),
-                "saldo_final": plan.get("saldo_final"),
-                "movimientos": len(plan.get("movimientos", [])),
-            },
-            "plan": _compress_transfer_plan(plan),
-        }
-        return _as_json(payload)
+        with langsmith_run_span(
+            _tool_run_name("simulate_transfer_plan"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "simulate_transfer_plan"},
+            inputs={"force_refresh": bool(force_refresh)},
+        ) as span:
+            team_analysis = runtime.get_team_analysis(force_refresh=force_refresh)
+            plan, claus_ok, hours_to_match = runtime.get_transfer_plan(force_refresh=force_refresh)
+            payload = {
+                "clausulazos_available": claus_ok,
+                "hours_to_first_match": round(hours_to_match, 1),
+                "clausulazos_window_source": "laliga_calendar_or_fallback",
+                "summary": {
+                    "modo_deuda": bool(plan.get("modo_deuda", False)),
+                    "deuda_objetivo": plan.get("deuda_objetivo"),
+                    "deuda_cubierta_estimada": plan.get("deuda_cubierta_estimada"),
+                    "deuda_pendiente_estimada": plan.get("deuda_pendiente_estimada"),
+                    "xp_once_actual": team_analysis.get("xp_total_once"),
+                    "xp_once_post": plan.get("xp_total_post"),
+                    "xp_delta": round((plan.get("xp_total_post", 0) or 0) - (team_analysis.get("xp_total_once", 0) or 0), 1),
+                    "saldo_actual": team_analysis.get("saldo"),
+                    "saldo_final": plan.get("saldo_final"),
+                    "movimientos": len(plan.get("movimientos", [])),
+                },
+                "plan": _compress_transfer_plan(plan),
+            }
+            finish_langsmith_span(
+                span,
+                {
+                    "ok": True,
+                    "movimientos": len(plan.get("movimientos", [])),
+                    "saldo_actual": team_analysis.get("saldo"),
+                    "saldo_final": plan.get("saldo_final"),
+                    "modo_deuda": bool(plan.get("modo_deuda", False)),
+                },
+            )
+            return _as_json(payload)
 
     @tool
     def execute_simulated_plan(force_refresh: bool = False) -> str:
         """Ejecuta el plan simulado (ventas fase1 + compras). Respeta `dry_run` del runtime."""
-        blocked = _block_if_post("execute_simulated_plan")
-        if blocked:
-            return blocked
-        try:
-            snapshot = runtime.get_snapshot(force_refresh=force_refresh)
-            plan, _, _ = runtime.get_transfer_plan(force_refresh=force_refresh)
-            movimientos = plan.get("movimientos", [])
-            ventas, compras, errores = execute_movements(
-                snapshot=snapshot,
-                transfer_plan=plan,
-                dry_run=runtime.dry_run,
-            )
-            runtime.invalidate()
-            return _as_json(
-                {
-                    "dry_run": runtime.dry_run,
-                    "movimientos_planificados": len(movimientos),
-                    "ventas_fase1": ventas,
-                    "compras": compras,
-                    "errores": errores,
-                }
-            )
-        except Exception as exc:
-            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        with langsmith_run_span(
+            _tool_run_name("execute_simulated_plan"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "execute_simulated_plan"},
+            inputs={"force_refresh": bool(force_refresh)},
+        ) as span:
+            blocked = _block_if_post("execute_simulated_plan")
+            if blocked:
+                finish_langsmith_span(span, {"ok": False, "blocked": True})
+                return blocked
+            try:
+                snapshot = runtime.get_snapshot(force_refresh=force_refresh)
+                plan, _, _ = runtime.get_transfer_plan(force_refresh=force_refresh)
+                movimientos = plan.get("movimientos", [])
+                ventas, compras, errores = execute_movements(
+                    snapshot=snapshot,
+                    transfer_plan=plan,
+                    dry_run=runtime.dry_run,
+                )
+                runtime.invalidate()
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "dry_run": runtime.dry_run,
+                        "movimientos_planificados": len(movimientos),
+                        "ventas": len(ventas or []),
+                        "compras": len(compras or []),
+                        "errores": len(errores or []),
+                    },
+                )
+                return _as_json(
+                    {
+                        "dry_run": runtime.dry_run,
+                        "movimientos_planificados": len(movimientos),
+                        "ventas_fase1": ventas,
+                        "compras": compras,
+                        "errores": errores,
+                    }
+                )
+            except Exception as exc:
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": False,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                )
+                return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
     def accept_closed_offers() -> str:
         """Ejecuta fase2 de ventas: aceptar ofertas de liga ya cerradas."""
-        if runtime.dry_run:
-            return _as_json(
-                {
-                    "dry_run": True,
-                    "action": "accept_closed_offers",
-                    "note": "No se ejecuta fase2 real en dry-run.",
-                }
-            )
-        try:
-            args = SimpleNamespace(league=runtime.league_id)
-            accepted = run_aceptar_ofertas(args)
-            runtime.invalidate()
-            return _as_json({"accepted_offers": int(accepted), "dry_run": runtime.dry_run})
-        except Exception as exc:
-            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        with langsmith_run_span(
+            _tool_run_name("accept_closed_offers"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "accept_closed_offers"},
+            inputs={},
+        ) as span:
+            if runtime.dry_run:
+                finish_langsmith_span(span, {"ok": True, "dry_run": True, "accepted_offers": 0})
+                return _as_json(
+                    {
+                        "dry_run": True,
+                        "action": "accept_closed_offers",
+                        "note": "No se ejecuta fase2 real en dry-run.",
+                    }
+                )
+            try:
+                args = SimpleNamespace(league=runtime.league_id)
+                accepted = run_aceptar_ofertas(args)
+                runtime.invalidate()
+                finish_langsmith_span(
+                    span,
+                    {"ok": True, "accepted_offers": int(accepted), "dry_run": runtime.dry_run},
+                )
+                return _as_json({"accepted_offers": int(accepted), "dry_run": runtime.dry_run})
+            except Exception as exc:
+                finish_langsmith_span(
+                    span,
+                    {"ok": False, "error_type": type(exc).__name__, "error": str(exc)},
+                )
+                return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
     def autoset_best_lineup_tool(
@@ -709,147 +783,290 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         after_market_time: str = "08:10",
     ) -> str:
         """Calcula y guarda automáticamente la mejor alineación por xP."""
-        try:
-            result = autoset_best_lineup(
-                league_id=runtime.league_id,
-                model=runtime.model_type,
-                day_before_only=day_before_only,
-                after_market_time=after_market_time,
-                timezone_name=None,
-                force=force,
-                dry_run=runtime.dry_run,
-            )
-            if result.get("applied"):
-                runtime.invalidate()
-            result["dry_run_runtime"] = runtime.dry_run
-            return _as_json(result)
-        except Exception as exc:
-            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        with langsmith_run_span(
+            _tool_run_name("autoset_best_lineup"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "autoset_best_lineup_tool"},
+            inputs={
+                "day_before_only": bool(day_before_only),
+                "force": bool(force),
+                "after_market_time": str(after_market_time),
+            },
+        ) as span:
+            try:
+                result = autoset_best_lineup(
+                    league_id=runtime.league_id,
+                    model=runtime.model_type,
+                    day_before_only=day_before_only,
+                    after_market_time=after_market_time,
+                    timezone_name=None,
+                    force=force,
+                    dry_run=runtime.dry_run,
+                )
+                if result.get("applied"):
+                    runtime.invalidate()
+                result["dry_run_runtime"] = runtime.dry_run
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "applied": bool(result.get("applied")),
+                        "dry_run": bool(result.get("dry_run")),
+                        "formation": result.get("formation"),
+                        "xp_once": result.get("xp_once"),
+                    },
+                )
+                return _as_json(result)
+            except Exception as exc:
+                finish_langsmith_span(
+                    span,
+                    {"ok": False, "error_type": type(exc).__name__, "error": str(exc)},
+                )
+                return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
     def sell_player_phase1_tool(player_team_id: str, sale_price: int) -> str:
         """Publica un jugador propio en mercado (fase1). Requiere `player_team_id`."""
-        blocked = _block_if_post("sell_player_phase1_tool")
-        if blocked:
-            return blocked
-        ptid = str(player_team_id or "").strip()
-        price = _safe_int(sale_price, 0)
-        if not ptid:
-            return _as_json({"ok": False, "error": "player_team_id vacío"})
-        if price <= 0:
-            return _as_json({"ok": False, "error": "sale_price debe ser > 0"})
+        with langsmith_run_span(
+            _tool_run_name("sell_player_phase1"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "sell_player_phase1_tool"},
+            inputs={"player_team_id": str(player_team_id or "").strip(), "sale_price": _safe_int(sale_price, 0)},
+        ) as span:
+            blocked = _block_if_post("sell_player_phase1_tool")
+            if blocked:
+                finish_langsmith_span(span, {"ok": False, "blocked": True})
+                return blocked
+            ptid = str(player_team_id or "").strip()
+            price = _safe_int(sale_price, 0)
+            if not ptid:
+                finish_langsmith_span(span, {"ok": False, "error": "player_team_id vacío"})
+                return _as_json({"ok": False, "error": "player_team_id vacío"})
+            if price <= 0:
+                finish_langsmith_span(span, {"ok": False, "error": "sale_price debe ser > 0"})
+                return _as_json({"ok": False, "error": "sale_price debe ser > 0"})
 
-        team_analysis = runtime.get_team_analysis(force_refresh=False)
-        players = [
-            p for p in team_analysis.get("jugadores", [])
-            if isinstance(p, dict)
-        ]
-        selected = None
-        for p in players:
-            if str(p.get("player_team_id", "")).strip() == ptid:
-                selected = p
-                break
-        if not selected:
-            return _as_json(
-                {
-                    "ok": False,
-                    "error": "No se encontró ese player_team_id en tu plantilla actual.",
-                    "player_team_id": ptid,
-                }
-            )
+            team_analysis = runtime.get_team_analysis(force_refresh=False)
+            players = [
+                p for p in team_analysis.get("jugadores", [])
+                if isinstance(p, dict)
+            ]
+            selected = None
+            for p in players:
+                if str(p.get("player_team_id", "")).strip() == ptid:
+                    selected = p
+                    break
+            if not selected:
+                finish_langsmith_span(span, {"ok": False, "player_team_id": ptid, "found": False})
+                return _as_json(
+                    {
+                        "ok": False,
+                        "error": "No se encontró ese player_team_id en tu plantilla actual.",
+                        "player_team_id": ptid,
+                    }
+                )
 
-        if not sale_keeps_lineup_viable(players, int(selected.get("player_id", 0) or 0)):
-            return _as_json(
-                {
-                    "ok": False,
-                    "blocked": True,
-                    "action": "sell_player_phase1",
-                    "player_team_id": ptid,
-                    "nombre": selected.get("nombre"),
-                    "posicion": selected.get("posicion"),
-                    "xP": selected.get("xP"),
-                    "valor_mercado": selected.get("valor_mercado"),
-                    "clausula": selected.get("clausula"),
-                    "reason": (
-                        "Venta bloqueada: quitar este jugador dejaría la plantilla "
-                        "sin una alineación viable según las formaciones permitidas."
-                    ),
-                }
-            )
-        if runtime.dry_run:
-            return _as_json(
-                {
-                    "dry_run": True,
-                    "action": "sell_player_phase1",
-                    "player_team_id": ptid,
-                    "sale_price": price,
-                    "nombre": selected.get("nombre"),
-                }
-            )
-        try:
-            client = runtime.get_client()
-            res = client.sell_player_phase1(player_team_id=ptid, price=price)
-            runtime.invalidate()
-            return _as_json({"ok": True, "response": res})
-        except Exception as exc:
-            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            if not sale_keeps_lineup_viable(players, int(selected.get("player_id", 0) or 0)):
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": False,
+                        "blocked": True,
+                        "player_team_id": ptid,
+                        "nombre": selected.get("nombre"),
+                    },
+                )
+                return _as_json(
+                    {
+                        "ok": False,
+                        "blocked": True,
+                        "action": "sell_player_phase1",
+                        "player_team_id": ptid,
+                        "nombre": selected.get("nombre"),
+                        "posicion": selected.get("posicion"),
+                        "xP": selected.get("xP"),
+                        "valor_mercado": selected.get("valor_mercado"),
+                        "clausula": selected.get("clausula"),
+                        "reason": (
+                            "Venta bloqueada: quitar este jugador dejaría la plantilla "
+                            "sin una alineación viable según las formaciones permitidas."
+                        ),
+                    }
+                )
+            if runtime.dry_run:
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "dry_run": True,
+                        "player_team_id": ptid,
+                        "nombre": selected.get("nombre"),
+                        "sale_price": price,
+                    },
+                )
+                return _as_json(
+                    {
+                        "dry_run": True,
+                        "action": "sell_player_phase1",
+                        "player_team_id": ptid,
+                        "sale_price": price,
+                        "nombre": selected.get("nombre"),
+                    }
+                )
+            try:
+                client = runtime.get_client()
+                client.sell_player_phase1(player_team_id=ptid, price=price)
+                runtime.invalidate()
+                finish_langsmith_span(
+                    span,
+                    {"ok": True, "player_team_id": ptid, "nombre": selected.get("nombre"), "sale_price": price},
+                )
+                return _as_json({"ok": True, "player_team_id": ptid, "sale_price": price})
+            except Exception as exc:
+                finish_langsmith_span(
+                    span,
+                    {"ok": False, "error_type": type(exc).__name__, "error": str(exc), "player_team_id": ptid},
+                )
+                return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
     def place_bid_tool(market_item_id: str, amount: int, player_id: int = 0) -> str:
         """Hace/actualiza una puja en mercado libre."""
-        blocked = _block_if_post("place_bid_tool")
-        if blocked:
-            return blocked
-        if runtime.dry_run:
-            return _as_json(
-                {
-                    "dry_run": True,
-                    "action": "bid",
-                    "market_item_id": market_item_id,
-                    "amount": int(amount),
-                    "player_id": int(player_id) if player_id else None,
-                }
-            )
-        try:
-            client = runtime.get_client()
-            res = client.buy_player_bid(
-                market_player_id=market_item_id,
-                amount=int(amount),
-                player_id=int(player_id) if player_id else None,
-            )
-            runtime.invalidate()
-            return _as_json({"ok": True, "response": res})
-        except Exception as exc:
-            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        with langsmith_run_span(
+            _tool_run_name("place_bid"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "place_bid_tool"},
+            inputs={
+                "market_item_id": str(market_item_id or "").strip(),
+                "amount": int(amount),
+                "player_id": int(player_id) if player_id else None,
+            },
+        ) as span:
+            blocked = _block_if_post("place_bid_tool")
+            if blocked:
+                finish_langsmith_span(span, {"ok": False, "blocked": True})
+                return blocked
+            if runtime.dry_run:
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "dry_run": True,
+                        "market_item_id": market_item_id,
+                        "amount": int(amount),
+                    },
+                )
+                return _as_json(
+                    {
+                        "dry_run": True,
+                        "action": "bid",
+                        "market_item_id": market_item_id,
+                        "amount": int(amount),
+                        "player_id": int(player_id) if player_id else None,
+                    }
+                )
+            try:
+                client = runtime.get_client()
+                client.buy_player_bid(
+                    market_player_id=market_item_id,
+                    amount=int(amount),
+                    player_id=int(player_id) if player_id else None,
+                )
+                runtime.invalidate()
+                finish_langsmith_span(
+                    span,
+                    {"ok": True, "market_item_id": market_item_id, "amount": int(amount)},
+                )
+                return _as_json({"ok": True, "market_item_id": market_item_id, "amount": int(amount)})
+            except Exception as exc:
+                finish_langsmith_span(
+                    span,
+                    {"ok": False, "error_type": type(exc).__name__, "error": str(exc), "market_item_id": market_item_id},
+                )
+                return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
     def buyout_player_tool(player_team_id: str, clause_to_pay: int = 0) -> str:
         """Ejecuta un clausulazo sobre un `player_team_id` rival. Prohibido desde 24h antes de jornada."""
-        blocked = _block_if_post("buyout_player_tool")
-        if blocked:
-            return blocked
-        blocked = _block_if_buyout_locked("buyout_player_tool")
-        if blocked:
-            return blocked
-        if runtime.dry_run:
-            return _as_json(
-                {
-                    "dry_run": True,
-                    "action": "buyout",
-                    "player_team_id": player_team_id,
-                    "clause_to_pay": int(clause_to_pay) if clause_to_pay else None,
-                }
-            )
-        try:
-            client = runtime.get_client()
-            res = client.buy_player_clausulazo(
-                player_team_id=player_team_id,
-                buyout_clause_to_pay=int(clause_to_pay) if clause_to_pay else None,
-            )
-            runtime.invalidate()
-            return _as_json({"ok": True, "response": res})
-        except Exception as exc:
-            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        with langsmith_run_span(
+            _tool_run_name("buyout_player"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "buyout_player_tool"},
+            inputs={
+                "player_team_id": str(player_team_id or "").strip(),
+                "clause_to_pay": int(clause_to_pay) if clause_to_pay else None,
+            },
+        ) as span:
+            blocked = _block_if_post("buyout_player_tool")
+            if blocked:
+                finish_langsmith_span(span, {"ok": False, "blocked": True})
+                return blocked
+            blocked = _block_if_buyout_locked("buyout_player_tool")
+            if blocked:
+                finish_langsmith_span(span, {"ok": False, "blocked": True, "window_locked": True})
+                return blocked
+            if runtime.dry_run:
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "dry_run": True,
+                        "player_team_id": player_team_id,
+                        "clause_to_pay": int(clause_to_pay) if clause_to_pay else None,
+                    },
+                )
+                return _as_json(
+                    {
+                        "dry_run": True,
+                        "action": "buyout",
+                        "player_team_id": player_team_id,
+                        "clause_to_pay": int(clause_to_pay) if clause_to_pay else None,
+                    }
+                )
+            try:
+                client = runtime.get_client()
+                client.buy_player_clausulazo(
+                    player_team_id=player_team_id,
+                    buyout_clause_to_pay=int(clause_to_pay) if clause_to_pay else None,
+                )
+                runtime.invalidate()
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "player_team_id": player_team_id,
+                        "clause_to_pay": int(clause_to_pay) if clause_to_pay else None,
+                    },
+                )
+                return _as_json(
+                    {
+                        "ok": True,
+                        "player_team_id": player_team_id,
+                        "clause_to_pay": int(clause_to_pay) if clause_to_pay else None,
+                    }
+                )
+            except Exception as exc:
+                finish_langsmith_span(
+                    span,
+                    {"ok": False, "error_type": type(exc).__name__, "error": str(exc), "player_team_id": player_team_id},
+                )
+                return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
     def increase_clause_tool(
@@ -864,117 +1081,169 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         Debe usarse de forma moderada: prioriza jugadores clave y expuestos
         (valor de mercado cercano a la cláusula).
         """
-        blocked = _block_if_post("increase_clause_tool")
-        if blocked:
-            return blocked
-        ptid = str(player_team_id or "").strip()
-        amount = _safe_int(value_to_increase, 0)
-        if not ptid:
-            return _as_json({"ok": False, "error": "player_team_id vacío"})
-        if amount <= 0:
-            return _as_json({"ok": False, "error": "value_to_increase debe ser > 0"})
+        with langsmith_run_span(
+            _tool_run_name("increase_clause"),
+            run_type="tool",
+            phase=runtime.phase,
+            command="agent-tool",
+            league_id=runtime.league_id,
+            dry_run=runtime.dry_run,
+            extra_metadata={"tool_name": "increase_clause_tool"},
+            inputs={
+                "player_team_id": str(player_team_id or "").strip(),
+                "value_to_increase": _safe_int(value_to_increase, 0),
+                "force": bool(force),
+            },
+        ) as span:
+            blocked = _block_if_post("increase_clause_tool")
+            if blocked:
+                finish_langsmith_span(span, {"ok": False, "blocked": True})
+                return blocked
+            ptid = str(player_team_id or "").strip()
+            amount = _safe_int(value_to_increase, 0)
+            if not ptid:
+                finish_langsmith_span(span, {"ok": False, "error": "player_team_id vacío"})
+                return _as_json({"ok": False, "error": "player_team_id vacío"})
+            if amount <= 0:
+                finish_langsmith_span(span, {"ok": False, "error": "value_to_increase debe ser > 0"})
+                return _as_json({"ok": False, "error": "value_to_increase debe ser > 0"})
 
-        team_analysis = runtime.get_team_analysis(force_refresh=False)
-        players = team_analysis.get("jugadores", [])
-        if not isinstance(players, list):
-            players = []
+            team_analysis = runtime.get_team_analysis(force_refresh=False)
+            players = team_analysis.get("jugadores", [])
+            if not isinstance(players, list):
+                players = []
 
-        selected = None
-        sorted_players = sorted(
-            [p for p in players if isinstance(p, dict)],
-            key=lambda x: _safe_float(x.get("xP"), 0.0),
-            reverse=True,
-        )
-        for p in sorted_players:
-            if str(p.get("player_team_id", "")).strip() == ptid:
-                selected = p
-                break
-
-        if not selected:
-            return _as_json(
-                {
-                    "ok": False,
-                    "error": "No se encontró ese player_team_id en tu plantilla actual.",
-                    "player_team_id": ptid,
-                }
+            selected = None
+            sorted_players = sorted(
+                [p for p in players if isinstance(p, dict)],
+                key=lambda x: _safe_float(x.get("xP"), 0.0),
+                reverse=True,
             )
+            for p in sorted_players:
+                if str(p.get("player_team_id", "")).strip() == ptid:
+                    selected = p
+                    break
 
-        key_player_team_ids = {
-            str(p.get("player_team_id", "")).strip()
-            for p in sorted_players[:7]
-            if str(p.get("player_team_id", "")).strip()
-        }
-        xp_value = _safe_float(selected.get("xP"), 0.0)
-        market_value = _safe_int(selected.get("valor_mercado"), 0)
-        clause_value = _safe_int(selected.get("clausula"), 0)
-        ratio = _clause_exposure_ratio(market_value, clause_value)
-        exposed = ratio is not None and ratio >= CLAUSE_EXPOSURE_THRESHOLD
-        is_key = ptid in key_player_team_ids
-        increase_delta = int(round(amount * CLAUSE_INCREASE_FACTOR))
-        estimated_new_clause = clause_value + increase_delta if clause_value > 0 else None
+            if not selected:
+                finish_langsmith_span(span, {"ok": False, "player_team_id": ptid, "found": False})
+                return _as_json(
+                    {
+                        "ok": False,
+                        "error": "No se encontró ese player_team_id en tu plantilla actual.",
+                        "player_team_id": ptid,
+                    }
+                )
 
-        if not force and (not is_key or not exposed):
-            return _as_json(
-                {
-                    "ok": False,
-                    "blocked": True,
-                    "player_team_id": ptid,
-                    "nombre": selected.get("nombre"),
-                    "xP": xp_value,
-                    "valor_mercado": market_value,
-                    "clausula_actual": clause_value,
-                    "ratio_valor_vs_clausula": ratio,
-                    "regla_moderacion": {
+            key_player_team_ids = {
+                str(p.get("player_team_id", "")).strip()
+                for p in sorted_players[:7]
+                if str(p.get("player_team_id", "")).strip()
+            }
+            xp_value = _safe_float(selected.get("xP"), 0.0)
+            market_value = _safe_int(selected.get("valor_mercado"), 0)
+            clause_value = _safe_int(selected.get("clausula"), 0)
+            ratio = _clause_exposure_ratio(market_value, clause_value)
+            exposed = ratio is not None and ratio >= CLAUSE_EXPOSURE_THRESHOLD
+            is_key = ptid in key_player_team_ids
+            increase_delta = int(round(amount * CLAUSE_INCREASE_FACTOR))
+            estimated_new_clause = clause_value + increase_delta if clause_value > 0 else None
+
+            if not force and (not is_key or not exposed):
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": False,
+                        "blocked": True,
+                        "player_team_id": ptid,
                         "jugador_clave": is_key,
                         "expuesto_clausulazo": exposed,
-                        "umbral_exposicion": CLAUSE_EXPOSURE_THRESHOLD,
                     },
-                    "error": (
-                        "Bloqueado por moderación: solo subir cláusula en jugadores clave "
-                        "y con valor de mercado cercano a cláusula. Usa force=true solo si hay justificación."
-                    ),
-                }
-            )
+                )
+                return _as_json(
+                    {
+                        "ok": False,
+                        "blocked": True,
+                        "player_team_id": ptid,
+                        "nombre": selected.get("nombre"),
+                        "xP": xp_value,
+                        "valor_mercado": market_value,
+                        "clausula_actual": clause_value,
+                        "ratio_valor_vs_clausula": ratio,
+                        "regla_moderacion": {
+                            "jugador_clave": is_key,
+                            "expuesto_clausulazo": exposed,
+                            "umbral_exposicion": CLAUSE_EXPOSURE_THRESHOLD,
+                        },
+                        "error": (
+                            "Bloqueado por moderación: solo subir cláusula en jugadores clave "
+                            "y con valor de mercado cercano a cláusula. Usa force=true solo si hay justificación."
+                        ),
+                    }
+                )
 
-        if runtime.dry_run:
-            return _as_json(
-                {
-                    "dry_run": True,
-                    "action": "increase_clause",
-                    "player_team_id": ptid,
-                    "nombre": selected.get("nombre"),
-                    "value_to_increase": amount,
-                    "factor": CLAUSE_INCREASE_FACTOR,
-                    "estimated_clause_increase": increase_delta,
-                    "clausula_actual": clause_value,
-                    "clausula_estimada_nueva": estimated_new_clause,
-                    "ratio_valor_vs_clausula": ratio,
-                    "jugador_clave": is_key,
-                    "expuesto_clausulazo": exposed,
-                }
-            )
+            if runtime.dry_run:
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "dry_run": True,
+                        "player_team_id": ptid,
+                        "jugador_clave": is_key,
+                        "expuesto_clausulazo": exposed,
+                        "value_to_increase": amount,
+                    },
+                )
+                return _as_json(
+                    {
+                        "dry_run": True,
+                        "action": "increase_clause",
+                        "player_team_id": ptid,
+                        "nombre": selected.get("nombre"),
+                        "value_to_increase": amount,
+                        "factor": CLAUSE_INCREASE_FACTOR,
+                        "estimated_clause_increase": increase_delta,
+                        "clausula_actual": clause_value,
+                        "clausula_estimada_nueva": estimated_new_clause,
+                        "ratio_valor_vs_clausula": ratio,
+                        "jugador_clave": is_key,
+                        "expuesto_clausulazo": exposed,
+                    }
+                )
 
-        try:
-            client = runtime.get_client()
-            res = client.increase_player_clause(
-                player_team_id=ptid,
-                value_to_increase=amount,
-                factor=CLAUSE_INCREASE_FACTOR,
-            )
-            runtime.invalidate()
-            return _as_json(
-                {
-                    "ok": True,
-                    "response": res,
-                    "player_team_id": ptid,
-                    "value_to_increase": amount,
-                    "factor": CLAUSE_INCREASE_FACTOR,
-                    "estimated_clause_increase": increase_delta,
-                    "clausula_estimada_nueva": estimated_new_clause,
-                }
-            )
-        except Exception as exc:
-            return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            try:
+                client = runtime.get_client()
+                client.increase_player_clause(
+                    player_team_id=ptid,
+                    value_to_increase=amount,
+                    factor=CLAUSE_INCREASE_FACTOR,
+                )
+                runtime.invalidate()
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "player_team_id": ptid,
+                        "value_to_increase": amount,
+                        "estimated_clause_increase": increase_delta,
+                        "clausula_estimada_nueva": estimated_new_clause,
+                    },
+                )
+                return _as_json(
+                    {
+                        "ok": True,
+                        "player_team_id": ptid,
+                        "value_to_increase": amount,
+                        "factor": CLAUSE_INCREASE_FACTOR,
+                        "estimated_clause_increase": increase_delta,
+                        "clausula_estimada_nueva": estimated_new_clause,
+                    }
+                )
+            except Exception as exc:
+                finish_langsmith_span(
+                    span,
+                    {"ok": False, "error_type": type(exc).__name__, "error": str(exc), "player_team_id": ptid},
+                )
+                return _as_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
     @tool
     def current_lineup() -> str:

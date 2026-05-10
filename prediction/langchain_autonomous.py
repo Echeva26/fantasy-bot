@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from laliga_fantasy_client import TOKEN_FILE, load_token
 from prediction.league_selection import load_selected_league, resolve_league_id
 from prediction.langchain_agent import run_agent_objective, run_agent_phase
+from prediction.langsmith_config import finish_langsmith_span, langsmith_run_span
 from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.predict import get_next_round, get_sofascore_season_id
@@ -228,8 +229,21 @@ def _build_objective(phase: str, custom_pre: str, custom_post: str) -> str | Non
     return None
 
 
-def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
+def _run_phase(
+    phase: str,
+    args: argparse.Namespace,
+    league_id: str,
+    *,
+    market_cycle_id: str | None = None,
+) -> dict:
     custom_objective = _build_objective(phase, args.pre_objective, args.post_objective)
+    trace_run_name = (
+        "fantasy-bot.pre-market-agent"
+        if phase == "pre"
+        else "fantasy-bot.post-market-agent"
+        if phase == "post"
+        else "fantasy-bot.daemon-cycle"
+    )
     if custom_objective:
         return run_agent_objective(
             league_id=league_id,
@@ -242,6 +256,10 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
             dry_run=args.dry_run,
             verbose=args.verbose,
             engine=getattr(args, "agent_engine", None),
+            trace_run_name=trace_run_name,
+            trace_command="daemon",
+            trace_market_cycle_id=market_cycle_id,
+            trace_extra_metadata={"trigger": "daemon"},
         )
     return run_agent_phase(
         league_id=league_id,
@@ -253,6 +271,10 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
         dry_run=args.dry_run,
         verbose=args.verbose,
         engine=getattr(args, "agent_engine", None),
+        trace_run_name=trace_run_name,
+        trace_command="daemon",
+        trace_market_cycle_id=market_cycle_id,
+        trace_extra_metadata={"trigger": "daemon"},
     )
 
 
@@ -268,103 +290,141 @@ def _run_pre_informe_plus_compraventa(
     - Siempre genera plan en dry-run (como /informe).
     - Si el daemon NO está en dry-run, ejecuta el plan resultante (como /compraventa).
     """
-    res = run_agent_objective(
-        league_id=league_id,
-        objective=REPORT_PLAN_OBJECTIVE,
+    with langsmith_run_span(
+        "fantasy-bot.daemon-cycle",
+        run_type="chain",
         phase="pre",
-        llm_model=args.llm_model,
-        temperature=args.temperature,
-        max_iterations=args.max_iterations,
-        dry_run=True,
-        verbose=args.verbose,
-        engine=getattr(args, "agent_engine", None),
-    )
-
-    output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
-    steps = res.get("steps", []) or []
-    simulation_payload = _extract_latest_simulation_payload(steps)
-    actions, action_source = _extract_executable_actions(steps)
-    report_payload = _extract_agent_report_payload(output)
-    if not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions):
-        inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
-        if inferred_clause_actions:
-            actions.extend(inferred_clause_actions)
-            action_source = (
-                "tool_calls+report_clause_fallback"
-                if action_source == "tool_calls"
-                else "simulate_transfer_plan+report_clause_fallback"
-            )
-
-    sim_summary = (
-        simulation_payload.get("summary")
-        if isinstance(simulation_payload, dict) and isinstance(simulation_payload.get("summary"), dict)
-        else {}
-    )
-
-    cache_payload = {
-        "version": 1,
-        "created_at": _now_iso(),
-        "league_id": league_id,
-        "league_name": league_name,
-        "market_key": market_key,
-        "llm_model": str(res.get("llm_model", "")),
-        "objective": REPORT_PLAN_OBJECTIVE,
-        "output": output,
-        "action_source": action_source,
-        "simulation_summary": sim_summary,
-        "actions": actions,
-        "actions_count": len(actions),
-        "executed_at": "",
-    }
-
-    report_text = _build_informe_message(
-        league_name=league_name,
-        market_key=market_key,
-        steps=steps,
-        output=output,
-        actions=actions,
-        action_source=action_source,
-        simulation_payload=simulation_payload,
-    )
-
-    out = {
-        "output": output,
-        "steps": steps,
-        "actions": actions,
-        "action_source": action_source,
-        "report_text": report_text,
-        "compraventa_text": "",
-        "execution_summary": {},
-        "executed": False,
-        "dry_run": bool(args.dry_run),
-    }
-
-    if args.dry_run:
-        _save_report_plan_cache(cache_payload)
-        return out
-
-    if not actions:
-        _save_report_plan_cache(cache_payload)
-        return out
-
-    summary = _execute_cached_actions(
+        command="daemon",
         league_id=league_id,
-        actions=actions,
-        fallback_balance=sim_summary.get("saldo_actual"),
-    )
-    cache_payload["executed_at"] = _now_iso()
-    cache_payload["execution_summary"] = summary
-    _save_report_plan_cache(cache_payload)
+        market_cycle_id=market_key,
+        dry_run=bool(args.dry_run),
+        extra_metadata={"trigger": "daemon"},
+        inputs={"market_key": market_key, "league_name": league_name},
+    ) as span:
+        res = run_agent_objective(
+            league_id=league_id,
+            objective=REPORT_PLAN_OBJECTIVE,
+            phase="pre",
+            llm_model=args.llm_model,
+            temperature=args.temperature,
+            max_iterations=args.max_iterations,
+            dry_run=True,
+            verbose=args.verbose,
+            engine=getattr(args, "agent_engine", None),
+            trace_run_name="fantasy-bot.pre-market-agent",
+            trace_command="daemon",
+            trace_market_cycle_id=market_key,
+            trace_extra_metadata={"trigger": "daemon"},
+        )
 
-    out["execution_summary"] = summary
-    out["executed"] = True
-    out["compraventa_text"] = _build_compraventa_message(
-        league_name=league_name,
-        market_key=market_key,
-        action_source=action_source,
-        summary=summary,
-    )
-    return out
+        output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
+        steps = res.get("steps", []) or []
+        simulation_payload = _extract_latest_simulation_payload(steps)
+        actions, action_source = _extract_executable_actions(steps)
+        report_payload = _extract_agent_report_payload(output)
+        if not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions):
+            inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
+            if inferred_clause_actions:
+                actions.extend(inferred_clause_actions)
+                action_source = (
+                    "tool_calls+report_clause_fallback"
+                    if action_source == "tool_calls"
+                    else "simulate_transfer_plan+report_clause_fallback"
+                )
+
+        sim_summary = (
+            simulation_payload.get("summary")
+            if isinstance(simulation_payload, dict) and isinstance(simulation_payload.get("summary"), dict)
+            else {}
+        )
+
+        cache_payload = {
+            "version": 1,
+            "created_at": _now_iso(),
+            "league_id": league_id,
+            "league_name": league_name,
+            "market_key": market_key,
+            "llm_model": str(res.get("llm_model", "")),
+            "objective": REPORT_PLAN_OBJECTIVE,
+            "output": output,
+            "action_source": action_source,
+            "simulation_summary": sim_summary,
+            "actions": actions,
+            "actions_count": len(actions),
+            "executed_at": "",
+        }
+
+        report_text = _build_informe_message(
+            league_name=league_name,
+            market_key=market_key,
+            steps=steps,
+            output=output,
+            actions=actions,
+            action_source=action_source,
+            simulation_payload=simulation_payload,
+        )
+
+        out = {
+            "output": output,
+            "steps": steps,
+            "actions": actions,
+            "action_source": action_source,
+            "report_text": report_text,
+            "compraventa_text": "",
+            "execution_summary": {},
+            "executed": False,
+            "dry_run": bool(args.dry_run),
+        }
+
+        if args.dry_run:
+            _save_report_plan_cache(cache_payload)
+            finish_langsmith_span(
+                span,
+                {"ok": True, "dry_run": True, "actions_count": len(actions), "tools_count": len(steps)},
+            )
+            return out
+
+        if not actions:
+            _save_report_plan_cache(cache_payload)
+            finish_langsmith_span(
+                span,
+                {"ok": True, "dry_run": False, "actions_count": 0, "tools_count": len(steps)},
+            )
+            return out
+
+        summary = _execute_cached_actions(
+            league_id=league_id,
+            actions=actions,
+            fallback_balance=sim_summary.get("saldo_actual"),
+            trace_command="daemon",
+            trace_channel="daemon",
+            trace_session="daemon",
+            market_cycle_id=market_key,
+        )
+        cache_payload["executed_at"] = _now_iso()
+        cache_payload["execution_summary"] = summary
+        _save_report_plan_cache(cache_payload)
+
+        out["execution_summary"] = summary
+        out["executed"] = True
+        out["compraventa_text"] = _build_compraventa_message(
+            league_name=league_name,
+            market_key=market_key,
+            action_source=action_source,
+            summary=summary,
+        )
+        finish_langsmith_span(
+            span,
+            {
+                "ok": not bool(summary.get("errors")),
+                "dry_run": False,
+                "actions_count": len(actions),
+                "actions_ok": summary.get("actions_ok"),
+                "actions_skipped": summary.get("actions_skipped"),
+                "errors": len(summary.get("errors", []) or []),
+            },
+        )
+        return out
 
 
 def _market_schedule_from_state(state: dict) -> dict | None:
@@ -475,28 +535,51 @@ def _maybe_run_lineup(
         new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
         return new_state, "lineup saltado: jornada ya iniciada"
 
-    result = autoset_best_lineup(
+    with langsmith_run_span(
+        "fantasy-bot.daemon-lineup",
+        run_type="chain",
+        phase="post",
+        command="daemon",
         league_id=league_id,
-        model=MODEL_TYPE,
-        day_before_only=False,
-        after_market_time="00:00",
-        timezone_name=os.getenv("TZ", "Europe/Madrid"),
-        force=True,
-        dry_run=dry_run,
-    )
-
-    if result.get("applied") or result.get("dry_run"):
-        new_state["last_lineup_applied_jornada"] = int(jornada)
-        new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
-        msg = (
-            "Fantasy LangChain LINEUP\n"
-            f"Jornada: {jornada}\n"
-            f"Objetivo: 23h55 antes del inicio"
+        market_cycle_id=str(jornada),
+        dry_run=bool(dry_run),
+        extra_metadata={"trigger": "daemon", "component": "lineup-autoset"},
+        inputs={"jornada": jornada, "target_ts": target_ts, "first_match_ts": first_ts},
+    ) as span:
+        result = autoset_best_lineup(
+            league_id=league_id,
+            model=MODEL_TYPE,
+            day_before_only=False,
+            after_market_time="00:00",
+            timezone_name=os.getenv("TZ", "Europe/Madrid"),
+            force=True,
+            dry_run=dry_run,
         )
-        return new_state, msg
 
-    reason = str(result.get("reason", "no aplicada"))
-    return new_state, f"lineup no aplicada: {reason}"
+        finish_langsmith_span(
+            span,
+            {
+                "ok": bool(result.get("applied") or result.get("dry_run")),
+                "applied": bool(result.get("applied")),
+                "dry_run": bool(result.get("dry_run")),
+                "formation": result.get("formation"),
+                "xp_once": result.get("xp_once"),
+                "jornada": jornada,
+            },
+        )
+
+        if result.get("applied") or result.get("dry_run"):
+            new_state["last_lineup_applied_jornada"] = int(jornada)
+            new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
+            msg = (
+                "Fantasy LangChain LINEUP\n"
+                f"Jornada: {jornada}\n"
+                f"Objetivo: 23h55 antes del inicio"
+            )
+            return new_state, msg
+
+        reason = str(result.get("reason", "no aplicada"))
+        return new_state, f"lineup no aplicada: {reason}"
 
 
 def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> None:
@@ -656,7 +739,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
 
                     if args.pre_objective.strip():
                         # Modo avanzado: objetivo PRE custom.
-                        res = _run_phase("pre", args, league_id)
+                        res = _run_phase("pre", args, league_id, market_cycle_id=market_key)
                         output = str(res.get("output", "") or "")
                         _notify(
                             build_agent_cycle_message(
@@ -759,7 +842,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 )
                 selected = load_selected_league() or {}
                 league_name = str(selected.get("league_name", "")).strip() or league_id
-                res = _run_phase("post", args, league_id)
+                res = _run_phase("post", args, league_id, market_cycle_id=pending_post_key)
                 output = res.get("output", "")
                 state["last_post_market_key"] = pending_post_key
                 state["last_post_run_at"] = now_utc.isoformat()

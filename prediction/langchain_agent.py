@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from prediction.league_selection import resolve_league_id
+from prediction.langsmith_config import (
+    build_langsmith_config,
+    langsmith_trace_context,
+)
 from prediction.langchain_tools import FantasyAgentRuntime, build_langchain_tools
 
 logger = logging.getLogger(__name__)
@@ -262,6 +266,53 @@ def _extract_output(response: dict) -> str:
     return ""
 
 
+def _agent_run_name(
+    phase: str,
+    objective: str,
+    *,
+    command: str | None = None,
+    explicit_run_name: str | None = None,
+) -> str:
+    if explicit_run_name:
+        return explicit_run_name
+    phase_key = str(phase or "").strip().lower()
+    command_key = str(command or "").strip().lower()
+    if command_key == "informe":
+        return "fantasy-bot.manual-report"
+    if command_key == "compraventa":
+        return "fantasy-bot.manual-compraventa"
+    if command_key == "daemon":
+        return "fantasy-bot.daemon-cycle"
+    if phase_key == "pre":
+        return "fantasy-bot.pre-market-agent"
+    if phase_key == "post":
+        return "fantasy-bot.post-market-agent"
+    if phase_key == "full":
+        return "fantasy-bot.full-agent"
+    if objective:
+        return "fantasy-bot.objective-agent"
+    return "fantasy-bot.langchain-agent"
+
+
+def _invoke_executor_with_config(
+    executor: Any,
+    objective: str,
+    invoke_config: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return executor.invoke({"input": objective}, config=invoke_config)
+    except TypeError:
+        return executor.invoke({"input": objective})
+    except Exception:
+        try:
+            return executor.invoke(
+                {"messages": [{"role": "user", "content": objective}]},
+                config=invoke_config,
+            )
+        except TypeError:
+            return executor.invoke({"messages": [{"role": "user", "content": objective}]})
+
+
 def run_agent_objective(
     *,
     league_id: str,
@@ -274,6 +325,10 @@ def run_agent_objective(
     dry_run: bool = False,
     verbose: bool = False,
     engine: str | None = None,
+    trace_run_name: str | None = None,
+    trace_command: str | None = None,
+    trace_market_cycle_id: str | None = None,
+    trace_extra_metadata: dict | None = None,
 ) -> dict:
     engine_key = (
         engine
@@ -281,6 +336,16 @@ def run_agent_objective(
         or os.getenv("LANGCHAIN_AGENT_ENGINE")
         or "langgraph"
     ).strip().lower()
+    run_name = _agent_run_name(
+        phase,
+        objective,
+        command=trace_command,
+        explicit_run_name=trace_run_name,
+    )
+    trace_metadata = dict(trace_extra_metadata or {})
+    trace_metadata.setdefault("engine", engine_key)
+    trace_metadata.setdefault("llm_model", llm_model)
+    trace_metadata.setdefault("model_provider", "openai")
     if engine_key in {"langgraph", "graph"}:
         from prediction.langgraph_agent import run_graph_objective
 
@@ -294,6 +359,10 @@ def run_agent_objective(
             max_iterations=max_iterations,
             dry_run=dry_run,
             verbose=verbose,
+            trace_run_name=run_name,
+            trace_command=trace_command,
+            trace_market_cycle_id=trace_market_cycle_id,
+            trace_extra_metadata=trace_metadata,
         )
     if engine_key not in {"legacy", "langchain"}:
         raise ValueError(
@@ -313,13 +382,29 @@ def run_agent_objective(
         max_iterations=max_iterations,
         verbose=verbose,
     )
-    # API legacy: {"input": ...}
-    # API moderna: {"messages": [{"role":"user","content": ...}]}
-    try:
-        response = executor.invoke({"input": objective})
-    except Exception:
-        response = executor.invoke(
-            {"messages": [{"role": "user", "content": objective}]}
+    invoke_config = build_langsmith_config(
+        run_name=run_name,
+        phase=phase,
+        command=trace_command,
+        league_id=league_id,
+        market_cycle_id=trace_market_cycle_id,
+        dry_run=dry_run,
+        extra_metadata=trace_metadata,
+    )
+
+    with langsmith_trace_context(
+        run_name=run_name,
+        phase=phase,
+        command=trace_command,
+        league_id=league_id,
+        market_cycle_id=trace_market_cycle_id,
+        dry_run=dry_run,
+        extra_metadata=trace_metadata,
+    ):
+        response = _invoke_executor_with_config(
+            executor,
+            objective,
+            invoke_config,
         )
 
     steps = []
@@ -344,6 +429,7 @@ def run_agent_objective(
         "model_type": model_type,
         "llm_model": llm_model,
         "engine": "legacy",
+        "trace_run_name": run_name,
         "output": _extract_output(response),
         "steps": steps,
     }
@@ -360,6 +446,10 @@ def run_agent_phase(
     dry_run: bool = False,
     verbose: bool = False,
     engine: str | None = None,
+    trace_run_name: str | None = None,
+    trace_command: str | None = None,
+    trace_market_cycle_id: str | None = None,
+    trace_extra_metadata: dict | None = None,
 ) -> dict:
     phase_key = (phase or "pre").strip().lower()
     if phase_key not in PHASE_OBJECTIVES:
@@ -375,6 +465,10 @@ def run_agent_phase(
         dry_run=dry_run,
         verbose=verbose,
         engine=engine,
+        trace_run_name=trace_run_name,
+        trace_command=trace_command,
+        trace_market_cycle_id=trace_market_cycle_id,
+        trace_extra_metadata=trace_extra_metadata,
     )
 
 

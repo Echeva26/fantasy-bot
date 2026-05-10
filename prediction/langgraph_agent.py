@@ -16,6 +16,10 @@ import logging
 import os
 from typing import Any, TypedDict
 
+from prediction.langsmith_config import (
+    build_langsmith_config,
+    langsmith_trace_context,
+)
 from prediction.langchain_tools import FantasyAgentRuntime, build_langchain_tools
 
 logger = logging.getLogger(__name__)
@@ -630,6 +634,10 @@ def run_graph_objective(
     max_iterations: int = 20,
     dry_run: bool = False,
     verbose: bool = False,
+    trace_run_name: str | None = None,
+    trace_command: str | None = None,
+    trace_market_cycle_id: str | None = None,
+    trace_extra_metadata: dict | None = None,
 ) -> dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY", "").strip():
         raise RuntimeError(
@@ -648,24 +656,53 @@ def run_graph_objective(
     tools = {tool.name: tool for tool in build_langchain_tools(runtime)}
     llm = ChatOpenAI(model=llm_model, temperature=temperature)
     graph = _build_graph(llm, verbose=verbose)
-    result = graph.invoke(
-        {
-            "league_id": league_id,
-            "objective": objective,
-            "phase": phase,
-            "dry_run": dry_run,
-            "model_type": model_type,
-            "llm_model": llm_model,
-            "runtime": runtime,
-            "tools": tools,
-            "context": {},
-            "steps": [],
-            "errors": [],
-        },
-        config={
-            "recursion_limit": max(10, int(max_iterations or 20) + 10),
-        },
+    run_name = trace_run_name or (
+        "fantasy-bot.post-market-agent"
+        if str(phase or "").strip().lower() == "post"
+        else "fantasy-bot.pre-market-agent"
+        if str(phase or "").strip().lower() == "pre"
+        else "fantasy-bot.full-agent"
     )
+    trace_metadata = dict(trace_extra_metadata or {})
+    trace_metadata.setdefault("engine", "langgraph")
+    trace_metadata.setdefault("llm_model", llm_model)
+    trace_metadata.setdefault("model_provider", "openai")
+    invoke_config = build_langsmith_config(
+        run_name=run_name,
+        phase=phase,
+        command=trace_command,
+        league_id=league_id,
+        market_cycle_id=trace_market_cycle_id,
+        dry_run=dry_run,
+        extra_metadata=trace_metadata,
+    )
+    invoke_config["recursion_limit"] = max(10, int(max_iterations or 20) + 10)
+
+    with langsmith_trace_context(
+        run_name=run_name,
+        phase=phase,
+        command=trace_command,
+        league_id=league_id,
+        market_cycle_id=trace_market_cycle_id,
+        dry_run=dry_run,
+        extra_metadata=trace_metadata,
+    ):
+        result = graph.invoke(
+            {
+                "league_id": league_id,
+                "objective": objective,
+                "phase": phase,
+                "dry_run": dry_run,
+                "model_type": model_type,
+                "llm_model": llm_model,
+                "runtime": runtime,
+                "tools": tools,
+                "context": {},
+                "steps": [],
+                "errors": [],
+            },
+            config=invoke_config,
+        )
 
     return {
         "league_id": league_id,
@@ -675,6 +712,7 @@ def run_graph_objective(
         "model_type": model_type,
         "llm_model": llm_model,
         "engine": "langgraph",
+        "trace_run_name": run_name,
         "output": str(result.get("output", "") or "").strip(),
         "steps": result.get("steps", []) or [],
         "context": result.get("context", {}) or {},

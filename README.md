@@ -103,6 +103,21 @@ TELEGRAM_CHAT_ID=...
 TELEGRAM_ALLOWED_CHAT_ID=...
 ```
 
+### Observabilidad con LangSmith
+
+Para activar trazas del agente, añade también:
+
+```env
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=...
+LANGSMITH_PROJECT=fantasy-bot-dev
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+LANGCHAIN_CALLBACKS_BACKGROUND=true
+```
+
+Usa proyectos separados para desarrollo y producción, y valida primero con `dry-run`.
+La guía completa está en [docs/LANGSMITH.md](docs/LANGSMITH.md).
+
 ### Obtener variables de Telegram
 
 1. Crea el bot con `@BotFather`:
