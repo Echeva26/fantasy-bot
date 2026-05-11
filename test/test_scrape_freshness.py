@@ -35,6 +35,8 @@ class ScrapeFreshnessTests(unittest.TestCase):
         self.assertTrue(result.fresh)
         self.assertTrue(result.ran_scraper)
         self.assertTrue(result.latest_file.endswith(".json"))
+        self.assertIn("No existe", result.trigger_reason)
+        self.assertEqual(result.status_reason, "Scrape fresco generado.")
 
     def test_fresh_file_does_not_run_scraper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

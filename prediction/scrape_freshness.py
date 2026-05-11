@@ -73,6 +73,8 @@ class ScrapeFreshnessResult:
     age_minutes: float | None
     error: str
     reason: str
+    trigger_reason: str = ""
+    status_reason: str = ""
 
     @property
     def stale(self) -> bool:
@@ -92,6 +94,8 @@ class ScrapeFreshnessResult:
             ),
             "error": self.error,
             "reason": self.reason,
+            "trigger_reason": self.trigger_reason,
+            "status_reason": self.status_reason or self.reason,
         }
 
 
@@ -121,7 +125,10 @@ def _fresh_result(
     ran_scraper: bool,
     error: str = "",
     reason: str = "",
+    trigger_reason: str = "",
+    status_reason: str = "",
 ) -> ScrapeFreshnessResult:
+    final_status_reason = status_reason or reason
     return ScrapeFreshnessResult(
         ok=bool(fresh and latest),
         fresh=bool(fresh and latest),
@@ -129,7 +136,9 @@ def _fresh_result(
         latest_file=str(latest) if latest else "",
         age_minutes=age,
         error=error,
-        reason=reason,
+        reason=final_status_reason,
+        trigger_reason=trigger_reason,
+        status_reason=final_status_reason,
     )
 
 
@@ -166,7 +175,7 @@ def ensure_fresh_scrapes(
             age=age,
             fresh=True,
             ran_scraper=False,
-            reason="Último scrape fresco.",
+            status_reason="Último scrape fresco.",
         )
 
     reason = (
@@ -178,6 +187,7 @@ def ensure_fresh_scrapes(
     )
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    base.mkdir(parents=True, exist_ok=True)
     output = base / f"{timestamp}.json"
     cmd = [
         sys.executable,
@@ -202,7 +212,12 @@ def ensure_fresh_scrapes(
             fresh=bool(latest_after and age_after is not None and age_after <= limit),
             ran_scraper=True,
             error=f"Timeout ejecutando scraper tras {timeout}s.",
-            reason=reason,
+            trigger_reason=reason,
+            status_reason=(
+                "Scraper agotó el timeout; se usará el último scrape disponible."
+                if latest_after
+                else "Scraper agotó el timeout y no hay scrape disponible."
+            ),
         )
     except Exception as exc:
         latest_after = latest_scrape_file(base)
@@ -217,7 +232,12 @@ def ensure_fresh_scrapes(
             fresh=bool(latest_after and age_after is not None and age_after <= limit),
             ran_scraper=True,
             error=f"{type(exc).__name__}: {exc}",
-            reason=reason,
+            trigger_reason=reason,
+            status_reason=(
+                "Scraper falló; se usará el último scrape disponible."
+                if latest_after
+                else "Scraper falló y no hay scrape disponible."
+            ),
         )
 
     latest_after = latest_scrape_file(base)
@@ -237,7 +257,12 @@ def ensure_fresh_scrapes(
             fresh=fresh_after,
             ran_scraper=True,
             error=f"Scraper falló: {detail[:500]}",
-            reason=reason,
+            trigger_reason=reason,
+            status_reason=(
+                "Scraper falló; se usará el último scrape disponible."
+                if latest_after
+                else "Scraper falló y no hay scrape disponible."
+            ),
         )
 
     return _fresh_result(
@@ -246,5 +271,10 @@ def ensure_fresh_scrapes(
         fresh=fresh_after,
         ran_scraper=True,
         error="" if fresh_after else "El scraper terminó pero no dejó un JSON fresco.",
-        reason=reason,
+        trigger_reason=reason,
+        status_reason=(
+            "Scrape fresco generado."
+            if fresh_after
+            else "El scraper terminó pero no dejó un JSON fresco."
+        ),
     )

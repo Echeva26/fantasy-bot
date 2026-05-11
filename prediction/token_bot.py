@@ -68,16 +68,21 @@ REPORT_PLAN_OBJECTIVE = (
     "   Regla fija: cada 1M invertido sube 2M la cláusula.\n"
     "6) Si recomiendas proteger jugadores, solo se materializará si el ejecutor "
     "lo valida mediante reglas determinísticas de exposición.\n"
-    "7) REGLA CRÍTICA: no se puede comprar ningún jugador mediante clausulazo "
+    "7) No confundas cierre de mercado con deadline de jornada: si falta un "
+    "portero pero quedan más de 48h para alinear, es prioridad planificada, no "
+    "emergencia. Entre 24-48h es alta; <=24h crítica; <=1h emergencia.\n"
+    "8) Las ventas fase 1 no financian pujas inmediatas hasta que la oferta se "
+    "acepte/procese. No plantees venta -> puja como liquidez del mismo paso.\n"
+    "9) REGLA CRÍTICA: no se puede comprar ningún jugador mediante clausulazo "
     "desde 24h antes del inicio de la jornada. Si faltan 24h o menos para el "
     "primer partido, NO llames buyout_player_tool y descarta todos los "
     "clausulazos; usa solo pujas de mercado, ventas o subidas de cláusula.\n"
-    "8) REGLA CRÍTICA DE SALDO NEGATIVO: si el saldo está por debajo de 0, "
+    "10) REGLA CRÍTICA DE SALDO NEGATIVO: si el saldo está por debajo de 0, "
     "activa modo deuda. No compres ni subas cláusulas hasta cubrirla. Vende "
     "jugadores de impacto bajo o nulo, teniendo en cuenta xP, valor de mercado, "
     "cláusula e impacto marginal en el once. No vendas a nadie si impide formar "
     "una alineación válida; por ejemplo, no vendas el único portero.\n"
-    "9) Devuelve resumen breve y claro en español."
+    "11) Devuelve resumen breve y claro en español."
 )
 
 
@@ -461,9 +466,15 @@ def _build_informe_message(
     if scrape_status:
         if bool(scrape_status.get("ok")):
             suffix = "tras refrescar" if scrape_status.get("ran_scraper") else "sin refrescar"
-            news_rows.append(f"Scrapes frescos ({suffix})")
+            status = scrape_status.get("status_reason") or "scrapes frescos"
+            news_rows.append(f"Scrapes frescos ({suffix}): {_compact_text(status, 140)}")
         else:
-            reason = scrape_status.get("error") or scrape_status.get("reason") or "sin detalle"
+            reason = (
+                scrape_status.get("error")
+                or scrape_status.get("status_reason")
+                or scrape_status.get("reason")
+                or "sin detalle"
+            )
             news_rows.append(f"Scrapes degradados: {_compact_text(reason, 180)}")
     if news_payload:
         if news_payload.get("fresh") is False:

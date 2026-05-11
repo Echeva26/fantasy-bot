@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, TypedDict
 
 from prediction.langsmith_config import (
@@ -21,6 +22,7 @@ from prediction.langsmith_config import (
     langsmith_trace_context,
 )
 from prediction.langchain_tools import FantasyAgentRuntime, build_langchain_tools
+from prediction.market_schedule import get_market_close_datetime_utc
 from prediction.scrape_freshness import ensure_fresh_scrapes
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,22 @@ ALLOWED_EXECUTION_TOOLS = {
     "buyout_player_tool",
     "increase_clause_tool",
 }
+
+GAME_RULES_DOCTRINE = """
+Doctrina de juego LaLiga Fantasy Relevo:
+- La jornada manda sobre el mercado: una carencia de plantilla solo es emergencia
+  si amenaza el deadline de alineación, no porque cierre el mercado diario.
+- Para puntuar hay que llegar al registro de jornada con saldo positivo y 11
+  jugadores alineados; los lesionados/sancionados alineados no aportarán puntos.
+- Urgencia de huecos de once: >48h planificada, 24-48h alta, <=24h crítica,
+  <=1h o once inválido en deadline emergencia.
+- Las pujas por jugadores libres se procesan al expirar el mercado. Las ventas
+  fase 1 no financian compras inmediatas hasta aceptación/procesamiento.
+- Clausulazos y subidas de cláusula no permiten endeudarse. Los clausulazos se
+  bloquean 24h antes de la jornada.
+- El blindaje existe como recomendación estratégica, pero no es acción ejecutable
+  si no hay tool/API dedicada.
+"""
 
 
 class FantasyGraphState(TypedDict, total=False):
@@ -55,7 +73,9 @@ class FantasyGraphState(TypedDict, total=False):
 
 ANALYST_PROMPT = """
 Eres el Agente Analista de un mánager de LaLiga Fantasy.
-Tu trabajo es revisar SOLO la plantilla propia: titulares, suplentes,
+{game_rules}
+Tu trabajo es centrarte en la plantilla propia, usando `game_context` para no
+confundir deadline de mercado con deadline de jornada: titulares, suplentes,
 jugadores en venta, riesgo de lesión/sanción, exposición a clausulazo y
 posibles ventas o banquillazos.
 Si el saldo global es negativo, trata el análisis como emergencia: identifica
@@ -78,7 +98,10 @@ explícito de noticias locales no frescas/degradadas.
 
 SCOUT_PROMPT = """
 Eres el Agente Ojeador de un mánager de LaLiga Fantasy.
-Tu trabajo es revisar SOLO mercado, clausulazos y noticias locales.
+{game_rules}
+Tu trabajo es centrarte en mercado, clausulazos y noticias locales, usando
+`game_context` y `plantilla_resumen` solo para entender necesidades reales
+de cobertura y urgencia.
 Busca chollos, subidas/bajadas de valor, jugadores lesionados o sancionados
 y oportunidades que mejoren la plantilla sin romper presupuesto.
 Regla crítica: los clausulazos quedan prohibidos desde 24h antes del inicio
@@ -99,6 +122,7 @@ locales degradadas y evita presentar lesiones/sanciones como confirmadas.
 
 MANAGER_PROMPT = """
 Eres el Mánager principal de LaLiga Fantasy.
+{game_rules}
 Recibes el estado global, el informe del Analista y el informe del Ojeador.
 Debes tomar la decisión final validando saldo, límites de plantilla,
 fase operativa y coherencia de ids.
@@ -121,8 +145,8 @@ Reglas:
    válida; ejemplo: si solo hay un portero, no lo vendas.
 8. Si `acciones_propuestas_motor` está vacío, NO incluyas compraventas
    ejecutables. Puedes explicar recomendaciones, riesgos o acciones manuales,
-   pero deja `acciones_ejecutables` vacío salvo protección de cláusula moderada
-   de un jugador clave y expuesto.
+   pero deja `acciones_ejecutables` vacío salvo protección de cláusula generada
+   por reglas determinísticas y solo si no hay una necesidad crítica de once.
 9. Si `scrape_status.ok` es false o `news_reader_tool.fresh` es false, continúa
    con aviso explícito en riesgos; no ocultes que las noticias están degradadas.
 
@@ -138,6 +162,7 @@ Devuelve JSON válido con:
   "acciones_descartadas": ["..."],
   "alineacion": ["..."],
   "riesgos_detectados": ["..."],
+  "recomendaciones_no_ejecutables": ["..."],
   "siguiente_revision_recomendada": "..."
 }
 Incluye solo acciones que realmente quieras ejecutar o simular.
@@ -213,9 +238,10 @@ def _compact_json(payload: Any, limit: int = 14000) -> str:
 
 
 def _invoke_llm(llm: Any, system_prompt: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    prompt = system_prompt.replace("{game_rules}", GAME_RULES_DOCTRINE)
     msg = llm.invoke(
         [
-            ("system", system_prompt),
+            ("system", prompt),
             ("human", _compact_json(payload)),
         ]
     )
@@ -393,7 +419,205 @@ def _action_key(action: dict[str, Any]) -> tuple[str, str]:
     return tool, json.dumps(payload, sort_keys=True, default=str)
 
 
+def _hours_until(dt: datetime | None) -> float | None:
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return round((dt.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds() / 3600, 1)
+
+
+def _position_key(raw: object) -> str:
+    txt = str(raw or "").strip().upper()
+    aliases = {
+        "PT": "POR",
+        "POR": "POR",
+        "PORTERO": "POR",
+        "GK": "POR",
+        "DF": "DEF",
+        "DEF": "DEF",
+        "DEFENSA": "DEF",
+        "MC": "MED",
+        "MED": "MED",
+        "CENTROCAMPISTA": "MED",
+        "DL": "DEL",
+        "DC": "DEL",
+        "DEL": "DEL",
+        "DELANTERO": "DEL",
+    }
+    return aliases.get(txt, txt)
+
+
+def _news_unavailable_names(news: dict[str, Any]) -> set[str]:
+    items = news.get("items", []) if isinstance(news, dict) else []
+    names: set[str] = set()
+    if not isinstance(items, list):
+        return names
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+        tipo = str(row.get("tipo", "")).strip().lower()
+        if tipo not in {"lesion", "sancion"}:
+            continue
+        name = str(row.get("nombre", "")).strip().lower()
+        if name:
+            names.add(name)
+    return names
+
+
+def _player_available_for_lineup(player: dict[str, Any], unavailable_names: set[str]) -> bool:
+    name = str(player.get("nombre", "")).strip().lower()
+    if name and name in unavailable_names:
+        return False
+    estado = str(player.get("estado", "") or "").strip().lower()
+    if estado and estado not in {"ok", "doubt", "warn", "apercibido"}:
+        return False
+    return True
+
+
+def _urgency_level(hours_to_lineup_deadline: float | None, can_field_11: bool) -> str:
+    if can_field_11:
+        return "normal"
+    if hours_to_lineup_deadline is None:
+        return "unknown"
+    if hours_to_lineup_deadline <= 1:
+        return "emergency"
+    if hours_to_lineup_deadline <= 24:
+        return "critical"
+    if hours_to_lineup_deadline <= 48:
+        return "high"
+    return "planned"
+
+
+def _build_game_context(
+    *,
+    context: dict[str, Any],
+    league_id: str,
+    phase: str,
+    proposed_actions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    snapshot = context.get("snapshot_summary", {}) if isinstance(context, dict) else {}
+    squad = context.get("my_squad", {}) if isinstance(context, dict) else {}
+    market = context.get("market_opportunities", {}) if isinstance(context, dict) else {}
+    news = context.get("news_reader_tool", {}) if isinstance(context, dict) else {}
+    simulation = context.get("simulate_transfer_plan", {}) if isinstance(context, dict) else {}
+    plan = simulation.get("plan", {}) if isinstance(simulation, dict) else {}
+
+    players = squad.get("players", []) if isinstance(squad, dict) else []
+    players = players if isinstance(players, list) else []
+    unavailable_names = _news_unavailable_names(news)
+    minimums = {"POR": 1, "DEF": 3, "MED": 3, "DEL": 1}
+    available_by_position = {pos: 0 for pos in minimums}
+    unavailable_players: list[dict[str, Any]] = []
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        pos = _position_key(player.get("posicion"))
+        available = _player_available_for_lineup(player, unavailable_names)
+        if pos in available_by_position and available:
+            available_by_position[pos] += 1
+        if not available:
+            unavailable_players.append(
+                {
+                    "nombre": player.get("nombre"),
+                    "posicion": pos,
+                    "estado": player.get("estado"),
+                }
+            )
+
+    position_needs = []
+    for pos, required in minimums.items():
+        missing = max(0, required - available_by_position.get(pos, 0))
+        if missing:
+            position_needs.append(
+                {
+                    "position": pos,
+                    "missing": missing,
+                    "available": available_by_position.get(pos, 0),
+                    "required_min": required,
+                }
+            )
+    available_count = sum(1 for p in players if isinstance(p, dict) and _player_available_for_lineup(p, unavailable_names))
+    can_field_11 = available_count >= 11 and not position_needs
+    hours_to_lineup = None
+    if isinstance(market, dict):
+        raw_hours = (
+            market.get("hours_to_lineup_deadline")
+            if market.get("hours_to_lineup_deadline") is not None
+            else market.get("hours_to_first_match")
+        )
+        if raw_hours is not None:
+            hours_to_lineup = _safe_float(raw_hours, 0.0)
+    urgency = _urgency_level(hours_to_lineup, can_field_11)
+    next_lineup_deadline_at = None
+    if hours_to_lineup is not None:
+        next_lineup_deadline_at = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() + (hours_to_lineup * 3600),
+            tz=timezone.utc,
+        ).isoformat()
+
+    market_close_at = None
+    market_close_error = ""
+    try:
+        market_close_dt, market_close_error = get_market_close_datetime_utc(league_id)
+        market_close_at = market_close_dt.isoformat() if market_close_dt else None
+        hours_to_market_close = _hours_until(market_close_dt)
+    except Exception as exc:
+        hours_to_market_close = None
+        market_close_error = f"{type(exc).__name__}: {exc}"
+
+    recommendations = []
+    if isinstance(plan, dict):
+        recommendations = plan.get("non_executable_recommendations", []) or []
+    items = market.get("items", []) if isinstance(market, dict) else []
+    min_need_cost = None
+    if isinstance(items, list):
+        for need in position_needs:
+            pos = need.get("position")
+            costs = [
+                _safe_int(i.get("coste"), 0)
+                for i in items
+                if isinstance(i, dict)
+                and i.get("tipo") == "mercado"
+                and _position_key(i.get("posicion")) == pos
+                and _safe_int(i.get("coste"), 0) > 0
+            ]
+            if costs:
+                value = min(costs)
+                min_need_cost = value if min_need_cost is None else min(min_need_cost, value)
+
+    return {
+        "phase": phase,
+        "phase_kind": "market_pre" if str(phase).lower() == "pre" else phase,
+        "market_close_at": market_close_at,
+        "hours_to_market_close": hours_to_market_close,
+        "market_close_error": market_close_error,
+        "next_lineup_deadline_at": next_lineup_deadline_at,
+        "hours_to_lineup_deadline": hours_to_lineup,
+        "urgency_level": urgency,
+        "valid_lineup_status": {
+            "can_field_11": can_field_11,
+            "available_count": available_count,
+            "required_total": 11,
+            "required_min_by_position": minimums,
+            "available_by_position": available_by_position,
+            "unavailable_players": unavailable_players,
+        },
+        "position_needs": position_needs,
+        "min_market_cost_for_position_need": min_need_cost,
+        "executable_actions": proposed_actions,
+        "non_executable_recommendations": recommendations,
+        "saldo_actual": snapshot.get("saldo_disponible") if isinstance(snapshot, dict) else None,
+        "scrape_status": context.get("scrape_status", {}),
+    }
+
+
 def _clause_protection_actions_from_context(context: dict[str, Any]) -> list[dict[str, Any]]:
+    game_context = context.get("game_context", {}) if isinstance(context, dict) else {}
+    if isinstance(game_context, dict):
+        urgency = str(game_context.get("urgency_level", "")).strip().lower()
+        if urgency in {"critical", "emergency"} and game_context.get("position_needs"):
+            return []
     squad = context.get("my_squad", {}) if isinstance(context, dict) else {}
     players = squad.get("players", []) if isinstance(squad, dict) else []
     if not isinstance(players, list):
@@ -447,7 +671,7 @@ def _reject_action(action: dict[str, Any], reason: str) -> dict[str, Any]:
 def _validated_manager_actions(
     manager_decision: dict[str, Any],
     proposed_actions: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     return _validated_manager_actions_with_context(manager_decision, proposed_actions, {})
 
 
@@ -455,16 +679,17 @@ def _validated_manager_actions_with_context(
     manager_decision: dict[str, Any],
     proposed_actions: list[dict[str, Any]],
     context: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     allowed_actions = list(proposed_actions)
     allowed_actions.extend(_clause_protection_actions_from_context(context))
     proposed_by_key = {_action_key(a): a for a in allowed_actions}
     raw_actions = manager_decision.get("acciones_ejecutables", [])
     if not isinstance(raw_actions, list):
-        return [], []
+        return [], [], []
 
     selected: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+    adjusted: list[dict[str, Any]] = []
     for raw in raw_actions:
         if not isinstance(raw, dict):
             continue
@@ -477,7 +702,27 @@ def _validated_manager_actions_with_context(
             continue
         key = _action_key(candidate)
         if key in proposed_by_key:
-            selected.append(proposed_by_key[key])
+            allowed = proposed_by_key[key]
+            selected.append(allowed)
+            raw_payload = candidate.get("tool_input", {})
+            allowed_payload = allowed.get("tool_input", {}) if isinstance(allowed, dict) else {}
+            amount_fields = {
+                "sell_player_phase1_tool": "sale_price",
+                "place_bid_tool": "amount",
+                "buyout_player_tool": "clause_to_pay",
+                "increase_clause_tool": "value_to_increase",
+            }
+            amount_field = amount_fields.get(tool)
+            if amount_field and _safe_int(raw_payload.get(amount_field), 0) != _safe_int(allowed_payload.get(amount_field), 0):
+                adjusted.append(
+                    {
+                        "tool": tool,
+                        "requested_tool_input": raw_payload,
+                        "executed_tool_input": allowed_payload,
+                        "label": allowed.get("label") or _format_action_label(tool, allowed_payload),
+                        "reason": "Importe ajustado a la acción autorizada por el motor/regla determinística.",
+                    }
+                )
         else:
             rejected.append(
                 _reject_action(
@@ -486,7 +731,7 @@ def _validated_manager_actions_with_context(
                 )
             )
 
-    return selected, rejected
+    return selected, rejected, adjusted
 
 
 def _action_cost(action: dict[str, Any]) -> int:
@@ -519,6 +764,12 @@ def _financially_validated_actions(
         else 0,
         0,
     )
+    game_context = context.get("game_context", {}) if isinstance(context, dict) else {}
+    reserve_for_need = 0
+    if isinstance(game_context, dict):
+        urgency = str(game_context.get("urgency_level", "")).strip().lower()
+        if urgency in {"critical", "emergency"} and game_context.get("position_needs"):
+            reserve_for_need = _safe_int(game_context.get("min_market_cost_for_position_need"), 0)
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     ordered = sorted(
@@ -533,6 +784,14 @@ def _financially_validated_actions(
         if tool in {"place_bid_tool", "buyout_player_tool", "increase_clause_tool"}:
             if cost <= 0:
                 rejected.append(_reject_action(action, "Importe inválido para validar saldo."))
+                continue
+            if tool == "increase_clause_tool" and reserve_for_need > 0 and balance - cost < reserve_for_need:
+                rejected.append(
+                    _reject_action(
+                        action,
+                        "Subida de cláusula bloqueada: el saldo debe reservarse para cubrir una necesidad crítica de alineación.",
+                    )
+                )
                 continue
             if balance < cost:
                 rejected.append(
@@ -550,7 +809,8 @@ def _financially_validated_actions(
             if sale_price <= 0:
                 rejected.append(_reject_action(action, "Precio de venta inválido."))
                 continue
-            balance += sale_price
+            # Publicar en venta no financia compras inmediatas: el dinero llega
+            # cuando la oferta se acepta/procesa en el ciclo correspondiente.
             accepted.append(action)
             continue
         accepted.append(action)
@@ -593,6 +853,12 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
 
         proposed_actions = _actions_from_simulation(context.get("simulate_transfer_plan", {}))
         context["acciones_propuestas_motor"] = proposed_actions
+        context["game_context"] = _build_game_context(
+            context=context,
+            league_id=str(state.get("league_id", "")),
+            phase=str(state.get("phase", "")),
+            proposed_actions=proposed_actions,
+        )
         return {
             "context": context,
             "steps": _append_steps(state, steps),
@@ -608,6 +874,9 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
             "noticias": state.get("context", {}).get("news_reader_tool", {}),
             "scrape_status": state.get("context", {}).get("scrape_status", {}),
             "alineacion_actual": state.get("context", {}).get("current_lineup", {}),
+            "mercado_resumen": state.get("context", {}).get("market_opportunities", {}),
+            "simulate_transfer_plan": state.get("context", {}).get("simulate_transfer_plan", {}),
+            "game_context": state.get("context", {}).get("game_context", {}),
         }
         text, parsed = _invoke_llm(llm, ANALYST_PROMPT, payload)
         step = {
@@ -629,7 +898,10 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
             "mercado": state.get("context", {}).get("market_opportunities", {}),
             "noticias": state.get("context", {}).get("news_reader_tool", {}),
             "scrape_status": state.get("context", {}).get("scrape_status", {}),
+            "plantilla_resumen": state.get("context", {}).get("my_squad", {}),
+            "simulate_transfer_plan": state.get("context", {}).get("simulate_transfer_plan", {}),
             "acciones_propuestas_motor": state.get("context", {}).get("acciones_propuestas_motor", []),
+            "game_context": state.get("context", {}).get("game_context", {}),
         }
         text, parsed = _invoke_llm(llm, SCOUT_PROMPT, payload)
         step = {
@@ -678,6 +950,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
         execution_steps: list[dict[str, Any]] = []
         results: list[dict[str, Any]] = []
         rejected_actions: list[dict[str, Any]] = []
+        adjusted_actions: list[dict[str, Any]] = []
 
         if phase == "post":
             actions = [
@@ -694,7 +967,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
         else:
             proposed = state.get("context", {}).get("acciones_propuestas_motor", [])
             proposed = proposed if isinstance(proposed, list) else []
-            actions, rejected_actions = _validated_manager_actions_with_context(
+            actions, rejected_actions, adjusted_actions = _validated_manager_actions_with_context(
                 state.get("manager_decision", {}),
                 proposed,
                 state.get("context", {}),
@@ -732,8 +1005,10 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
                 "phase": phase,
                 "actions_count": len(results),
                 "rejected_count": len(rejected_actions),
+                "adjusted_count": len(adjusted_actions),
                 "executed_actions": results,
                 "rejected_actions": rejected_actions,
+                "adjusted_actions": adjusted_actions,
                 "results": results,
             },
             "steps": _append_steps(state, execution_steps),
@@ -744,6 +1019,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
         execution = state.get("execution", {}) or {}
         results = execution.get("executed_actions", []) if isinstance(execution, dict) else []
         rejected = execution.get("rejected_actions", []) if isinstance(execution, dict) else []
+        adjusted = execution.get("adjusted_actions", []) if isinstance(execution, dict) else []
         labels: list[str] = []
         if isinstance(results, list):
             for row in results:
@@ -756,7 +1032,9 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
             "decision_general": str(decision.get("decision_general", "")).strip(),
             "acciones_ejecutadas": labels,
             "acciones_rechazadas": rejected if isinstance(rejected, list) else [],
+            "acciones_ajustadas": adjusted if isinstance(adjusted, list) else [],
             "acciones_descartadas": decision.get("acciones_descartadas", []),
+            "recomendaciones_no_ejecutables": decision.get("recomendaciones_no_ejecutables", []),
             "riesgos_detectados": decision.get("riesgos_detectados", []),
             "siguiente_revision_recomendada": decision.get(
                 "siguiente_revision_recomendada",

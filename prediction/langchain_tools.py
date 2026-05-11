@@ -209,6 +209,8 @@ def _compress_transfer_plan(plan: dict) -> dict:
         "deuda_cubierta_estimada": plan.get("deuda_cubierta_estimada"),
         "deuda_pendiente_estimada": plan.get("deuda_pendiente_estimada"),
         "alertas": plan.get("alertas", []),
+        "priority_needs": plan.get("priority_needs", []),
+        "non_executable_recommendations": plan.get("non_executable_recommendations", []),
         "saldo_final": plan.get("saldo_final"),
         "xp_total_post": plan.get("xp_total_post"),
         "formacion_post": plan.get("formacion_post"),
@@ -249,6 +251,7 @@ def _compress_transfer_plan(plan: dict) -> dict:
                 "coste": compra.get("coste"),
                 "xP": compra.get("xP"),
                 "propietario": compra.get("propietario"),
+                "motivo": compra.get("motivo"),
             }
         out["movimientos"].append(row)
     return out
@@ -498,6 +501,7 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
             {
                 "count": min(len(items), n),
                 "hours_to_first_match": round(hours_to_match, 1),
+                "hours_to_lineup_deadline": round(hours_to_match, 1),
                 "clausulazos_available": claus_ok,
                 "clausulazos_window_source": claus_source,
                 "items": items[:n],
@@ -681,6 +685,7 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
             payload = {
                 "clausulazos_available": claus_ok,
                 "hours_to_first_match": round(hours_to_match, 1),
+                "hours_to_lineup_deadline": round(hours_to_match, 1),
                 "clausulazos_window_source": "laliga_calendar_or_fallback",
                 "summary": {
                     "modo_deuda": bool(plan.get("modo_deuda", False)),
@@ -695,6 +700,8 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
                     "movimientos": len(plan.get("movimientos", [])),
                 },
                 "plan": _compress_transfer_plan(plan),
+                "priority_needs": plan.get("priority_needs", []),
+                "non_executable_recommendations": plan.get("non_executable_recommendations", []),
             }
             finish_langsmith_span(
                 span,

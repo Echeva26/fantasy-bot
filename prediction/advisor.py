@@ -18,7 +18,7 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -188,7 +188,7 @@ def _parse_api_datetime(raw: object) -> datetime | None:
 
 def get_laliga_calendar_first_match_ts() -> tuple[int, str]:
     """
-    Obtiene el primer partido de la jornada actual desde la API de LaLiga Fantasy.
+    Obtiene el próximo primer partido futuro desde la API de LaLiga Fantasy.
 
     Esta es la fuente operativa para la regla de clausulazos, porque es la misma
     competición que aplica el bloqueo 24h. No depende de Sofascore ni de que se
@@ -216,8 +216,17 @@ def get_laliga_calendar_first_match_ts() -> tuple[int, str]:
     if not dates:
         raise RuntimeError("No se encontraron fechas de partido en /api/v3/calendar.")
 
+    now = datetime.now(timezone.utc)
+    # Si la jornada actual ya ha empezado, el mínimo global queda en el pasado y
+    # provoca urgencias falsas. Para alineación y clausulazos usamos el próximo
+    # inicio de jornada/partido que aún no haya ocurrido.
+    future_dates = sorted(dt for dt in dates if dt >= now - timedelta(minutes=5))
+    target_dates = future_dates or sorted(dates)
     week = current_week.get("weekNumber") or current_week.get("nextWeek") or "?"
-    return int(min(dates).timestamp()), f"laliga_calendar_week_{week}"
+    source = f"laliga_calendar_week_{week}"
+    if not future_dates:
+        source += "_past_only"
+    return int(target_dates[0].timestamp()), source
 
 
 def current_week_clausulazos_available(
@@ -781,6 +790,9 @@ def simulate_transfer_plan(
     saldo = team_analysis["saldo"]
     plantilla = [dict(j) for j in team_analysis["jugadores"]]
     movimientos = []
+    alertas: list[str] = []
+    priority_needs: list[dict] = []
+    non_executable_recommendations: list[dict] = []
     jugadores_vendidos_ids: set[int] = set()
     jugadores_comprados_ids: set[int] = set()
     once_actual_ids = {j["player_id"] for j in team_analysis.get("once_ideal", [])}
@@ -833,6 +845,57 @@ def simulate_transfer_plan(
             "media_pts_3j": compra.get("media_pts_5j", 0),
             "nuevo_fichaje": True,
         }
+
+    def _position_key(raw: object) -> str:
+        txt = str(raw or "").strip().upper()
+        aliases = {
+            "PT": "POR",
+            "POR": "POR",
+            "PORTERO": "POR",
+            "GK": "POR",
+            "DF": "DEF",
+            "DEF": "DEF",
+            "DEFENSA": "DEF",
+            "MC": "MED",
+            "MED": "MED",
+            "CENTROCAMPISTA": "MED",
+            "DL": "DEL",
+            "DC": "DEL",
+            "DEL": "DEL",
+            "DELANTERO": "DEL",
+        }
+        return aliases.get(txt, txt)
+
+    def _player_available(jugador: dict) -> bool:
+        estado = str(jugador.get("estado", "") or "").strip().lower()
+        if bool(jugador.get("no_disponible")):
+            return False
+        if estado and estado not in {"ok", "doubt", "warn", "apercibido"}:
+            return False
+        return True
+
+    def _coverage_needs(jugadores: list[dict]) -> list[dict]:
+        minimums = {"POR": 1, "DEF": 3, "MED": 3, "DEL": 1}
+        counts = {pos: 0 for pos in minimums}
+        for jugador in jugadores:
+            if not _player_available(jugador):
+                continue
+            pos = _position_key(jugador.get("posicion"))
+            if pos in counts:
+                counts[pos] += 1
+        needs = []
+        for pos, minimum in minimums.items():
+            missing = max(0, minimum - counts.get(pos, 0))
+            if missing:
+                needs.append(
+                    {
+                        "position": pos,
+                        "missing": missing,
+                        "available": counts.get(pos, 0),
+                        "required_min": minimum,
+                    }
+                )
+        return needs
 
     def _xp_once(jugadores: list[dict]) -> float:
         once = _calcular_once(jugadores)
@@ -1016,6 +1079,86 @@ def simulate_transfer_plan(
             })
     pool_compras.sort(key=lambda x: x.get("xP", 0), reverse=True)
 
+    # ── 0) Cobertura crítica de alineación ────────────────────
+    # Antes de optimizar xP o valor, el motor debe asegurar que existe una
+    # plantilla capaz de formar once válido. Esto evita gastar ciclos en mejoras
+    # marginales cuando falta, por ejemplo, un portero disponible.
+    for need in _coverage_needs(plantilla):
+        pos = need["position"]
+        priority_needs.append(
+            {
+                **need,
+                "reason": f"Faltan {need['missing']} jugador(es) disponible(s) en {pos} para una alineación válida.",
+            }
+        )
+        candidates = [
+            c
+            for c in pool_compras
+            if _position_key(c.get("posicion")) == pos
+            and c.get("tipo_op") == "mercado"
+            and int(c.get("player_id", 0) or 0) not in jugadores_comprados_ids
+        ]
+        candidates.sort(
+            key=lambda c: (
+                int(c.get("coste", 0) or 0) > int(saldo or 0),
+                -float(c.get("xP", 0) or 0.0),
+                int(c.get("coste", 0) or 0),
+            )
+        )
+        affordable = [c for c in candidates if int(c.get("coste", 0) or 0) <= int(saldo or 0)]
+        if not affordable:
+            cheapest = min((int(c.get("coste", 0) or 0) for c in candidates), default=0)
+            non_executable_recommendations.append(
+                {
+                    "type": "coverage_need",
+                    "position": pos,
+                    "reason": (
+                        f"Necesidad de {pos}, pero no hay candidato de mercado financiable "
+                        "con el saldo actual."
+                    ),
+                    "min_market_cost": cheapest or None,
+                    "saldo_actual": int(saldo or 0),
+                }
+            )
+            alertas.append(
+                f"Necesidad de {pos}: no hay compra financiable con saldo actual; revisar ventas/ofertas manuales."
+            )
+            continue
+
+        for compra in affordable[: int(need["missing"])]:
+            if int(compra.get("player_id", 0) or 0) in jugadores_comprados_ids:
+                continue
+            jugadores_comprados_ids.add(compra["player_id"])
+            saldo_antes = saldo
+            saldo -= int(compra["coste"])
+            plantilla.append(_crear_fichaje(compra))
+            movimientos.append(
+                {
+                    "paso": len(movimientos) + 1,
+                    "venta": None,
+                    "compra": {
+                        "player_id": compra["player_id"],
+                        "tipo": compra.get("tipo_op", "?"),
+                        "market_item_id": compra.get("market_item_id"),
+                        "player_team_id": compra.get("player_team_id"),
+                        "nombre": compra["nombre"],
+                        "posicion": compra.get("posicion", "?"),
+                        "equipo_real": compra.get("equipo_real", "?"),
+                        "xP": compra.get("xP", 0),
+                        "coste": compra["coste"],
+                        "coste_base": compra.get("coste_base", compra["coste"]),
+                        "pujas_detectadas": compra.get("pujas_detectadas", 0),
+                        "incremento_competitivo": compra.get("incremento_competitivo", 0),
+                        "propietario": compra.get("propietario", compra.get("vendedor", "")),
+                        "motivo": f"Cubrir necesidad de alineación en {pos}",
+                    },
+                    "saldo_antes": saldo_antes,
+                    "saldo_despues": saldo,
+                    "ganancia_xp": 0.0,
+                    "priority": "lineup_coverage",
+                }
+            )
+
     # ── 1) Ventas INDEPENDIENTES ──────────────────────────────
     candidatos_venta = []
     for j in plantilla:
@@ -1079,7 +1222,10 @@ def simulate_transfer_plan(
         })
 
     # ── 2) Compras INDEPENDIENTES ─────────────────────────────
-    for _ in range(MAX_COMPRAS):
+    # Si sigue faltando cobertura básica, no gastamos saldo en mejoras de otras
+    # posiciones: se informa como recomendación no ejecutable.
+    unresolved_coverage_needs = _coverage_needs(plantilla)
+    for _ in range(0 if unresolved_coverage_needs else MAX_COMPRAS):
         xp_once_antes = _xp_once(plantilla)
         ids_plantilla = {j["player_id"] for j in plantilla}
         mejor_compra = None
@@ -1155,6 +1301,9 @@ def simulate_transfer_plan(
 
     return {
         "movimientos": movimientos,
+        "priority_needs": priority_needs,
+        "non_executable_recommendations": non_executable_recommendations,
+        "alertas": alertas,
         "plantilla_final": plantilla,
         "once_post": once_post,
         "formacion_post": formacion_post,
