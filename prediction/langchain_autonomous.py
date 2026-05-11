@@ -53,6 +53,16 @@ LINEUP_REFRESH_SECONDS = 900
 LINEUP_MINUTES_BEFORE_FIRST_MATCH = 23 * 60 + 55
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default)) or default))
+    except Exception:
+        return default
+
+
+LINEUP_ERROR_RETRY_SECONDS = _env_int("LINEUP_ERROR_RETRY_SECONDS", 3600)
+
+
 def _parse_iso_dt(raw: str | None) -> datetime | None:
     if not raw:
         return None
@@ -507,6 +517,12 @@ def _maybe_run_lineup(
         new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
         return new_state, "lineup saltado: jornada ya iniciada"
 
+    last_error_at = _parse_iso_dt(new_state.get("last_lineup_error_at"))
+    if last_error_at:
+        elapsed = (datetime.now(timezone.utc) - last_error_at).total_seconds()
+        if elapsed < LINEUP_ERROR_RETRY_SECONDS:
+            return new_state, ""
+
     with langsmith_run_span(
         "fantasy-bot.daemon-lineup",
         run_type="chain",
@@ -518,15 +534,31 @@ def _maybe_run_lineup(
         extra_metadata={"trigger": "daemon", "component": "lineup-autoset"},
         inputs={"jornada": jornada, "target_ts": target_ts, "first_match_ts": first_ts},
     ) as span:
-        result = autoset_best_lineup(
-            league_id=league_id,
-            model=MODEL_TYPE,
-            day_before_only=False,
-            after_market_time="00:00",
-            timezone_name=os.getenv("TZ", "Europe/Madrid"),
-            force=True,
-            dry_run=dry_run,
-        )
+        try:
+            result = autoset_best_lineup(
+                league_id=league_id,
+                model=MODEL_TYPE,
+                day_before_only=False,
+                after_market_time="00:00",
+                timezone_name=os.getenv("TZ", "Europe/Madrid"),
+                force=True,
+                dry_run=dry_run,
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            finish_langsmith_span(
+                span,
+                {
+                    "ok": False,
+                    "applied": False,
+                    "dry_run": bool(dry_run),
+                    "jornada": jornada,
+                    "error": reason,
+                },
+            )
+            new_state["last_lineup_error_at"] = datetime.now(timezone.utc).isoformat()
+            new_state["last_lineup_error"] = reason
+            return new_state, f"lineup no aplicada: {reason}"
 
         finish_langsmith_span(
             span,
@@ -543,6 +575,8 @@ def _maybe_run_lineup(
         if result.get("applied") or result.get("dry_run"):
             new_state["last_lineup_applied_jornada"] = int(jornada)
             new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
+            new_state.pop("last_lineup_error_at", None)
+            new_state.pop("last_lineup_error", None)
             msg = (
                 "Fantasy LangChain LINEUP\n"
                 f"Jornada: {jornada}\n"
@@ -551,6 +585,8 @@ def _maybe_run_lineup(
             return new_state, msg
 
         reason = str(result.get("reason", "no aplicada"))
+        new_state["last_lineup_error_at"] = datetime.now(timezone.utc).isoformat()
+        new_state["last_lineup_error"] = reason
         return new_state, f"lineup no aplicada: {reason}"
 
 
