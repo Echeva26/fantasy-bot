@@ -66,7 +66,8 @@ REPORT_PLAN_OBJECTIVE = (
     "4) Como dry_run está activo, no habrá cambios reales ahora.\n"
     "5) Si propones subir cláusula, sé moderado: solo jugadores clave y expuestos.\n"
     "   Regla fija: cada 1M invertido sube 2M la cláusula.\n"
-    "6) Si recomiendas proteger jugadores, DEBES materializarlo llamando increase_clause_tool.\n"
+    "6) Si recomiendas proteger jugadores, solo se materializará si el ejecutor "
+    "lo valida mediante reglas determinísticas de exposición.\n"
     "7) REGLA CRÍTICA: no se puede comprar ningún jugador mediante clausulazo "
     "desde 24h antes del inicio de la jornada. Si faltan 24h o menos para el "
     "primer partido, NO llames buyout_player_tool y descarta todos los "
@@ -372,185 +373,6 @@ def _extract_agent_report_payload(output: str) -> dict:
     return {}
 
 
-def _report_recommends_clause_protection(report_payload: dict) -> bool:
-    decision = str(report_payload.get("decision_general", "")).lower()
-    siguiente = str(report_payload.get("siguiente_revision_recomendada", "")).lower()
-    riesgos = report_payload.get("riesgos_detectados", [])
-    riesgos_txt = " ".join(str(r or "") for r in riesgos) if isinstance(riesgos, list) else ""
-    riesgos_txt = riesgos_txt.lower()
-
-    all_text = " ".join([decision, siguiente, riesgos_txt]).strip()
-    if not all_text:
-        return False
-
-    has_clause_word = any(w in all_text for w in ("clausula", "cláusula", "clausul", "buyout"))
-    has_action_word = any(w in all_text for w in ("aument", "sub", "proteg", "blind", "evaluar"))
-    has_exposure_signal = any(
-        w in all_text
-        for w in ("exposicion a clausulazo", "exposición a clausulazo", "ratio valor_vs_clausula", "muy vulnerable")
-    )
-
-    return (has_clause_word and has_action_word) or (has_clause_word and has_exposure_signal)
-
-
-def _extract_clause_names_from_report(report_payload: dict) -> list[str]:
-    names: list[str] = []
-    seen: set[str] = set()
-    decision_names: list[str] = []
-
-    def _push(name_raw: object) -> None:
-        name = str(name_raw or "").strip()
-        if not name:
-            return
-        name = re.sub(r"^[\-\d\.\)\s]+", "", name).strip()
-        if "(" in name:
-            name = name.split("(", 1)[0].strip()
-        if not name:
-            return
-        key = _norm(name)
-        if not key or key in seen:
-            return
-        seen.add(key)
-        names.append(name)
-
-    decision = str(report_payload.get("decision_general", "") or "")
-    m = re.search(r"proteger\s+a\s+([^.;]+)", decision, flags=re.IGNORECASE)
-    if m:
-        chunk = m.group(1).replace(" y ", ",")
-        for raw in chunk.split(","):
-            _push(raw)
-        decision_names = list(names)
-
-    if decision_names:
-        return decision_names
-
-    riesgos = report_payload.get("riesgos_detectados", [])
-    if isinstance(riesgos, list):
-        for row in riesgos:
-            txt = str(row or "").strip()
-            if not txt:
-                continue
-            if "clausul" not in txt.lower():
-                continue
-            chunk = txt.split(":", 1)[1] if ":" in txt else txt
-            for raw in chunk.split(","):
-                _push(raw)
-
-    return names
-
-
-def _extract_my_squad_players_from_steps(steps: list[dict]) -> list[dict]:
-    for step in reversed(steps):
-        if str(step.get("tool", "")).strip() != "my_squad":
-            continue
-        payload = _json_dict_from_text(step.get("observation"))
-        players = payload.get("players")
-        if isinstance(players, list):
-            return [p for p in players if isinstance(p, dict)]
-    return []
-
-
-def _recommended_clause_increase_value(player: dict) -> int:
-    market_value = _safe_int(player.get("valor_mercado"), 0)
-    clause_value = _safe_int(player.get("clausula"), 0)
-    if market_value <= 0:
-        return 1_000_000
-
-    target_clause = int(market_value * 1.08)
-    delta = max(0, target_clause - max(0, clause_value))
-    invest = max(1_000_000, min(3_000_000, (delta + 1) // 2))
-    # Redondeo a 100k para importes limpios.
-    invest = ((invest + 99_999) // 100_000) * 100_000
-    return int(invest)
-
-
-def _build_clause_actions_from_report(report_payload: dict, steps: list[dict]) -> list[dict]:
-    if not _report_recommends_clause_protection(report_payload):
-        return []
-
-    players = _extract_my_squad_players_from_steps(steps)
-    if not players:
-        return []
-
-    by_name: dict[str, dict] = {}
-    for p in players:
-        ptid = str(p.get("player_team_id", "")).strip()
-        name = str(p.get("nombre", "")).strip()
-        if name:
-            by_name[_norm(name)] = p
-
-    names = _extract_clause_names_from_report(report_payload)
-    selected: list[dict] = []
-    selected_ptids: set[str] = set()
-
-    for name in names:
-        p = by_name.get(_norm(name))
-        if not p:
-            continue
-        ptid = str(p.get("player_team_id", "")).strip()
-        if not ptid or ptid in selected_ptids:
-            continue
-        selected.append(p)
-        selected_ptids.add(ptid)
-        if len(selected) >= 3:
-            break
-
-    target_recommended = 2
-    if not selected:
-        exposed = sorted(
-            players,
-            key=lambda x: _safe_float(x.get("ratio_valor_vs_clausula"), 0.0),
-            reverse=True,
-        )
-        for p in exposed:
-            ratio = _safe_float(p.get("ratio_valor_vs_clausula"), 0.0)
-            if ratio < 0.88:
-                continue
-            ptid = str(p.get("player_team_id", "")).strip()
-            if not ptid or ptid in selected_ptids:
-                continue
-            selected.append(p)
-            selected_ptids.add(ptid)
-            if len(selected) >= target_recommended:
-                break
-    elif len(selected) < target_recommended:
-        exposed = sorted(
-            players,
-            key=lambda x: _safe_float(x.get("ratio_valor_vs_clausula"), 0.0),
-            reverse=True,
-        )
-        for p in exposed:
-            ratio = _safe_float(p.get("ratio_valor_vs_clausula"), 0.0)
-            if ratio < 0.88:
-                continue
-            ptid = str(p.get("player_team_id", "")).strip()
-            if not ptid or ptid in selected_ptids:
-                continue
-            selected.append(p)
-            selected_ptids.add(ptid)
-            if len(selected) >= target_recommended:
-                break
-
-    actions: list[dict] = []
-    for p in selected:
-        ptid = str(p.get("player_team_id", "")).strip()
-        if not ptid:
-            continue
-        payload = {
-            "player_team_id": ptid,
-            "value_to_increase": _recommended_clause_increase_value(p),
-            "nombre": str(p.get("nombre", "")).strip(),
-        }
-        actions.append(
-            {
-                "tool": "increase_clause_tool",
-                "tool_input": payload,
-                "label": _format_action_label("increase_clause_tool", payload),
-            }
-        )
-    return actions
-
-
 def _format_tools_used(steps: list[dict], limit: int = 8) -> str:
     tool_names: list[str] = []
     for s in steps:
@@ -563,6 +385,15 @@ def _format_tools_used(steps: list[dict], limit: int = 8) -> str:
     if len(tool_names) > limit:
         out += ", ..."
     return out
+
+
+def _extract_step_payload(steps: list[dict], tool_name: str) -> dict:
+    for step in reversed(steps):
+        if str(step.get("tool", "")).strip() != tool_name:
+            continue
+        payload = _json_dict_from_text(step.get("observation"))
+        return payload if isinstance(payload, dict) else {}
+    return {}
 
 
 def _build_informe_message(
@@ -593,12 +424,8 @@ def _build_informe_message(
     source_txt = {
         "tool_calls": "tools ejecutables del agente",
         "simulate_transfer_plan": "plan de simulacion del motor",
-        "simulate_transfer_plan+report_clause_fallback": "plan de simulacion + clausulas sugeridas",
-        "tool_calls+report_clause_fallback": "tools ejecutables + clausulas sugeridas",
         "tool_calls+debt_filter": "tools ejecutables filtradas por modo deuda",
         "simulate_transfer_plan+debt_filter": "plan de simulacion filtrado por modo deuda",
-        "simulate_transfer_plan+report_clause_fallback+debt_filter": "plan de simulacion filtrado por modo deuda",
-        "tool_calls+report_clause_fallback+debt_filter": "tools ejecutables filtradas por modo deuda",
         "none": "sin plan ejecutable detectado",
     }.get(action_source, action_source)
 
@@ -628,6 +455,24 @@ def _build_informe_message(
         if movs not in (None, ""):
             sim_rows.append(f"Movimientos simulados: {_safe_int(movs, 0)}")
 
+    scrape_status = _extract_step_payload(steps, "ensure_fresh_scrapes")
+    news_payload = _extract_step_payload(steps, "news_reader_tool")
+    news_rows: list[str] = []
+    if scrape_status:
+        if bool(scrape_status.get("ok")):
+            suffix = "tras refrescar" if scrape_status.get("ran_scraper") else "sin refrescar"
+            news_rows.append(f"Scrapes frescos ({suffix})")
+        else:
+            reason = scrape_status.get("error") or scrape_status.get("reason") or "sin detalle"
+            news_rows.append(f"Scrapes degradados: {_compact_text(reason, 180)}")
+    if news_payload:
+        if news_payload.get("fresh") is False:
+            reason = news_payload.get("reason") or "snapshot obsoleto"
+            news_rows.append(f"Noticias no frescas: {_compact_text(reason, 180)}")
+        elif news_payload.get("ok") is False:
+            reason = news_payload.get("reason") or "sin noticias locales"
+            news_rows.append(f"Noticias no disponibles: {_compact_text(reason, 180)}")
+
     action_rows: list[str] = []
     if actions:
         for idx, action in enumerate(actions[:8], 1):
@@ -641,7 +486,7 @@ def _build_informe_message(
     else:
         action_rows = [
             "No se detectaron acciones ejecutables en este informe.",
-            "Si el texto recomienda operar, vuelve a lanzar /informe para regenerar el plan del ciclo.",
+            "Si el texto recomienda operar, no se cacheará hasta que el motor lo valide.",
         ]
 
     sections: list[tuple[str, list[str] | str]] = [
@@ -649,6 +494,8 @@ def _build_informe_message(
     ]
     if sim_rows:
         sections.append(("Simulación", sim_rows))
+    if news_rows:
+        sections.append(("Noticias", news_rows))
     sections.append(("Acciones propuestas", action_rows))
     if decision:
         sections.append(("Decisión IA", decision))
@@ -678,12 +525,8 @@ def _build_compraventa_message(
     source_txt = {
         "tool_calls": "tools ejecutables del agente",
         "simulate_transfer_plan": "plan de simulacion cacheado",
-        "simulate_transfer_plan+report_clause_fallback": "plan cacheado + clausulas sugeridas",
-        "tool_calls+report_clause_fallback": "tools ejecutables + clausulas sugeridas",
         "tool_calls+debt_filter": "tools ejecutables filtradas por modo deuda",
         "simulate_transfer_plan+debt_filter": "plan cacheado filtrado por modo deuda",
-        "simulate_transfer_plan+report_clause_fallback+debt_filter": "plan cacheado filtrado por modo deuda",
-        "tool_calls+report_clause_fallback+debt_filter": "tools ejecutables filtradas por modo deuda",
         "none": "origen no informado",
     }.get(str(action_source), str(action_source or "none"))
 
@@ -1382,25 +1225,12 @@ def _run_langchain_agent_cmd(
                 steps = res.get("steps", []) or []
                 simulation_payload = _extract_latest_simulation_payload(steps)
                 actions, action_source = _extract_executable_actions(steps)
-                report_payload = _extract_agent_report_payload(output)
                 sim_summary = (
                     simulation_payload.get("summary")
                     if isinstance(simulation_payload.get("summary"), dict)
                     else {}
                 )
                 debt_mode = _summary_requires_debt_mode(sim_summary)
-                if (
-                    not debt_mode
-                    and not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions)
-                ):
-                    inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
-                    if inferred_clause_actions:
-                        actions.extend(inferred_clause_actions)
-                        action_source = (
-                            "tool_calls+report_clause_fallback"
-                            if action_source == "tool_calls"
-                            else "simulate_transfer_plan+report_clause_fallback"
-                        )
                 if debt_mode:
                     filtered_actions = _filter_debt_mode_actions(actions)
                     if len(filtered_actions) != len(actions):

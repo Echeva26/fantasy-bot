@@ -21,6 +21,7 @@ from prediction.langsmith_config import (
     langsmith_trace_context,
 )
 from prediction.langchain_tools import FantasyAgentRuntime, build_langchain_tools
+from prediction.scrape_freshness import ensure_fresh_scrapes
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,8 @@ Devuelve JSON válido con:
   "riesgos": ["..."]
 }
 No inventes ids. Si falta un dato, dilo como riesgo.
+Si `scrape_status.ok` es false o `noticias.fresh` es false, añade un riesgo
+explícito de noticias locales no frescas/degradadas.
 """
 
 SCOUT_PROMPT = """
@@ -90,6 +93,8 @@ Devuelve JSON válido con:
   "riesgos_mercado": ["..."]
 }
 No inventes ids. Si falta un dato, dilo como riesgo.
+Si `scrape_status.ok` es false o `noticias.fresh` es false, marca noticias
+locales degradadas y evita presentar lesiones/sanciones como confirmadas.
 """
 
 MANAGER_PROMPT = """
@@ -114,6 +119,12 @@ Reglas:
    nulo, considerando cláusula, valor de mercado, expected points e impacto
    marginal en el once. No vendas jugadores si eso impide alinear una formación
    válida; ejemplo: si solo hay un portero, no lo vendas.
+8. Si `acciones_propuestas_motor` está vacío, NO incluyas compraventas
+   ejecutables. Puedes explicar recomendaciones, riesgos o acciones manuales,
+   pero deja `acciones_ejecutables` vacío salvo protección de cláusula moderada
+   de un jugador clave y expuesto.
+9. Si `scrape_status.ok` es false o `news_reader_tool.fresh` es false, continúa
+   con aviso explícito en riesgos; no ocultes que las noticias están degradadas.
 
 Devuelve JSON válido con:
 {
@@ -240,6 +251,13 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return int(default)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
 
 
 def _money_short(value: Any) -> str:
@@ -375,37 +393,168 @@ def _action_key(action: dict[str, Any]) -> tuple[str, str]:
     return tool, json.dumps(payload, sort_keys=True, default=str)
 
 
+def _clause_protection_actions_from_context(context: dict[str, Any]) -> list[dict[str, Any]]:
+    squad = context.get("my_squad", {}) if isinstance(context, dict) else {}
+    players = squad.get("players", []) if isinstance(squad, dict) else []
+    if not isinstance(players, list):
+        return []
+    invest = _safe_int(os.getenv("CLAUSE_PROTECTION_INVESTMENT", "50000"), 50000)
+    invest = max(1, min(invest, 250_000))
+    actions: list[dict[str, Any]] = []
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        ptid = str(player.get("player_team_id", "")).strip()
+        if not ptid:
+            continue
+        estado = str(player.get("estado", "")).strip().lower()
+        if estado and estado not in {"ok", "doubt", "warn"}:
+            continue
+        if bool(player.get("en_venta")):
+            continue
+        ratio = _safe_float(player.get("ratio_valor_vs_clausula"), 0.0)
+        xp = _safe_float(player.get("xP"), 0.0)
+        if ratio < 0.88 or xp < 5.0:
+            continue
+        payload = {
+            "player_team_id": ptid,
+            "value_to_increase": invest,
+            "nombre": str(player.get("nombre", "")).strip(),
+        }
+        actions.append(
+            {
+                "tool": "increase_clause_tool",
+                "tool_input": payload,
+                "label": _format_action_label("increase_clause_tool", payload),
+                "source": "deterministic_clause_protection",
+            }
+        )
+    return actions
+
+
+def _reject_action(action: dict[str, Any], reason: str) -> dict[str, Any]:
+    tool = str(action.get("tool", "")).strip()
+    payload = action.get("tool_input")
+    payload = payload if isinstance(payload, dict) else {}
+    return {
+        "tool": tool,
+        "tool_input": payload,
+        "label": action.get("label") or _format_action_label(tool, payload),
+        "reason": reason,
+    }
+
+
 def _validated_manager_actions(
     manager_decision: dict[str, Any],
     proposed_actions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    proposed_by_key = {_action_key(a): a for a in proposed_actions}
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    return _validated_manager_actions_with_context(manager_decision, proposed_actions, {})
+
+
+def _validated_manager_actions_with_context(
+    manager_decision: dict[str, Any],
+    proposed_actions: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    allowed_actions = list(proposed_actions)
+    allowed_actions.extend(_clause_protection_actions_from_context(context))
+    proposed_by_key = {_action_key(a): a for a in allowed_actions}
     raw_actions = manager_decision.get("acciones_ejecutables", [])
     if not isinstance(raw_actions, list):
-        return proposed_actions
+        return [], []
 
     selected: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
     for raw in raw_actions:
         if not isinstance(raw, dict):
             continue
         tool = str(raw.get("tool", "")).strip()
         payload = raw.get("tool_input")
         payload = payload if isinstance(payload, dict) else {}
-        if tool not in ALLOWED_EXECUTION_TOOLS:
-            continue
         candidate = {"tool": tool, "tool_input": payload}
-        key = _action_key(candidate)
-        if tool == "increase_clause_tool":
-            ptid = str(payload.get("player_team_id", "")).strip()
-            amount = _safe_int(payload.get("value_to_increase"), 0)
-            if ptid and amount > 0:
-                candidate["label"] = _format_action_label(tool, payload)
-                selected.append(candidate)
+        if tool not in ALLOWED_EXECUTION_TOOLS:
+            rejected.append(_reject_action(candidate, "Herramienta no permitida por el ejecutor."))
             continue
+        key = _action_key(candidate)
         if key in proposed_by_key:
             selected.append(proposed_by_key[key])
+        else:
+            rejected.append(
+                _reject_action(
+                    candidate,
+                    "Acción no generada por el motor ni por reglas determinísticas.",
+                )
+            )
 
-    return selected if selected else proposed_actions
+    return selected, rejected
+
+
+def _action_cost(action: dict[str, Any]) -> int:
+    tool = str(action.get("tool", "")).strip()
+    payload = action.get("tool_input")
+    payload = payload if isinstance(payload, dict) else {}
+    if tool == "sell_player_phase1_tool":
+        return -_safe_int(payload.get("sale_price"), 0)
+    if tool == "place_bid_tool":
+        return _safe_int(payload.get("amount"), 0)
+    if tool == "buyout_player_tool":
+        return _safe_int(payload.get("clause_to_pay"), 0)
+    if tool == "increase_clause_tool":
+        return _safe_int(payload.get("value_to_increase"), 0)
+    return 0
+
+
+def _financially_validated_actions(
+    actions: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    snapshot = context.get("snapshot_summary", {}) if isinstance(context, dict) else {}
+    simulation = context.get("simulate_transfer_plan", {}) if isinstance(context, dict) else {}
+    summary = simulation.get("summary", {}) if isinstance(simulation, dict) else {}
+    balance = _safe_int(
+        summary.get("saldo_actual")
+        if isinstance(summary, dict) and summary.get("saldo_actual") is not None
+        else snapshot.get("saldo_disponible")
+        if isinstance(snapshot, dict)
+        else 0,
+        0,
+    )
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    ordered = sorted(
+        actions,
+        key=lambda a: 0
+        if str(a.get("tool", "")).strip() == "sell_player_phase1_tool"
+        else 1,
+    )
+    for action in ordered:
+        tool = str(action.get("tool", "")).strip()
+        cost = _action_cost(action)
+        if tool in {"place_bid_tool", "buyout_player_tool", "increase_clause_tool"}:
+            if cost <= 0:
+                rejected.append(_reject_action(action, "Importe inválido para validar saldo."))
+                continue
+            if balance < cost:
+                rejected.append(
+                    _reject_action(
+                        action,
+                        f"Saldo insuficiente: requiere {_money_short(cost)} y hay {_money_short(balance)}.",
+                    )
+                )
+                continue
+            balance -= cost
+            accepted.append(action)
+            continue
+        if tool == "sell_player_phase1_tool":
+            sale_price = -cost
+            if sale_price <= 0:
+                rejected.append(_reject_action(action, "Precio de venta inválido."))
+                continue
+            balance += sale_price
+            accepted.append(action)
+            continue
+        accepted.append(action)
+    return accepted, rejected
 
 
 def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
@@ -418,6 +567,18 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
         tools = state["tools"]
         context: dict[str, Any] = {}
         steps: list[dict[str, Any]] = []
+        scrape_status = ensure_fresh_scrapes()
+        context["scrape_status"] = scrape_status.to_dict()
+        steps.append(
+            {
+                "tool": "ensure_fresh_scrapes",
+                "tool_input": {
+                    "max_age_minutes": os.getenv("SCRAPES_MAX_AGE_MINUTES", "120"),
+                    "timeout_seconds": os.getenv("SCRAPER_TIMEOUT_SECONDS", "90"),
+                },
+                "observation": json.dumps(scrape_status.to_dict(), ensure_ascii=False),
+            }
+        )
         for name, payload in (
             ("snapshot_summary", {"force_refresh": True}),
             ("my_squad", {"force_refresh": False}),
@@ -445,6 +606,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
             "snapshot": state.get("context", {}).get("snapshot_summary", {}),
             "plantilla": state.get("context", {}).get("my_squad", {}),
             "noticias": state.get("context", {}).get("news_reader_tool", {}),
+            "scrape_status": state.get("context", {}).get("scrape_status", {}),
             "alineacion_actual": state.get("context", {}).get("current_lineup", {}),
         }
         text, parsed = _invoke_llm(llm, ANALYST_PROMPT, payload)
@@ -466,6 +628,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
             "snapshot": state.get("context", {}).get("snapshot_summary", {}),
             "mercado": state.get("context", {}).get("market_opportunities", {}),
             "noticias": state.get("context", {}).get("news_reader_tool", {}),
+            "scrape_status": state.get("context", {}).get("scrape_status", {}),
             "acciones_propuestas_motor": state.get("context", {}).get("acciones_propuestas_motor", []),
         }
         text, parsed = _invoke_llm(llm, SCOUT_PROMPT, payload)
@@ -514,6 +677,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
         phase = str(state.get("phase", "full")).strip().lower()
         execution_steps: list[dict[str, Any]] = []
         results: list[dict[str, Any]] = []
+        rejected_actions: list[dict[str, Any]] = []
 
         if phase == "post":
             actions = [
@@ -530,7 +694,16 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
         else:
             proposed = state.get("context", {}).get("acciones_propuestas_motor", [])
             proposed = proposed if isinstance(proposed, list) else []
-            actions = _validated_manager_actions(state.get("manager_decision", {}), proposed)
+            actions, rejected_actions = _validated_manager_actions_with_context(
+                state.get("manager_decision", {}),
+                proposed,
+                state.get("context", {}),
+            )
+            actions, financial_rejected = _financially_validated_actions(
+                actions,
+                state.get("context", {}),
+            )
+            rejected_actions.extend(financial_rejected)
 
         for action in actions:
             if not isinstance(action, dict):
@@ -539,13 +712,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
             payload = action.get("tool_input")
             payload = payload if isinstance(payload, dict) else {}
             if tool_name not in tools:
-                results.append(
-                    {
-                        "tool": tool_name,
-                        "ok": False,
-                        "error": "Herramienta no registrada.",
-                    }
-                )
+                rejected_actions.append(_reject_action(action, "Herramienta no registrada."))
                 continue
             observation, step = _invoke_tool(tools, tool_name, payload)
             execution_steps.append(step)
@@ -564,6 +731,9 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
                 "dry_run": bool(state.get("dry_run", False)),
                 "phase": phase,
                 "actions_count": len(results),
+                "rejected_count": len(rejected_actions),
+                "executed_actions": results,
+                "rejected_actions": rejected_actions,
                 "results": results,
             },
             "steps": _append_steps(state, execution_steps),
@@ -572,7 +742,8 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
     def final_node(state: FantasyGraphState) -> dict[str, Any]:
         decision = state.get("manager_decision", {}) or {}
         execution = state.get("execution", {}) or {}
-        results = execution.get("results", []) if isinstance(execution, dict) else []
+        results = execution.get("executed_actions", []) if isinstance(execution, dict) else []
+        rejected = execution.get("rejected_actions", []) if isinstance(execution, dict) else []
         labels: list[str] = []
         if isinstance(results, list):
             for row in results:
@@ -584,6 +755,7 @@ def _build_graph(llm: Any, *, verbose: bool = False) -> Any:
         output_payload = {
             "decision_general": str(decision.get("decision_general", "")).strip(),
             "acciones_ejecutadas": labels,
+            "acciones_rechazadas": rejected if isinstance(rejected, list) else [],
             "acciones_descartadas": decision.get("acciones_descartadas", []),
             "riesgos_detectados": decision.get("riesgos_detectados", []),
             "siguiente_revision_recomendada": decision.get(

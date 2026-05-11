@@ -32,6 +32,12 @@ from prediction.advisor import (
 from prediction.advisor_execute import execute_movements, run_aceptar_ofertas
 from prediction.langsmith_config import finish_langsmith_span, langsmith_run_span
 from prediction.lineup_autoset import autoset_best_lineup
+from prediction.scrape_freshness import (
+    latest_scrape_file,
+    max_age_minutes,
+    scrape_age_minutes,
+    scrapes_dir,
+)
 
 logger = logging.getLogger(__name__)
 MODEL_TYPE = "xgboost"
@@ -507,38 +513,55 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         apercibidos y movimientos de mercado relevantes para mi plantilla y
         jugadores disponibles.
         """
-        scrapes_dir = Path(__file__).parent.parent / "scrapes"
-        if not scrapes_dir.exists():
+        scrape_dir = scrapes_dir()
+        if not scrape_dir.exists():
             return _as_json(
                 {
                     "ok": False,
+                    "fresh": False,
+                    "stale": True,
                     "source": "scrapes",
+                    "latest_file": "",
+                    "age_minutes": None,
                     "reason": "No existe el directorio scrapes/. Ejecuta python -m scrapers.scrape_all.",
                     "items": [],
                 }
             )
 
-        files = sorted(
-            [p for p in scrapes_dir.iterdir() if p.is_file() and p.suffix == ".json"],
-            reverse=True,
-        )
-        if not files:
+        latest = latest_scrape_file(scrape_dir)
+        if latest is None:
             return _as_json(
                 {
                     "ok": False,
+                    "fresh": False,
+                    "stale": True,
                     "source": "scrapes",
+                    "latest_file": "",
+                    "age_minutes": None,
                     "reason": "No hay snapshots JSON en scrapes/. Ejecuta python -m scrapers.scrape_all.",
                     "items": [],
                 }
             )
 
-        latest = files[0]
+        age = scrape_age_minutes(latest)
+        max_age = max_age_minutes()
+        fresh = age <= max_age
+        stale_reason = (
+            ""
+            if fresh
+            else f"Último scrape obsoleto ({age:.1f} min > {max_age} min)."
+        )
         try:
             data = json.loads(latest.read_text(encoding="utf-8"))
         except Exception as exc:
             return _as_json(
                 {
                     "ok": False,
+                    "fresh": False,
+                    "stale": True,
+                    "source": "scrapes",
+                    "latest_file": str(latest),
+                    "age_minutes": round(age, 1),
                     "source_file": str(latest),
                     "reason": f"No se pudo leer el scrape: {type(exc).__name__}: {exc}",
                     "items": [],
@@ -622,9 +645,14 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
         return _as_json(
             {
                 "ok": True,
+                "fresh": fresh,
+                "stale": not fresh,
                 "source": "scrapes",
+                "latest_file": str(latest),
+                "age_minutes": round(age, 1),
                 "source_file": str(latest),
                 "scraped_at": data.get("scraped_at") if isinstance(data, dict) else None,
+                "reason": stale_reason,
                 "counts": {
                     "lesionados": len(ff.get("lesionados", []) or []) if isinstance(ff, dict) else 0,
                     "sancionados": len(ff.get("sancionados", []) or []) if isinstance(ff, dict) else 0,

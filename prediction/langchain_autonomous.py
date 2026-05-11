@@ -34,11 +34,9 @@ from prediction.telegram_messages import (
 from prediction.telegram_notify import send_telegram_message
 from prediction.token_bot import (
     REPORT_PLAN_OBJECTIVE,
-    _build_clause_actions_from_report,
     _build_compraventa_message,
     _build_informe_message,
     _execute_cached_actions,
-    _extract_agent_report_payload,
     _extract_executable_actions,
     _extract_latest_simulation_payload,
     _now_iso,
@@ -305,16 +303,6 @@ def _run_pre_informe_plus_compraventa(
         steps = res.get("steps", []) or []
         simulation_payload = _extract_latest_simulation_payload(steps)
         actions, action_source = _extract_executable_actions(steps)
-        report_payload = _extract_agent_report_payload(output)
-        if not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions):
-            inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
-            if inferred_clause_actions:
-                actions.extend(inferred_clause_actions)
-                action_source = (
-                    "tool_calls+report_clause_fallback"
-                    if action_source == "tool_calls"
-                    else "simulate_transfer_plan+report_clause_fallback"
-                )
 
         sim_summary = (
             simulation_payload.get("summary")
