@@ -42,8 +42,9 @@ from prediction.telegram_messages import (
     build_help_message,
     build_progress_message,
     build_standard_message,
+    build_token_renewal_message,
 )
-from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
+from prediction.telegram_notify import send_telegram_message
 
 logger = logging.getLogger(__name__)
 
@@ -1784,15 +1785,22 @@ def _handle_text(
     t = text.strip().lower()
     if t.startswith("/start") or t.startswith("/help"):
         return False, build_help_message()
+
+    if t.startswith("/token") or t.startswith("/renovar"):
+        token_max_age = float(os.getenv("TOKEN_MAX_AGE_HOURS", "23"))
+        status, age_h = _token_status(max_age_hours=token_max_age)
+        # Aunque el token siga vivo, /token debe devolver SIEMPRE el flujo de
+        # renovación con la URL completa: el usuario lo lanza precisamente
+        # cuando quiere renovar antes de la caducidad.
+        renewal_status = status if status != "ok" else "renovacion_manual"
+        return False, build_token_renewal_message(
+            status=renewal_status, age_h=age_h
+        )
+
     if t.startswith("/status"):
         age = _token_age_hours()
         if age is None:
-            return False, build_standard_message(
-                title="🩺 Estado del bot",
-                status="Token no disponible",
-                sections=[("Token", ["No hay token válido guardado."])],
-                footer="Renueva el token siguiendo /help.",
-            )
+            return False, build_token_renewal_message(status="missing")
         return False, build_standard_message(
             title="🩺 Estado del bot",
             status="Operativo",
@@ -1900,6 +1908,7 @@ def _set_bot_commands(bot_token: str) -> None:
         {"command": "ligas", "description": "Listar ligas disponibles"},
         {"command": "liga", "description": "Seleccionar liga por nombre"},
         {"command": "status", "description": "Estado del token"},
+        {"command": "token", "description": "Enviar enlace para renovar el token"},
         {"command": "help", "description": "Ayuda y lista de comandos"},
     ]
     try:
@@ -1943,24 +1952,8 @@ def run_token_bot(
     if notify_chat_id:
         token_max_age = float(os.getenv("TOKEN_MAX_AGE_HOURS", "23"))
         status, age_h = _token_status(max_age_hours=token_max_age)
-        if status == "missing":
-            msg = build_standard_message(
-                title="🔐 Token LaLiga",
-                status="Ausente",
-                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
-            )
-        elif status == "expired":
-            msg = build_standard_message(
-                title="🔐 Token LaLiga",
-                status=f"Caducado · edad ~{age_h:.1f}h",
-                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
-            )
-        elif status == "invalid":
-            msg = build_standard_message(
-                title="🔐 Token LaLiga",
-                status="Inválido",
-                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
-            )
+        if status in ("missing", "expired", "invalid"):
+            msg = build_token_renewal_message(status=status, age_h=age_h)
         else:
             msg = build_standard_message(
                 title="🤖 Fantasy Bot iniciado",

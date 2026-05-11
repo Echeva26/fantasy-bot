@@ -7,12 +7,5 @@ services:
       - ./:/app
     env_file:
       - .env
-    environment:
-      - TZ=${TZ:-Europe/Madrid}
-      - LANGSMITH_TRACING=${LANGSMITH_TRACING:-false}
-      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY:-}
-      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-fantasy-bot}
-      - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
-      - LANGCHAIN_CALLBACKS_BACKGROUND=${LANGCHAIN_CALLBACKS_BACKGROUND:-true}
     command: ["python", "-m", "prediction.docker_langchain_autonomous"]
     restart: unless-stopped

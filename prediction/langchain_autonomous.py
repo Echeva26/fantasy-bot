@@ -29,8 +29,9 @@ from prediction.telegram_messages import (
     build_agent_cycle_message,
     build_error_message,
     build_standard_message,
+    build_token_renewal_message,
 )
-from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
+from prediction.telegram_notify import send_telegram_message
 from prediction.token_bot import (
     REPORT_PLAN_OBJECTIVE,
     _build_clause_actions_from_report,
@@ -146,24 +147,7 @@ def _maybe_alert_token_issue(state: dict, cooldown_minutes: int) -> dict:
     )
 
     if should_alert:
-        if status == "expired":
-            msg = build_standard_message(
-                title="🔐 Token LaLiga",
-                status=f"Caducado · edad ~{(age_h or 0.0):.1f}h",
-                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
-            )
-        elif status == "missing":
-            msg = build_standard_message(
-                title="🔐 Token LaLiga",
-                status="Ausente",
-                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
-            )
-        else:
-            msg = build_standard_message(
-                title="🔐 Token LaLiga",
-                status="Inválido",
-                sections=[("Renovación", GUIDA_RENOVACION_TOKEN.splitlines())],
-            )
+        msg = build_token_renewal_message(status=status, age_h=age_h)
         logger.warning(msg.replace("\n", " | "))
         _notify(msg, parse_mode=TELEGRAM_PARSE_MODE)
         new_state["token_alert_at"] = now_utc.isoformat()

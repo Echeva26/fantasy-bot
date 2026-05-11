@@ -98,11 +98,61 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _maybe_disable_langsmith_on_forbidden() -> None:
+    """
+    Evita spam de warnings cuando LANGSMITH_TRACING está activo pero la API responde 403.
+
+    En ese caso deshabilitamos tracing en caliente para que el bot siga funcionando
+    sin ruido en logs.
+    """
+    tracing = os.getenv("LANGSMITH_TRACING", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    api_key = os.getenv("LANGSMITH_API_KEY", "").strip()
+    if not tracing or not api_key:
+        return
+
+    try:
+        from langsmith import Client
+        from langsmith.utils import LangSmithError
+    except Exception:
+        return
+
+    try:
+        # Un request ligero para validar credenciales/permisos.
+        # Si esto falla con 403, el backend rechazará igualmente /runs/multipart.
+        client = Client(
+            api_url=os.getenv("LANGSMITH_ENDPOINT", "").strip() or None,
+            api_key=api_key,
+        )
+        next(client.list_projects(limit=1), None)
+    except LangSmithError as exc:
+        msg = str(exc)
+        if "403" in msg or "Forbidden" in msg:
+            os.environ["LANGSMITH_TRACING"] = "false"
+            os.environ["LANGCHAIN_TRACING_V2"] = "false"
+            for name in ("langsmith", "langsmith.client", "langsmith.utils"):
+                logging.getLogger(name).setLevel(logging.ERROR)
+            logger.warning(
+                "LangSmith devuelve 403 (Forbidden). Deshabilitando tracing para evitar spam en logs. "
+                "Revisa permisos del API key / workspace / endpoint."
+            )
+        else:
+            logger.debug("LangSmith no disponible (se ignora): %s", exc)
+    except Exception as exc:
+        logger.debug("Chequeo LangSmith falló (se ignora): %s", exc)
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+    _maybe_disable_langsmith_on_forbidden()
     parser = build_parser()
     args = parser.parse_args()
 
