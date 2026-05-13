@@ -235,6 +235,9 @@ def _compress_transfer_plan(plan: dict) -> dict:
                 "valor_mercado": venta.get("valor_mercado"),
                 "clausula": venta.get("clausula"),
                 "ratio_clausula_valor": venta.get("ratio_clausula_valor"),
+                "ratio_valor_xp": venta.get("ratio_valor_xp"),
+                "xp_esperado_por_valor_log": venta.get("xp_esperado_por_valor_log"),
+                "brecha_xp_valor_log": venta.get("brecha_xp_valor_log"),
                 "precio_publicacion": venta.get("precio_publicacion"),
                 "motivo": venta.get("motivo"),
                 "xP": venta.get("xP"),
@@ -906,6 +909,31 @@ def build_langchain_tools(runtime: FantasyAgentRuntime) -> list:
                         "ok": False,
                         "error": "No se encontró ese player_team_id en tu plantilla actual.",
                         "player_team_id": ptid,
+                    }
+                )
+
+            if bool(selected.get("en_venta")):
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "skipped": True,
+                        "already_on_market": True,
+                        "player_team_id": ptid,
+                        "nombre": selected.get("nombre"),
+                    },
+                )
+                return _as_json(
+                    {
+                        "ok": True,
+                        "skipped": True,
+                        "action": "sell_player_phase1",
+                        "already_on_market": True,
+                        "player_team_id": ptid,
+                        "nombre": selected.get("nombre"),
+                        "precio_venta": selected.get("precio_venta"),
+                        "market_player_id": selected.get("market_player_id"),
+                        "reason": "Venta omitida: el jugador ya esta publicado en el mercado.",
                     }
                 )
 

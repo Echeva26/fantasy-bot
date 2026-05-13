@@ -73,16 +73,21 @@ REPORT_PLAN_OBJECTIVE = (
     "emergencia. Entre 24-48h es alta; <=24h crítica; <=1h emergencia.\n"
     "8) Las ventas fase 1 no financian pujas inmediatas hasta que la oferta se "
     "acepte/procese. No plantees venta -> puja como liquidez del mismo paso.\n"
-    "9) REGLA CRÍTICA: no se puede comprar ningún jugador mediante clausulazo "
+    "9) Puedes vender jugadores con ratio valor/xP ineficiente: caros para sus "
+    "puntos esperados. El umbral sigue una curva logarítmica valor -> xP "
+    "esperado, no una división lineal euros/xP. Antes de vender, revisa la "
+    "cláusula; si está muy por encima del valor de mercado, evita vender porque "
+    "hay inversión pendiente de amortizar.\n"
+    "10) REGLA CRÍTICA: no se puede comprar ningún jugador mediante clausulazo "
     "desde 24h antes del inicio de la jornada. Si faltan 24h o menos para el "
     "primer partido, NO llames buyout_player_tool y descarta todos los "
     "clausulazos; usa solo pujas de mercado, ventas o subidas de cláusula.\n"
-    "10) REGLA CRÍTICA DE SALDO NEGATIVO: si el saldo está por debajo de 0, "
+    "11) REGLA CRÍTICA DE SALDO NEGATIVO: si el saldo está por debajo de 0, "
     "activa modo deuda. No compres ni subas cláusulas hasta cubrirla. Vende "
     "jugadores de impacto bajo o nulo, teniendo en cuenta xP, valor de mercado, "
     "cláusula e impacto marginal en el once. No vendas a nadie si impide formar "
     "una alineación válida; por ejemplo, no vendas el único portero.\n"
-    "11) Devuelve resumen breve y claro en español."
+    "12) Devuelve resumen breve y claro en español."
 )
 
 
@@ -671,6 +676,85 @@ def _resolve_current_balance(
         return None, "unknown", f"{type(exc).__name__}: {exc}"
 
 
+def _current_player_sale_state(
+    client: LaLigaFantasyClient,
+    player_team_id: str,
+) -> dict:
+    ptid = str(player_team_id or "").strip()
+    if not ptid:
+        return {"found": False, "en_venta": False, "error": "player_team_id vacio"}
+
+    def _extract_ptid(player: dict) -> str:
+        player_team = player.get("playerTeam") or {}
+        return str(
+            player.get("id")
+            or player.get("playerTeamId")
+            or player_team.get("id")
+            or player_team.get("playerTeamId")
+            or ""
+        ).strip()
+
+    def _state_from_player(player: dict, source: str) -> dict:
+        pm = player.get("playerMaster") or {}
+        market = player.get("playerMarket") or {}
+        return {
+            "found": True,
+            "source": source,
+            "en_venta": bool(market),
+            "nombre": pm.get("nickname") or pm.get("name") or "",
+            "player_id": pm.get("id"),
+            "precio_venta": market.get("salePrice"),
+            "market_player_id": str(market.get("id") or ""),
+            "expiracion": market.get("expirationDate"),
+        }
+
+    try:
+        my_team_id = client.find_my_team_id()
+        for source, getter in (
+            ("league_me", client.get_league_me_raw),
+            ("team_v4", lambda: client.get_team_raw_v4(my_team_id)),
+            ("team_v3", lambda: client.get_team_raw(my_team_id)),
+        ):
+            data = getter()
+            if not isinstance(data, dict):
+                continue
+            players = data.get("players", data.get("squad", []))
+            if not isinstance(players, list):
+                continue
+            for player in players:
+                if isinstance(player, dict) and _extract_ptid(player) == ptid:
+                    return _state_from_player(player, source)
+
+        for item in client.get_daily_market_raw():
+            if not isinstance(item, dict):
+                continue
+            seller = item.get("sellerTeam") or {}
+            player_team = item.get("playerTeam") or {}
+            market_ptid = str(
+                player_team.get("id")
+                or player_team.get("playerTeamId")
+                or item.get("playerTeamId")
+                or ""
+            ).strip()
+            if market_ptid != ptid or str(seller.get("id", "")) != str(my_team_id):
+                continue
+            pm = item.get("playerMaster") or {}
+            return {
+                "found": True,
+                "source": "market",
+                "en_venta": True,
+                "nombre": pm.get("nickname") or pm.get("name") or "",
+                "player_id": pm.get("id"),
+                "precio_venta": item.get("salePrice"),
+                "market_player_id": str(item.get("id") or ""),
+                "expiracion": item.get("expirationDate"),
+            }
+    except Exception as exc:
+        return {"found": None, "en_venta": False, "error": _exception_detail(exc, 220)}
+
+    return {"found": False, "en_venta": False}
+
+
 def _buyout_window_for_execution() -> dict:
     available, hours_to_match, source = current_week_clausulazos_available(
         fail_closed=True,
@@ -806,6 +890,31 @@ def _execute_cached_actions(
                         sale_price = _safe_int(payload.get("sale_price"), 0)
                         if not player_team_id or sale_price <= 0:
                             raise ValueError("faltan player_team_id o sale_price")
+                        sale_state = _current_player_sale_state(client, player_team_id)
+                        if bool(sale_state.get("en_venta")):
+                            summary["actions_skipped"] += 1
+                            summary["details"].append(
+                                f"[SKIP] {idx}. {label} -> ya esta en venta"
+                                + (
+                                    f" (market_item_id={sale_state.get('market_player_id')}, "
+                                    f"precio={_money_short(sale_state.get('precio_venta'))})"
+                                    if sale_state.get("market_player_id")
+                                    else ""
+                                )
+                            )
+                            finish_langsmith_span(
+                                action_span,
+                                {
+                                    "ok": True,
+                                    "skipped": True,
+                                    "already_on_market": True,
+                                    "tool": tool,
+                                    "player_team_id": player_team_id,
+                                    "market_player_id": sale_state.get("market_player_id"),
+                                    "precio_venta": sale_state.get("precio_venta"),
+                                },
+                            )
+                            continue
                         client.sell_player_phase1(player_team_id=player_team_id, price=sale_price)
                         summary["actions_ok"] += 1
                         summary["ventas"] += 1
@@ -886,12 +995,13 @@ def _execute_cached_actions(
                     summary["details"].append(f"[ERROR] {idx}. {label} -> {msg}")
                     finish_langsmith_span(action_span, {"ok": False, "tool": tool, "error": msg})
                 except Exception as exc:
-                    msg = f"Paso {idx} ({tool}): {type(exc).__name__}: {exc}"
+                    detail = _exception_detail(exc)
+                    msg = f"Paso {idx} ({tool}): {detail}"
                     summary["errors"].append(msg)
-                    summary["details"].append(f"[ERROR] {idx}. {label} -> {type(exc).__name__}: {exc}")
+                    summary["details"].append(f"[ERROR] {idx}. {label} -> {detail}")
                     finish_langsmith_span(
                         action_span,
-                        {"ok": False, "tool": tool, "error_type": type(exc).__name__, "error": str(exc)},
+                        {"ok": False, "tool": tool, "error_type": type(exc).__name__, "error": detail},
                     )
 
         summary["saldo_restante_estimado"] = remaining_balance

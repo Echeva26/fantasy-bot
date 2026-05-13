@@ -61,6 +61,45 @@ def _format_money(amount: int) -> str:
     return f"{sign}{n}"
 
 
+def _parse_api_datetime(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _extract_offer_id(market_info: dict | None) -> str:
+    """
+    Extrae el ID de oferta que exige la fase 2:
+    POST /api/v4/league/{leagueId}/market/{marketPlayerId}/offer/{offerId}/accept.
+    """
+    if not isinstance(market_info, dict):
+        return ""
+
+    direct = market_info.get("leagueOfferId") or market_info.get("offerId")
+    if direct:
+        return str(direct)
+
+    for key in ("leagueOffer", "offer", "bestOffer"):
+        nested = market_info.get(key)
+        if isinstance(nested, dict) and nested.get("id"):
+            return str(nested.get("id"))
+
+    offers = market_info.get("offers")
+    if isinstance(offers, list):
+        for offer in offers:
+            if isinstance(offer, dict) and offer.get("id"):
+                return str(offer.get("id"))
+
+    return ""
+
+
 def run_advisor_pipeline(args: argparse.Namespace) -> dict:
     """Ejecuta el pipeline del advisor (snapshot, predicciones, análisis, plan)."""
     if args.snapshot:
@@ -307,28 +346,34 @@ def run_aceptar_ofertas(args: argparse.Namespace) -> int:
             continue
         expiracion = p.get("venta_expiracion")
         if not expiracion:
+            print(f"  [SKIP] {p['nombre']}: venta sin fecha de cierre")
             continue
-        try:
-            exp_dt = datetime.fromisoformat(expiracion.replace("Z", "+00:00"))
-            if exp_dt.tzinfo is None:
-                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
+        exp_dt = _parse_api_datetime(expiracion)
+        if exp_dt is None:
+            print(f"  [SKIP] {p['nombre']}: fecha de cierre no valida ({expiracion})")
             continue
         if exp_dt > now:
-            continue  # Aún no ha cerrado la subasta
+            print(
+                f"  [SKIP] {p['nombre']}: venta aun abierta "
+                f"(cierra {exp_dt.isoformat()})"
+            )
+            continue
 
         mpid = p.get("market_player_id")
-        oid = p.get("offer_id")
+        oid = p.get("offer_id") or _extract_offer_id(p.get("playerMarket"))
         # La oferta de la liga: necesitamos market_player_id y offer_id
         # offer_id puede venir de ofertas_recibidas al hacer match por player
-        if not mpid:
-            for of in mi_equipo.get("ofertas_recibidas", []):
-                if of.get("player_id") == p.get("player_id"):
-                    mpid = of.get("market_player_id")
-                    oid = of.get("offer_id")
-                    break
+        for of in mi_equipo.get("ofertas_recibidas", []):
+            if of.get("player_id") != p.get("player_id"):
+                continue
+            mpid = mpid or of.get("market_player_id")
+            oid = oid or of.get("offer_id") or _extract_offer_id(of)
+            break
         if not mpid or not oid:
-            print(f"  [SKIP] {p['nombre']}: falta market_player_id u offer_id para aceptar")
+            print(
+                f"  [SKIP] {p['nombre']}: venta cerrada, pero falta "
+                f"market_player_id u offer_id para aceptar"
+            )
             continue
 
         try:

@@ -48,11 +48,18 @@ Reglas operativas:
    11 alineados.
 10. Las ventas fase 1 no financian compras inmediatas: el dinero solo cuenta
     cuando la oferta se acepta/procesa.
-11. Regla crítica de clausulazos: no se puede comprar ningún jugador mediante
+11. Puedes vender jugadores con ratio valor/xP ineficiente: si un jugador vale
+    mucho para los puntos esperados, y la venta no compromete la alineación,
+    venderlo puede liberar dinero para conseguir más puntos por menos coste en
+    ciclos posteriores. El ratio sigue una curva logarítmica valor -> xP
+    esperado; no uses una división lineal euros/xP. Antes de confirmar, revisa
+    su cláusula: si la cláusula está muy por encima del valor de mercado, evita
+    venderlo porque hay inversión en cláusula pendiente de amortizar.
+12. Regla crítica de clausulazos: no se puede comprar ningún jugador mediante
    clausulazo desde 24h antes del inicio de la jornada. Si faltan 24h o menos
    para el primer partido, descarta todos los buyout_player_tool/clausulazos y
    usa solo mercado de pujas, ventas o subidas de cláusula.
-12. Regla crítica de saldo negativo: si `saldo_disponible` o el saldo del plan
+13. Regla crítica de saldo negativo: si `saldo_disponible` o el saldo del plan
     es negativo, cambia a modo deuda. La prioridad absoluta es volver a saldo
     >= 0 antes de la jornada: no compres ni subas cláusulas mientras siga la
     deuda, vende primero jugadores de impacto bajo o nulo. Para elegir ventas,
