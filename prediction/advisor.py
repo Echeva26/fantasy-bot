@@ -519,11 +519,6 @@ def sale_keeps_lineup_viable(jugadores: list[dict], player_id: int) -> bool:
         (j for j in jugadores if int(j.get("player_id", 0) or 0) == pid),
         {},
     )
-    if sold.get("no_disponible", False):
-        current_once = _calcular_once([dict(j) for j in jugadores])
-        remaining_once = _calcular_once(remaining)
-        return len(remaining_once) >= len(current_once)
-
     sold_pos = str(sold.get("posicion", "")).strip().upper()
     minimum_by_pos = {"POR": 1, "DEF": 2, "MED": 2, "DEL": 1}
     if sold_pos in minimum_by_pos:
@@ -792,26 +787,6 @@ def simulate_transfer_plan(
     MAX_VENTAS = 4
     MAX_COMPRAS = 4
 
-    def _env_int_local(name: str, default: int) -> int:
-        try:
-            return int(os.getenv(name, str(default)) or default)
-        except Exception:
-            return default
-
-    def _env_float_local(name: str, default: float) -> float:
-        try:
-            return float(os.getenv(name, str(default)) or default)
-        except Exception:
-            return default
-
-    VALUE_XP_SELL_MIN_VALUE_EUR = _env_int_local("VALUE_XP_SELL_MIN_VALUE_EUR", 2_000_000)
-    VALUE_XP_LOG_SCALE = _env_float_local("VALUE_XP_LOG_SCALE", 3.4)
-    VALUE_XP_LOG_VALUE_UNIT_EUR = _env_int_local("VALUE_XP_LOG_VALUE_UNIT_EUR", 3_500_000)
-    VALUE_XP_SELL_MIN_LOG_GAP = _env_float_local("VALUE_XP_SELL_MIN_LOG_GAP", 1.25)
-    VALUE_XP_SELL_MAX_MARGINAL_LOSS = _env_float_local("VALUE_XP_SELL_MAX_MARGINAL_LOSS", 1.2)
-    CLAUSE_AMORTIZATION_RATIO = _env_float_local("CLAUSE_AMORTIZATION_RATIO", 1.25)
-    CLAUSE_AMORTIZATION_MIN_PREMIUM_EUR = _env_int_local("CLAUSE_AMORTIZATION_MIN_PREMIUM_EUR", 500_000)
-
     saldo = team_analysis["saldo"]
     plantilla = [dict(j) for j in team_analysis["jugadores"]]
     movimientos = []
@@ -828,72 +803,6 @@ def simulate_transfer_plan(
     def _sale_publication_price(jugador: dict) -> int:
         valor_mercado = int(jugador.get("valor_mercado", 0) or 0)
         return max(valor_mercado, int(valor_mercado * VENTA_PCT))
-
-    def _value_xp_ratio(jugador: dict) -> float | None:
-        market_value = int(jugador.get("valor_mercado", 0) or 0)
-        if market_value <= 0:
-            return None
-        xp = max(0.25, float(jugador.get("xP", 0) or 0.0))
-        return market_value / xp
-
-    def _expected_xp_for_market_value(market_value: int) -> float:
-        """
-        Curva logarítmica valor -> xP esperable.
-
-        El valor de mercado crece mucho más rápido que los puntos esperados:
-        un crack caro no debe compararse linealmente contra jugadores baratos.
-        Esta curva modela rendimientos decrecientes y solo marca venta cuando
-        el xP queda claramente por debajo de lo que su valor debería comprar.
-        """
-        import math
-
-        value = max(0, int(market_value or 0))
-        unit = max(1, int(VALUE_XP_LOG_VALUE_UNIT_EUR or 1))
-        return round(float(VALUE_XP_LOG_SCALE) * math.log1p(value / unit), 2)
-
-    def _clause_amortization_protected(jugador: dict) -> bool:
-        market_value = int(jugador.get("valor_mercado", 0) or 0)
-        clause_value = int(jugador.get("clausula", 0) or 0)
-        if market_value <= 0 or clause_value <= 0:
-            return False
-        premium = clause_value - market_value
-        return (
-            clause_value >= int(market_value * CLAUSE_AMORTIZATION_RATIO)
-            and premium >= CLAUSE_AMORTIZATION_MIN_PREMIUM_EUR
-        )
-
-    def _sale_marginal_loss(jugador: dict, jugadores_base: list[dict]) -> float:
-        pid = int(jugador.get("player_id", 0) or 0)
-        before_xp = _xp_once([dict(j) for j in jugadores_base])
-        remaining = [dict(j) for j in jugadores_base if int(j.get("player_id", 0) or 0) != pid]
-        after_xp = _xp_once(remaining)
-        return max(0.0, round(before_xp - after_xp, 2))
-
-    def _bad_value_sale_reason(jugador: dict, jugadores_base: list[dict]) -> tuple[str | None, dict]:
-        market_value = int(jugador.get("valor_mercado", 0) or 0)
-        player_xp = float(jugador.get("xP", 0) or 0.0)
-        ratio = _value_xp_ratio(jugador)
-        expected_xp = _expected_xp_for_market_value(market_value)
-        log_gap = round(expected_xp - player_xp, 2)
-        marginal_loss = _sale_marginal_loss(jugador, jugadores_base)
-        metrics = {
-            "ratio_valor_xp": round(ratio, 0) if ratio is not None else None,
-            "xp_esperado_por_valor_log": expected_xp,
-            "brecha_xp_valor_log": log_gap,
-            "impacto_xp_once": marginal_loss,
-            "clausula_amortizacion_protegida": _clause_amortization_protected(jugador),
-        }
-        if ratio is None:
-            return None, metrics
-        if market_value < VALUE_XP_SELL_MIN_VALUE_EUR:
-            return None, metrics
-        if log_gap < VALUE_XP_SELL_MIN_LOG_GAP:
-            return None, metrics
-        if metrics["clausula_amortizacion_protegida"]:
-            return None, metrics
-        if marginal_loss > VALUE_XP_SELL_MAX_MARGINAL_LOSS:
-            return None, metrics
-        return "Por debajo de la curva logarítmica valor/xP", metrics
 
     def _es_buen_valor(compra: dict) -> bool:
         vm = compra.get("valor_mercado") or 0
@@ -1255,7 +1164,6 @@ def simulate_transfer_plan(
     for j in plantilla:
         pid = j["player_id"]
         motivo = None
-        extra_metrics: dict = {}
         prioridad = 99
 
         if j.get("no_disponible"):
@@ -1270,48 +1178,19 @@ def simulate_transfer_plan(
         elif pid not in once_actual_ids and j["xP"] < 1.5:
             motivo = "Mejora por xP"
             prioridad = 3
-        else:
-            motivo_valor, extra_metrics = _bad_value_sale_reason(j, plantilla)
-            if motivo_valor:
-                motivo = motivo_valor
-                prioridad = 4
 
         if motivo:
             if not _lineup_sale_ok(plantilla, pid):
                 continue
             ingresos = _sale_income(j)
-            if not extra_metrics:
-                extra_metrics = {
-                    "ratio_valor_xp": round(_value_xp_ratio(j), 0)
-                    if _value_xp_ratio(j) is not None
-                    else None,
-                    "xp_esperado_por_valor_log": _expected_xp_for_market_value(
-                        int(j.get("valor_mercado", 0) or 0)
-                    ),
-                    "brecha_xp_valor_log": round(
-                        _expected_xp_for_market_value(int(j.get("valor_mercado", 0) or 0))
-                        - float(j.get("xP", 0) or 0.0),
-                        2,
-                    ),
-                    "impacto_xp_once": _sale_marginal_loss(j, plantilla),
-                    "clausula_amortizacion_protegida": _clause_amortization_protected(j),
-                }
             candidatos_venta.append({
                 **j,
                 "motivo_venta": motivo,
                 "ingresos_estimados": ingresos,
-                **extra_metrics,
                 "prioridad": prioridad,
             })
 
-    candidatos_venta.sort(
-        key=lambda x: (
-            x["prioridad"],
-            float(x.get("impacto_xp_once", 0) or 0),
-            x["xP"],
-            -int(x.get("ingresos_estimados", 0) or 0),
-        )
-    )
+    candidatos_venta.sort(key=lambda x: (x["prioridad"], x["xP"]))
 
     for venta in candidatos_venta[:MAX_VENTAS]:
         pid = venta["player_id"]
@@ -1332,11 +1211,6 @@ def simulate_transfer_plan(
                 "xP": venta["xP"],
                 "valor_mercado": venta.get("valor_mercado", 0),
                 "clausula": venta.get("clausula", 0),
-                "ratio_valor_xp": venta.get("ratio_valor_xp"),
-                "xp_esperado_por_valor_log": venta.get("xp_esperado_por_valor_log"),
-                "brecha_xp_valor_log": venta.get("brecha_xp_valor_log"),
-                "impacto_xp_once": venta.get("impacto_xp_once"),
-                "clausula_amortizacion_protegida": venta.get("clausula_amortizacion_protegida"),
                 "ingresos": venta["ingresos_estimados"],
                 "motivo": venta.get("motivo_venta", "?"),
                 "precio_publicacion": _sale_publication_price(venta),

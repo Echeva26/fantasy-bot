@@ -45,14 +45,6 @@ Doctrina de juego LaLiga Fantasy Relevo:
   <=1h o once inválido en deadline emergencia.
 - Las pujas por jugadores libres se procesan al expirar el mercado. Las ventas
   fase 1 no financian compras inmediatas hasta aceptación/procesamiento.
-- El agente puede vender jugadores con ratio valor/xP muy alto: si un jugador
-  cuesta mucho para los puntos esperados y su venta no rompe el once, venderlo
-  puede financiar mejores puntos por euro en ciclos posteriores.
-- Ese ratio sigue una curva logarítmica valor -> xP esperado: el valor crece
-  más rápido que el xP. Vende solo si el jugador queda claramente por debajo
-  de la curva esperada para su valor, no por una división lineal euros/xP.
-- No vendas por ratio valor/xP si la cláusula es muy alta frente al valor de
-  mercado: esa prima indica dinero invertido que debe amortizarse.
 - Clausulazos y subidas de cláusula no permiten endeudarse. Los clausulazos se
   bloquean 24h antes de la jornada.
 - El blindaje existe como recomendación estratégica, pero no es acción ejecutable
@@ -89,11 +81,6 @@ posibles ventas o banquillazos.
 Si el saldo global es negativo, trata el análisis como emergencia: identifica
 ventas de bajo o nulo impacto para cubrir deuda, pero no propongas vender a un
 jugador si al quitarlo la plantilla deja de poder alinear un once válido.
-También puedes recomendar ventas por eficiencia valor/xP cuando el jugador sea
-caro para sus puntos esperados, siempre que su cláusula no esté inflada por una
-inversión previa pendiente de amortizar. Recuerda que el umbral valor/xP sube
-según una curva logarítmica: un jugador premium de 8-9 xP no es malo solo por
-ser caro.
 
 Devuelve JSON válido con:
 {
@@ -157,17 +144,11 @@ Reglas:
    nulo, considerando cláusula, valor de mercado, expected points e impacto
    marginal en el once. No vendas jugadores si eso impide alinear una formación
    válida; ejemplo: si solo hay un portero, no lo vendas.
-8. Fuera de modo deuda, puedes vender jugadores caros con xP bajo o ratio
-   valor/xP ineficiente si el motor lo propone. Usa la curva logarítmica del
-   motor (`xp_esperado_por_valor_log` y `brecha_xp_valor_log`), no un ratio
-   lineal. Confirma antes su cláusula: si la cláusula está muy por encima del
-   valor de mercado, no vendas por esa regla porque hay inversión de cláusula
-   que amortizar.
-9. Si `acciones_propuestas_motor` está vacío, NO incluyas compraventas
+8. Si `acciones_propuestas_motor` está vacío, NO incluyas compraventas
    ejecutables. Puedes explicar recomendaciones, riesgos o acciones manuales,
    pero deja `acciones_ejecutables` vacío salvo protección de cláusula generada
    por reglas determinísticas y solo si no hay una necesidad crítica de once.
-10. Si `scrape_status.ok` es false o `news_reader_tool.fresh` es false, continúa
+9. Si `scrape_status.ok` es false o `news_reader_tool.fresh` es false, continúa
    con aviso explícito en riesgos; no ocultes que las noticias están degradadas.
 
 Devuelve JSON válido con:
