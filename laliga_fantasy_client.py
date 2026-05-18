@@ -771,6 +771,39 @@ class LaLigaFantasyClient:
         logger.info("Aceptando oferta %s por item mercado %s...", offer_id, market_player_id)
         return self._post(url, {})
 
+    def get_market_player_offers(self, market_player_id: str) -> dict | list:
+        """
+        Devuelve el detalle de ofertas de un item en mercado.
+
+        En algunas respuestas de plantilla solo llega numberOfOffers, sin el
+        array con IDs. La fase 2 necesita ese offerId, así que consultamos el
+        recurso de ofertas del marketPlayer antes de aceptar.
+        """
+        item_id = str(market_player_id or "").strip()
+        if not item_id:
+            raise ValueError("market_player_id requerido para consultar ofertas")
+
+        errors: list[str] = []
+        for url in (
+            f"{BASE_URL}/api/v3/league/{self.league_id}/market/{item_id}/offer",
+            f"{BASE_URL}/api/v3/league/{self.league_id}/market/{item_id}/offers",
+            f"{BASE_URL}/api/v4/league/{self.league_id}/market/{item_id}/offer",
+            f"{BASE_URL}/api/v4/league/{self.league_id}/market/{item_id}/offers",
+        ):
+            try:
+                logger.info("Consultando ofertas del item mercado %s...", item_id)
+                return self._get(url)
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "?"
+                errors.append(f"{url} -> {status}")
+                if status not in (404, 405):
+                    raise
+
+        raise RuntimeError(
+            "No se pudo obtener el detalle de ofertas del mercado: "
+            + "; ".join(errors)
+        )
+
     def buy_player_bid(
         self,
         market_player_id: str,

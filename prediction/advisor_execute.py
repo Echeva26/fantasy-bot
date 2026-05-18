@@ -82,21 +82,88 @@ def _extract_offer_id(market_info: dict | None) -> str:
     if not isinstance(market_info, dict):
         return ""
 
-    direct = market_info.get("leagueOfferId") or market_info.get("offerId")
+    direct = (
+        market_info.get("leagueOfferId")
+        or market_info.get("offerId")
+        or market_info.get("idOffer")
+        or market_info.get("marketOfferId")
+    )
     if direct:
         return str(direct)
 
-    for key in ("leagueOffer", "offer", "bestOffer"):
+    for key in ("leagueOffer", "offer", "bestOffer", "acceptedOffer", "maxOffer"):
         nested = market_info.get(key)
         if isinstance(nested, dict) and nested.get("id"):
             return str(nested.get("id"))
 
-    offers = market_info.get("offers")
+    offers = (
+        market_info.get("offers")
+        or market_info.get("marketOffers")
+        or market_info.get("playerMarketOffers")
+        or market_info.get("receivedOffers")
+    )
     if isinstance(offers, list):
         for offer in offers:
             if isinstance(offer, dict) and offer.get("id"):
                 return str(offer.get("id"))
 
+    return ""
+
+
+def _iter_offer_records(payload: object) -> list[dict]:
+    """Normaliza respuestas de ofertas de la API en una lista de dicts."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    records: list[dict] = []
+    for key in (
+        "offers",
+        "marketOffers",
+        "playerMarketOffers",
+        "receivedOffers",
+        "data",
+        "items",
+        "content",
+        "results",
+    ):
+        value = payload.get(key)
+        if isinstance(value, list):
+            records.extend(item for item in value if isinstance(item, dict))
+
+    if not records and _extract_offer_id(payload):
+        records.append(payload)
+    return records
+
+
+def _select_offer_id(payload: object) -> str:
+    """Elige una oferta aceptable, priorizando la de la liga si viene marcada."""
+    records = _iter_offer_records(payload)
+    if not records:
+        return _extract_offer_id(payload if isinstance(payload, dict) else None)
+
+    def is_league_offer(offer: dict) -> bool:
+        raw = " ".join(
+            str(offer.get(key, ""))
+            for key in ("type", "discr", "origin", "source", "offerType")
+        ).lower()
+        if any(token in raw for token in ("league", "laliga", "system")):
+            return True
+        if "manager" in raw or "user" in raw:
+            return False
+        bidder = offer.get("bidderTeam") or offer.get("team") or offer.get("manager")
+        return bidder in (None, "", {})
+
+    for offer in records:
+        if is_league_offer(offer):
+            offer_id = str(offer.get("id") or "") or _extract_offer_id(offer)
+            if offer_id:
+                return offer_id
+    for offer in records:
+        offer_id = str(offer.get("id") or "") or _extract_offer_id(offer)
+        if offer_id:
+            return offer_id
     return ""
 
 
@@ -369,6 +436,17 @@ def run_aceptar_ofertas(args: argparse.Namespace) -> int:
             mpid = mpid or of.get("market_player_id")
             oid = oid or of.get("offer_id") or _extract_offer_id(of)
             break
+        if mpid and not oid:
+            try:
+                oid = _select_offer_id(client.get_market_player_offers(mpid))
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo consultar ofertas para %s (%s): %s",
+                    p.get("nombre", "?"),
+                    mpid,
+                    exc,
+                )
+
         if not mpid or not oid:
             print(
                 f"  [SKIP] {p['nombre']}: venta cerrada, pero falta "
