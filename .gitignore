@@ -4,6 +4,7 @@
 !.env.example
 .laliga_token
 .autopilot_state.json
+.retrain_state.json
 
 # Python cache and build artifacts
 __pycache__/

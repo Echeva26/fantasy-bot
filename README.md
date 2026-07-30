@@ -17,6 +17,7 @@ grafo LangGraph por ciclos.
 - POST mercado: se ejecuta siempre 10 minutos despues del cierre real.
 - Guarda la alineacion exactamente 23 horas y 55 minutos antes del inicio de la jornada.
 - Puede proteger plantilla subiendo clausulas de jugadores clave cuando estan expuestos a clausulazo.
+- Reentrena el modelo xP automaticamente (una vez al dia, tras `RETRAIN_TIME`) cuando detecta una jornada completada nueva, reejecutando `collect_data -> features -> train` y avisando por Telegram del resultado.
 - Si el token falta o caduca, te avisa por Telegram para renovarlo.
 
 ### Arquitectura LangGraph

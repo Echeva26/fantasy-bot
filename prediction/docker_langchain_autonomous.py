@@ -4,6 +4,7 @@ Runner Docker para agente LangGraph/LangChain autónomo.
 Lanza en un solo proceso:
 - Daemon autónomo (scheduler PRE/POST)
 - Bot de Telegram para renovación de token (opcional)
+- Job de reentrenamiento periódico del modelo xP (opcional)
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import time
 from types import SimpleNamespace
 
 from prediction.langchain_autonomous import run_daemon
+from prediction.retrain import run_retrain_daemon
 from prediction.token_bot import run_token_bot
 
 logger = logging.getLogger(__name__)
@@ -95,6 +97,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("TOKEN_BOT_POLL_TIMEOUT", "50")),
     )
+    parser.add_argument(
+        "--retrain-enabled",
+        action="store_true",
+        default=_env_bool("RETRAIN_ENABLED", True),
+    )
+    parser.add_argument("--retrain-disabled", action="store_true")
     return parser
 
 
@@ -209,6 +217,24 @@ def main() -> None:
             logger.info("Token bot thread iniciada.")
     else:
         logger.info("Token bot deshabilitado.")
+
+    retrain_enabled = bool(args.retrain_enabled and not args.retrain_disabled)
+    if retrain_enabled:
+        retrain_thread = threading.Thread(
+            target=run_retrain_daemon,
+            kwargs={
+                "stop_event": stop_event,
+                "bot_token": args.bot_token,
+                "notify_chat_id": args.notify_chat_id,
+            },
+            name="retrain-daemon",
+            daemon=True,
+        )
+        retrain_thread.start()
+        threads.append(retrain_thread)
+        logger.info("Retrain daemon thread iniciada.")
+    else:
+        logger.info("Retrain daemon deshabilitado.")
 
     try:
         while True:
