@@ -25,6 +25,8 @@ import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from prediction.fantasy_team_resolve import fantasy_team_name_for_mapping
+
 logger = logging.getLogger(__name__)
 
 # ─── Constantes ───────────────────────────────────────────────
@@ -70,23 +72,23 @@ def _get(url: str, headers: dict, retries: int = 3) -> dict | list:
 def fetch_fantasy_players_raw(league_id: str = "") -> list[dict]:
     """
     Obtiene jugadores de Fantasy con fallback robusto:
-    1) Endpoint público /api/v3/players
+    1) Endpoint público /api/v5/players (migrado desde v3, que devuelve 404)
     2) Endpoint autenticado de liga /api/v3/players/league/{league_id}
     """
-    # 1) Intento público (históricamente estable para entrenamiento/predicción)
+    # 1) Intento público v5 (v3/players devuelve 404 desde ~Feb 2026)
     try:
-        players = _get(f"{FANTASY_API}/api/v3/players", FANTASY_HEADERS)
+        players = _get(f"{FANTASY_API}/api/v5/players", FANTASY_HEADERS)
         if isinstance(players, list) and players:
             return players
     except requests.exceptions.HTTPError as exc:
         status = exc.response.status_code if getattr(exc, "response", None) else "?"
         logger.warning(
-            "Endpoint público /api/v3/players falló (%s). Probando fallback autenticado.",
+            "Endpoint público /api/v5/players falló (%s). Probando fallback autenticado.",
             status,
         )
     except Exception as exc:
         logger.warning(
-            "No se pudo usar endpoint público /api/v3/players: %s. Probando fallback autenticado.",
+            "No se pudo usar endpoint público /api/v5/players: %s. Probando fallback autenticado.",
             exc,
         )
 
@@ -384,9 +386,11 @@ def build_team_mapping(
     # Extraer nombres únicos de equipos en Fantasy
     fantasy_teams = set()
     for p in fantasy_players:
-        team = p.get("team", {})
-        name = team.get("name", "")
-        tid = team.get("id", "")
+        team = p.get("team", {}) if isinstance(p.get("team"), dict) else {}
+        name = str(team.get("name", "") or "").strip()
+        tid = str(team.get("id", "") or p.get("teamId", "") or "").strip()
+        if not name:
+            name = fantasy_team_name_for_mapping(p)
         if name:
             fantasy_teams.add((name, tid))
 
@@ -526,7 +530,7 @@ def build_raw_dataset(
     rows = []
     for pid, detail in player_details.items():
         fp = fp_by_id.get(pid, {})
-        team_name = fp.get("team", {}).get("name", "")
+        team_name = fantasy_team_name_for_mapping(fp)
         ss_team_id = team_mapping.get(team_name)
 
         player_stats = detail.get("playerStats", [])

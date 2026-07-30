@@ -552,11 +552,11 @@ def _build_player_status_index() -> dict[int, str]:
 
     index = {}
 
-    # --- Fuente 1: API pública ---
-    logger.info("Consultando estados de jugadores (API pública)...")
+    # --- Fuente 1: API pública (v5 — v3 devuelve 404 desde ~Feb 2026) ---
+    logger.info("Consultando estados de jugadores (API pública v5)...")
     try:
         r = requests.get(
-            "https://api-fantasy.llt-services.com/api/v3/players",
+            "https://api-fantasy.llt-services.com/api/v5/players",
             headers={"User-Agent": "okhttp/4.12.0", "X-App": "Fantasy", "X-Lang": "es"},
             timeout=15,
         )
