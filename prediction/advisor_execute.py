@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from prediction.advisor import (
     analyze_available_players,
     analyze_my_team,
-    clausulazos_available,
+    current_week_clausulazos_available,
     generate_report,
     get_predictions,
     load_snapshot,
@@ -52,11 +52,119 @@ MODEL_TYPE = "xgboost"
 
 
 def _format_money(amount: int) -> str:
-    if amount >= 1_000_000:
-        return f"{amount / 1_000_000:.1f}M"
-    if amount >= 1_000:
-        return f"{amount / 1_000:.0f}K"
-    return str(amount)
+    sign = "-" if amount < 0 else ""
+    n = abs(int(amount or 0))
+    if n >= 1_000_000:
+        return f"{sign}{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{sign}{n / 1_000:.0f}K"
+    return f"{sign}{n}"
+
+
+def _parse_api_datetime(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _extract_offer_id(market_info: dict | None) -> str:
+    """
+    Extrae el ID de oferta que exige la fase 2:
+    POST /api/v4/league/{leagueId}/market/{marketPlayerId}/offer/{offerId}/accept.
+    """
+    if not isinstance(market_info, dict):
+        return ""
+
+    direct = (
+        market_info.get("leagueOfferId")
+        or market_info.get("offerId")
+        or market_info.get("idOffer")
+        or market_info.get("marketOfferId")
+    )
+    if direct:
+        return str(direct)
+
+    for key in ("leagueOffer", "offer", "bestOffer", "acceptedOffer", "maxOffer"):
+        nested = market_info.get(key)
+        if isinstance(nested, dict) and nested.get("id"):
+            return str(nested.get("id"))
+
+    offers = (
+        market_info.get("offers")
+        or market_info.get("marketOffers")
+        or market_info.get("playerMarketOffers")
+        or market_info.get("receivedOffers")
+    )
+    if isinstance(offers, list):
+        for offer in offers:
+            if isinstance(offer, dict) and offer.get("id"):
+                return str(offer.get("id"))
+
+    return ""
+
+
+def _iter_offer_records(payload: object) -> list[dict]:
+    """Normaliza respuestas de ofertas de la API en una lista de dicts."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+
+    records: list[dict] = []
+    for key in (
+        "offers",
+        "marketOffers",
+        "playerMarketOffers",
+        "receivedOffers",
+        "data",
+        "items",
+        "content",
+        "results",
+    ):
+        value = payload.get(key)
+        if isinstance(value, list):
+            records.extend(item for item in value if isinstance(item, dict))
+
+    if not records and _extract_offer_id(payload):
+        records.append(payload)
+    return records
+
+
+def _select_offer_id(payload: object) -> str:
+    """Elige una oferta aceptable, priorizando la de la liga si viene marcada."""
+    records = _iter_offer_records(payload)
+    if not records:
+        return _extract_offer_id(payload if isinstance(payload, dict) else None)
+
+    def is_league_offer(offer: dict) -> bool:
+        raw = " ".join(
+            str(offer.get(key, ""))
+            for key in ("type", "discr", "origin", "source", "offerType")
+        ).lower()
+        if any(token in raw for token in ("league", "laliga", "system")):
+            return True
+        if "manager" in raw or "user" in raw:
+            return False
+        bidder = offer.get("bidderTeam") or offer.get("team") or offer.get("manager")
+        return bidder in (None, "", {})
+
+    for offer in records:
+        if is_league_offer(offer):
+            offer_id = str(offer.get("id") or "") or _extract_offer_id(offer)
+            if offer_id:
+                return offer_id
+    for offer in records:
+        offer_id = str(offer.get("id") or "") or _extract_offer_id(offer)
+        if offer_id:
+            return offer_id
+    return ""
 
 
 def run_advisor_pipeline(args: argparse.Namespace) -> dict:
@@ -67,7 +175,10 @@ def run_advisor_pipeline(args: argparse.Namespace) -> dict:
         snapshot = load_snapshot(args.league)
     pred_df, first_match_ts = get_predictions(MODEL_TYPE)
     jornada = int(pred_df["jornada"].iloc[0]) if not pred_df.empty else "?"
-    clausulazos_ok, horas_al_partido = clausulazos_available(first_match_ts)
+    clausulazos_ok, horas_al_partido, _ = current_week_clausulazos_available(
+        first_match_ts,
+        fail_closed=False,
+    )
     team_analysis = analyze_my_team(snapshot, pred_df)
     mi_equipo = snapshot["mi_equipo"]
     available = analyze_available_players(
@@ -103,6 +214,10 @@ def print_plan_summary(transfer_plan: dict) -> None:
         if v:
             print(f"  {mov['paso']}. VENDER: {v['nombre']} ({v['posicion']})")
             print(f"       Ingresos: {fm(v['ingresos'])} | motivo: {v['motivo']}")
+            if v.get("clausula"):
+                print(f"       Cláusula: {fm(v['clausula'])}")
+            if v.get("impacto_xp_once") is not None:
+                print(f"       Impacto once: {v['impacto_xp_once']:.1f} xP")
         if c:
             print(f"      COMPRAR: {c['nombre']} ({c['posicion']}, {c['equipo_real']})")
             print(f"       Coste: {fm(c['coste'])} ({c['tipo']}) | xP: {c['xP']:.1f}")
@@ -139,6 +254,28 @@ def execute_movements(
     errores: list[str] = []
     compras_saltadas_saldo = 0  # Para informar al usuario
     compras_saltadas_faltan_datos = 0
+    compras_saltadas_clausulazo_24h = 0
+    plan_incluye_clausulazo = any(
+        (mov.get("compra") or {}).get("tipo") == "clausulazo"
+        for mov in transfer_plan.get("movimientos", [])
+        if isinstance(mov, dict)
+    )
+    clausulazos_ok = True
+    horas_al_partido = 999.0
+    if plan_incluye_clausulazo:
+        try:
+            _, first_match_ts = get_predictions(MODEL_TYPE)
+            clausulazos_ok, horas_al_partido, _ = current_week_clausulazos_available(
+                first_match_ts,
+                fail_closed=True,
+            )
+        except Exception as exc:
+            clausulazos_ok = False
+            horas_al_partido = 0.0
+            errores.append(
+                "Clausulazos bloqueados: no se pudo validar la ventana 24h "
+                f"({type(exc).__name__}: {exc})"
+            )
 
     # Jugadores que ya están en venta: plantilla + mercado (no volver a publicar)
     team_id = str(mi_equipo.get("team_id", ""))
@@ -187,6 +324,13 @@ def execute_movements(
             continue
 
         # Verificar datos necesarios
+        if c.get("tipo") == "clausulazo" and not clausulazos_ok:
+            compras_saltadas_clausulazo_24h += 1
+            print(
+                f"    [SKIP] Clausulazo {c.get('nombre', '?')}: bloqueado por regla 24h "
+                f"(primer partido en {horas_al_partido:.1f}h)"
+            )
+            continue
         if c.get("tipo") == "clausulazo" and not c.get("player_team_id"):
             compras_saltadas_faltan_datos += 1
             continue
@@ -225,8 +369,15 @@ def execute_movements(
             print(f"    [ERROR] {msg}")
 
     # Explicar por qué no se ejecutaron compras
-    if compras == 0 and (compras_saltadas_saldo or compras_saltadas_faltan_datos):
+    if compras == 0 and (
+        compras_saltadas_saldo
+        or compras_saltadas_faltan_datos
+        or compras_saltadas_clausulazo_24h
+    ):
         print()
+        if compras_saltadas_clausulazo_24h:
+            print("  ℹ Clausulazos no ejecutados: bloqueados desde 24h antes de la jornada.")
+            print("    En esa ventana solo se permiten pujas de mercado, ventas o subir cláusulas.")
         if compras_saltadas_saldo:
             print("  ℹ Compras no ejecutadas: saldo insuficiente.")
             print("    El dinero de las ventas llegará tras ejecutar --aceptar-ofertas")
@@ -262,28 +413,45 @@ def run_aceptar_ofertas(args: argparse.Namespace) -> int:
             continue
         expiracion = p.get("venta_expiracion")
         if not expiracion:
+            print(f"  [SKIP] {p['nombre']}: venta sin fecha de cierre")
             continue
-        try:
-            exp_dt = datetime.fromisoformat(expiracion.replace("Z", "+00:00"))
-            if exp_dt.tzinfo is None:
-                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
+        exp_dt = _parse_api_datetime(expiracion)
+        if exp_dt is None:
+            print(f"  [SKIP] {p['nombre']}: fecha de cierre no valida ({expiracion})")
             continue
         if exp_dt > now:
-            continue  # Aún no ha cerrado la subasta
+            print(
+                f"  [SKIP] {p['nombre']}: venta aun abierta "
+                f"(cierra {exp_dt.isoformat()})"
+            )
+            continue
 
         mpid = p.get("market_player_id")
-        oid = p.get("offer_id")
+        oid = p.get("offer_id") or _extract_offer_id(p.get("playerMarket"))
         # La oferta de la liga: necesitamos market_player_id y offer_id
         # offer_id puede venir de ofertas_recibidas al hacer match por player
-        if not mpid:
-            for of in mi_equipo.get("ofertas_recibidas", []):
-                if of.get("player_id") == p.get("player_id"):
-                    mpid = of.get("market_player_id")
-                    oid = of.get("offer_id")
-                    break
+        for of in mi_equipo.get("ofertas_recibidas", []):
+            if of.get("player_id") != p.get("player_id"):
+                continue
+            mpid = mpid or of.get("market_player_id")
+            oid = oid or of.get("offer_id") or _extract_offer_id(of)
+            break
+        if mpid and not oid:
+            try:
+                oid = _select_offer_id(client.get_market_player_offers(mpid))
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo consultar ofertas para %s (%s): %s",
+                    p.get("nombre", "?"),
+                    mpid,
+                    exc,
+                )
+
         if not mpid or not oid:
-            print(f"  [SKIP] {p['nombre']}: falta market_player_id u offer_id para aceptar")
+            print(
+                f"  [SKIP] {p['nombre']}: venta cerrada, pero falta "
+                f"market_player_id u offer_id para aceptar"
+            )
             continue
 
         try:

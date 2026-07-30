@@ -7,6 +7,7 @@ Recibe tokens por Telegram y actualiza .laliga_token.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -21,8 +22,13 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from laliga_fantasy_client import LaLigaFantasyClient, TOKEN_FILE, load_token, save_token
+from prediction.advisor import (
+    CLAUSULAZO_LOCKOUT_HOURS,
+    current_week_clausulazos_available,
+)
 from prediction.advisor_execute import run_aceptar_ofertas
 from prediction.langchain_agent import run_agent_objective
+from prediction.langsmith_config import finish_langsmith_span, langsmith_run_span
 from prediction.league_selection import (
     load_selected_league,
     resolve_league_id,
@@ -30,7 +36,15 @@ from prediction.league_selection import (
 )
 from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
-from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
+from prediction.telegram_messages import (
+    TELEGRAM_PARSE_MODE,
+    build_error_message,
+    build_help_message,
+    build_progress_message,
+    build_standard_message,
+    build_token_renewal_message,
+)
+from prediction.telegram_notify import send_telegram_message
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +59,38 @@ EXECUTABLE_TOOLS = {
 REPORT_PLAN_OBJECTIVE = (
     "Genera el informe del ciclo actual y un plan EJECUTABLE de compraventa.\n"
     "Reglas obligatorias:\n"
-    "1) Usa snapshot_summary, my_squad, market_opportunities y simulate_transfer_plan.\n"
+    "1) Usa snapshot_summary, my_squad, market_opportunities, news_reader_tool y simulate_transfer_plan.\n"
     "2) Simula EXACTAMENTE las operaciones finales llamando las herramientas:\n"
     "   sell_player_phase1_tool, place_bid_tool, buyout_player_tool, increase_clause_tool.\n"
     "3) Respeta el orden real de ejecución y no uses accept_closed_offers.\n"
     "4) Como dry_run está activo, no habrá cambios reales ahora.\n"
     "5) Si propones subir cláusula, sé moderado: solo jugadores clave y expuestos.\n"
     "   Regla fija: cada 1M invertido sube 2M la cláusula.\n"
-    "6) Si recomiendas proteger jugadores, DEBES materializarlo llamando increase_clause_tool.\n"
-    "7) Devuelve resumen breve y claro en español."
+    "6) Si recomiendas proteger jugadores, solo se materializará si el ejecutor "
+    "lo valida mediante reglas determinísticas de exposición.\n"
+    "7) No confundas cierre de mercado con deadline de jornada: si falta un "
+    "portero pero quedan más de 48h para alinear, es prioridad planificada, no "
+    "emergencia. Entre 24-48h es alta; <=24h crítica; <=1h emergencia.\n"
+    "8) Las ventas fase 1 no financian pujas inmediatas hasta que la oferta se "
+    "acepte/procese. No plantees venta -> puja como liquidez del mismo paso.\n"
+    "9) REGLA CRÍTICA: no se puede comprar ningún jugador mediante clausulazo "
+    "desde 24h antes del inicio de la jornada. Si faltan 24h o menos para el "
+    "primer partido, NO llames buyout_player_tool y descarta todos los "
+    "clausulazos; usa solo pujas de mercado, ventas o subidas de cláusula.\n"
+    "10) REGLA CRÍTICA DE SALDO NEGATIVO: si el saldo está por debajo de 0, "
+    "activa modo deuda. No compres ni subas cláusulas hasta cubrirla. Vende "
+    "jugadores de impacto bajo o nulo, teniendo en cuenta xP, valor de mercado, "
+    "cláusula e impacto marginal en el once. No vendas a nadie si impide formar "
+    "una alineación válida; por ejemplo, no vendas el único portero.\n"
+    "11) Devuelve resumen breve y claro en español."
 )
+
+
+def _telegram_session_label(chat_id: str) -> str:
+    if not chat_id:
+        return "telegram"
+    digest = hashlib.sha256(str(chat_id).encode("utf-8")).hexdigest()[:8]
+    return f"telegram:{digest}"
 
 
 def _now_iso() -> str:
@@ -106,6 +142,22 @@ def _compact_text(text: object, limit: int = 280) -> str:
     if len(clean) <= limit:
         return clean
     return clean[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _exception_detail(exc: Exception, limit: int = 700) -> str:
+    base = f"{type(exc).__name__}: {exc}"
+    response = getattr(exc, "response", None)
+    if response is None:
+        return _compact_text(base, limit)
+
+    status = getattr(response, "status_code", "")
+    try:
+        body = response.json() if getattr(response, "content", None) else getattr(response, "text", "")
+    except Exception:
+        body = getattr(response, "text", "")
+    if body:
+        return _compact_text(f"{base} | status={status} | response={body}", limit)
+    return _compact_text(f"{base} | status={status}", limit)
 
 
 def _json_dict_from_text(text: object) -> dict:
@@ -218,6 +270,8 @@ def _extract_actions_from_simulation_payload(payload: dict) -> list[dict]:
 
         venta = mov.get("venta")
         if isinstance(venta, dict):
+            if bool(venta.get("ya_en_venta")):
+                continue
             player_team_id = str(venta.get("player_team_id", "")).strip()
             sale_price = max(
                 _safe_int(venta.get("precio_publicacion"), 0),
@@ -298,6 +352,23 @@ def _extract_executable_actions(steps: list[dict]) -> tuple[list[dict], str]:
     return [], "none"
 
 
+def _summary_requires_debt_mode(summary: dict) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if bool(summary.get("modo_deuda")):
+        return True
+    saldo_actual = summary.get("saldo_actual")
+    return saldo_actual not in (None, "") and _safe_int(saldo_actual, 0) < 0
+
+
+def _filter_debt_mode_actions(actions: list[dict]) -> list[dict]:
+    return [
+        a for a in actions
+        if isinstance(a, dict)
+        and str(a.get("tool", "")).strip() == "sell_player_phase1_tool"
+    ]
+
+
 def _extract_agent_report_payload(output: str) -> dict:
     payload = _json_dict_from_text(output)
     if not payload:
@@ -305,185 +376,6 @@ def _extract_agent_report_payload(output: str) -> dict:
     if "decision_general" in payload:
         return payload
     return {}
-
-
-def _report_recommends_clause_protection(report_payload: dict) -> bool:
-    decision = str(report_payload.get("decision_general", "")).lower()
-    siguiente = str(report_payload.get("siguiente_revision_recomendada", "")).lower()
-    riesgos = report_payload.get("riesgos_detectados", [])
-    riesgos_txt = " ".join(str(r or "") for r in riesgos) if isinstance(riesgos, list) else ""
-    riesgos_txt = riesgos_txt.lower()
-
-    all_text = " ".join([decision, siguiente, riesgos_txt]).strip()
-    if not all_text:
-        return False
-
-    has_clause_word = any(w in all_text for w in ("clausula", "cláusula", "clausul", "buyout"))
-    has_action_word = any(w in all_text for w in ("aument", "sub", "proteg", "blind", "evaluar"))
-    has_exposure_signal = any(
-        w in all_text
-        for w in ("exposicion a clausulazo", "exposición a clausulazo", "ratio valor_vs_clausula", "muy vulnerable")
-    )
-
-    return (has_clause_word and has_action_word) or (has_clause_word and has_exposure_signal)
-
-
-def _extract_clause_names_from_report(report_payload: dict) -> list[str]:
-    names: list[str] = []
-    seen: set[str] = set()
-    decision_names: list[str] = []
-
-    def _push(name_raw: object) -> None:
-        name = str(name_raw or "").strip()
-        if not name:
-            return
-        name = re.sub(r"^[\-\d\.\)\s]+", "", name).strip()
-        if "(" in name:
-            name = name.split("(", 1)[0].strip()
-        if not name:
-            return
-        key = _norm(name)
-        if not key or key in seen:
-            return
-        seen.add(key)
-        names.append(name)
-
-    decision = str(report_payload.get("decision_general", "") or "")
-    m = re.search(r"proteger\s+a\s+([^.;]+)", decision, flags=re.IGNORECASE)
-    if m:
-        chunk = m.group(1).replace(" y ", ",")
-        for raw in chunk.split(","):
-            _push(raw)
-        decision_names = list(names)
-
-    if decision_names:
-        return decision_names
-
-    riesgos = report_payload.get("riesgos_detectados", [])
-    if isinstance(riesgos, list):
-        for row in riesgos:
-            txt = str(row or "").strip()
-            if not txt:
-                continue
-            if "clausul" not in txt.lower():
-                continue
-            chunk = txt.split(":", 1)[1] if ":" in txt else txt
-            for raw in chunk.split(","):
-                _push(raw)
-
-    return names
-
-
-def _extract_my_squad_players_from_steps(steps: list[dict]) -> list[dict]:
-    for step in reversed(steps):
-        if str(step.get("tool", "")).strip() != "my_squad":
-            continue
-        payload = _json_dict_from_text(step.get("observation"))
-        players = payload.get("players")
-        if isinstance(players, list):
-            return [p for p in players if isinstance(p, dict)]
-    return []
-
-
-def _recommended_clause_increase_value(player: dict) -> int:
-    market_value = _safe_int(player.get("valor_mercado"), 0)
-    clause_value = _safe_int(player.get("clausula"), 0)
-    if market_value <= 0:
-        return 1_000_000
-
-    target_clause = int(market_value * 1.08)
-    delta = max(0, target_clause - max(0, clause_value))
-    invest = max(1_000_000, min(3_000_000, (delta + 1) // 2))
-    # Redondeo a 100k para importes limpios.
-    invest = ((invest + 99_999) // 100_000) * 100_000
-    return int(invest)
-
-
-def _build_clause_actions_from_report(report_payload: dict, steps: list[dict]) -> list[dict]:
-    if not _report_recommends_clause_protection(report_payload):
-        return []
-
-    players = _extract_my_squad_players_from_steps(steps)
-    if not players:
-        return []
-
-    by_name: dict[str, dict] = {}
-    for p in players:
-        ptid = str(p.get("player_team_id", "")).strip()
-        name = str(p.get("nombre", "")).strip()
-        if name:
-            by_name[_norm(name)] = p
-
-    names = _extract_clause_names_from_report(report_payload)
-    selected: list[dict] = []
-    selected_ptids: set[str] = set()
-
-    for name in names:
-        p = by_name.get(_norm(name))
-        if not p:
-            continue
-        ptid = str(p.get("player_team_id", "")).strip()
-        if not ptid or ptid in selected_ptids:
-            continue
-        selected.append(p)
-        selected_ptids.add(ptid)
-        if len(selected) >= 3:
-            break
-
-    target_recommended = 2
-    if not selected:
-        exposed = sorted(
-            players,
-            key=lambda x: _safe_float(x.get("ratio_valor_vs_clausula"), 0.0),
-            reverse=True,
-        )
-        for p in exposed:
-            ratio = _safe_float(p.get("ratio_valor_vs_clausula"), 0.0)
-            if ratio < 0.88:
-                continue
-            ptid = str(p.get("player_team_id", "")).strip()
-            if not ptid or ptid in selected_ptids:
-                continue
-            selected.append(p)
-            selected_ptids.add(ptid)
-            if len(selected) >= target_recommended:
-                break
-    elif len(selected) < target_recommended:
-        exposed = sorted(
-            players,
-            key=lambda x: _safe_float(x.get("ratio_valor_vs_clausula"), 0.0),
-            reverse=True,
-        )
-        for p in exposed:
-            ratio = _safe_float(p.get("ratio_valor_vs_clausula"), 0.0)
-            if ratio < 0.88:
-                continue
-            ptid = str(p.get("player_team_id", "")).strip()
-            if not ptid or ptid in selected_ptids:
-                continue
-            selected.append(p)
-            selected_ptids.add(ptid)
-            if len(selected) >= target_recommended:
-                break
-
-    actions: list[dict] = []
-    for p in selected:
-        ptid = str(p.get("player_team_id", "")).strip()
-        if not ptid:
-            continue
-        payload = {
-            "player_team_id": ptid,
-            "value_to_increase": _recommended_clause_increase_value(p),
-            "nombre": str(p.get("nombre", "")).strip(),
-        }
-        actions.append(
-            {
-                "tool": "increase_clause_tool",
-                "tool_input": payload,
-                "label": _format_action_label("increase_clause_tool", payload),
-            }
-        )
-    return actions
 
 
 def _format_tools_used(steps: list[dict], limit: int = 8) -> str:
@@ -498,6 +390,15 @@ def _format_tools_used(steps: list[dict], limit: int = 8) -> str:
     if len(tool_names) > limit:
         out += ", ..."
     return out
+
+
+def _extract_step_payload(steps: list[dict], tool_name: str) -> dict:
+    for step in reversed(steps):
+        if str(step.get("tool", "")).strip() != tool_name:
+            continue
+        payload = _json_dict_from_text(step.get("observation"))
+        return payload if isinstance(payload, dict) else {}
+    return {}
 
 
 def _build_informe_message(
@@ -528,20 +429,15 @@ def _build_informe_message(
     source_txt = {
         "tool_calls": "tools ejecutables del agente",
         "simulate_transfer_plan": "plan de simulacion del motor",
-        "simulate_transfer_plan+report_clause_fallback": "plan de simulacion + clausulas sugeridas",
-        "tool_calls+report_clause_fallback": "tools ejecutables + clausulas sugeridas",
+        "tool_calls+debt_filter": "tools ejecutables filtradas por modo deuda",
+        "simulate_transfer_plan+debt_filter": "plan de simulacion filtrado por modo deuda",
         "none": "sin plan ejecutable detectado",
     }.get(action_source, action_source)
 
-    lines = [
-        "INFORME IA (LangChain)",
-        f"Liga: {league_name}",
-        "Modo: simulacion (dry-run)",
-        f"Ciclo mercado: {market_key}",
-        "",
-        f"Plan cacheado: {len(actions)} accion(es) ejecutables",
+    summary_rows = [
+        "Modo: simulación (dry-run)",
+        f"Plan cacheado: {len(actions)} acción(es) ejecutable(s)",
         f"Fuente del plan: {source_txt}",
-        "Usa /compraventa para ejecutar ESTE plan en este mismo ciclo.",
     ]
 
     xp_now = summary.get("xp_once_actual")
@@ -550,57 +446,84 @@ def _build_informe_message(
     saldo_now = summary.get("saldo_actual")
     saldo_final = summary.get("saldo_final")
     movs = summary.get("movimientos")
+    if _summary_requires_debt_mode(summary):
+        summary_rows.append("Modo deuda: activo; solo se cachean ventas hasta salir de saldo negativo")
     has_summary = any(v not in (None, "") for v in (xp_now, xp_post, saldo_now, saldo_final, movs))
+    sim_rows: list[str] = []
     if has_summary:
-        lines.extend(["", "Resumen simulacion:"])
         if xp_now not in (None, "") and xp_post not in (None, ""):
             delta = _safe_float(xp_delta, _safe_float(xp_post) - _safe_float(xp_now))
             delta_txt = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
-            lines.append(f"- xP once: {_safe_float(xp_now):.1f} -> {_safe_float(xp_post):.1f} ({delta_txt})")
+            sim_rows.append(f"xP once: {_safe_float(xp_now):.1f} → {_safe_float(xp_post):.1f} ({delta_txt})")
         if saldo_now not in (None, "") and saldo_final not in (None, ""):
-            lines.append(f"- Saldo: {_money_short(saldo_now)} -> {_money_short(saldo_final)}")
+            sim_rows.append(f"Saldo: {_money_short(saldo_now)} → {_money_short(saldo_final)}")
         if movs not in (None, ""):
-            lines.append(f"- Movimientos simulados: {_safe_int(movs, 0)}")
+            sim_rows.append(f"Movimientos simulados: {_safe_int(movs, 0)}")
 
+    scrape_status = _extract_step_payload(steps, "ensure_fresh_scrapes")
+    news_payload = _extract_step_payload(steps, "news_reader_tool")
+    news_rows: list[str] = []
+    if scrape_status:
+        if bool(scrape_status.get("ok")):
+            suffix = "tras refrescar" if scrape_status.get("ran_scraper") else "sin refrescar"
+            status = scrape_status.get("status_reason") or "scrapes frescos"
+            news_rows.append(f"Scrapes frescos ({suffix}): {_compact_text(status, 140)}")
+        else:
+            reason = (
+                scrape_status.get("error")
+                or scrape_status.get("status_reason")
+                or scrape_status.get("reason")
+                or "sin detalle"
+            )
+            news_rows.append(f"Scrapes degradados: {_compact_text(reason, 180)}")
+    if news_payload:
+        if news_payload.get("fresh") is False:
+            reason = news_payload.get("reason") or "snapshot obsoleto"
+            news_rows.append(f"Noticias no frescas: {_compact_text(reason, 180)}")
+        elif news_payload.get("ok") is False:
+            reason = news_payload.get("reason") or "sin noticias locales"
+            news_rows.append(f"Noticias no disponibles: {_compact_text(reason, 180)}")
+
+    action_rows: list[str] = []
     if actions:
-        lines.extend(["", "Acciones propuestas para /compraventa:"])
         for idx, action in enumerate(actions[:8], 1):
             payload = _tool_input_dict(action.get("tool_input"))
             label = str(action.get("label", "")).strip() or _format_action_label(
                 str(action.get("tool", "")).strip(), payload
             )
-            lines.append(f"{idx}. {label}")
+            action_rows.append(f"{idx}. {label}")
         if len(actions) > 8:
-            lines.append(f"... y {len(actions) - 8} accion(es) mas.")
+            action_rows.append(f"+{len(actions) - 8} acción(es) más")
     else:
-        lines.extend(
-            [
-                "",
-                "No se detectaron acciones ejecutables en este informe.",
-                "Si el texto recomienda operar, vuelve a lanzar /informe para regenerar el plan del ciclo.",
-            ]
-        )
-
-    if decision:
-        lines.extend(["", "Decision IA:", decision])
-
-    if riesgos_txt:
-        lines.append("")
-        lines.append("Riesgos clave:")
-        for r in riesgos_txt:
-            lines.append(f"- {r}")
-
-    if siguiente:
-        lines.extend(["", f"Siguiente revision recomendada: {siguiente}"])
-
-    lines.extend(
-        [
-            "",
-            f"Tools usadas: {len(steps)}",
-            f"Tools: {_format_tools_used(steps)}",
+        action_rows = [
+            "No se detectaron acciones ejecutables en este informe.",
+            "Si el texto recomienda operar, no se cacheará hasta que el motor lo valide.",
         ]
+
+    sections: list[tuple[str, list[str] | str]] = [
+        ("Resumen", summary_rows),
+    ]
+    if sim_rows:
+        sections.append(("Simulación", sim_rows))
+    if news_rows:
+        sections.append(("Noticias", news_rows))
+    sections.append(("Acciones propuestas", action_rows))
+    if decision:
+        sections.append(("Decisión IA", decision))
+    if riesgos_txt:
+        sections.append(("Riesgos clave", riesgos_txt))
+    if siguiente:
+        sections.append(("Siguiente revisión", siguiente))
+    sections.append(("Técnico", [f"Tools usadas: {len(steps)}", f"Tools: {_format_tools_used(steps)}"]))
+
+    return build_standard_message(
+        title="📊 Informe IA",
+        status="Plan preparado",
+        league_name=league_name,
+        market_key=market_key,
+        sections=sections,
+        footer="Usa /compraventa para ejecutar este plan en el mismo ciclo.",
     )
-    return "\n".join(lines).strip()
 
 
 def _build_compraventa_message(
@@ -613,44 +536,91 @@ def _build_compraventa_message(
     source_txt = {
         "tool_calls": "tools ejecutables del agente",
         "simulate_transfer_plan": "plan de simulacion cacheado",
-        "simulate_transfer_plan+report_clause_fallback": "plan cacheado + clausulas sugeridas",
-        "tool_calls+report_clause_fallback": "tools ejecutables + clausulas sugeridas",
+        "tool_calls+debt_filter": "tools ejecutables filtradas por modo deuda",
+        "simulate_transfer_plan+debt_filter": "plan cacheado filtrado por modo deuda",
         "none": "origen no informado",
     }.get(str(action_source), str(action_source or "none"))
 
-    lines = [
-        "COMPRAVENTA IA (LangChain)",
-        f"Liga: {league_name}",
-        f"Ciclo mercado: {market_key}",
+    result_rows = [
         f"Fuente del plan: {source_txt}",
-        "",
         f"Acciones planificadas: {summary.get('actions_total', 0)}",
         f"Acciones OK: {summary.get('actions_ok', 0)}",
-        f"Ventas fase1: {summary.get('ventas', 0)}",
+        f"Acciones saltadas: {summary.get('actions_skipped', 0)}",
+        f"Ventas fase 1: {summary.get('ventas', 0)}",
         f"Pujas: {summary.get('pujas', 0)}",
         f"Clausulazos: {summary.get('clausulazos', 0)}",
         f"Subidas de cláusula: {summary.get('clausulas_subidas', 0)}",
     ]
 
+    saldo_actual = summary.get("saldo_actual")
+    saldo_restante = summary.get("saldo_restante_estimado")
+    balance_rows: list[str] = []
+    if saldo_actual is not None:
+        source = str(summary.get("saldo_source", "")).strip()
+        source_txt_balance = "API" if source == "api" else "cache del informe" if source == "cache" else source
+        balance_rows.extend(
+            [
+                f"Saldo validado: {_money_short(saldo_actual)}"
+                + (f" ({source_txt_balance})" if source_txt_balance else ""),
+                f"Saldo restante estimado: {_money_short(saldo_restante)}",
+            ]
+        )
+    if summary.get("saldo_warning"):
+        balance_rows.append(f"Aviso saldo: {_compact_text(summary.get('saldo_warning'), 220)}")
+
+    buyout_window = summary.get("clausulazos_window", {})
+    rule_rows: list[str] = []
+    if bool(summary.get("debt_mode")):
+        rule_rows.append("Modo deuda: activo. Se han bloqueado compras y subidas de cláusula.")
+    if isinstance(buyout_window, dict) and not bool(buyout_window.get("available", True)):
+        hours = buyout_window.get("hours_to_first_match")
+        hours_txt = (
+            f" Quedan {_safe_float(hours):.1f}h para el primer partido."
+            if hours not in (None, "")
+            else ""
+        )
+        skipped = _safe_int(summary.get("clausulazos_bloqueados_24h"), 0)
+        rule_rows.append(
+            "Regla clausulazos: BLOQUEADOS desde 24h antes de jornada."
+            f"{hours_txt}"
+        )
+        if skipped:
+            rule_rows.append(f"Clausulazos saltados por regla 24h: {skipped}")
+
     details = summary.get("details", [])
+    detail_rows: list[str] = []
     if isinstance(details, list) and details:
-        lines.append("")
-        lines.append("Detalle de ejecucion:")
         for row in details[:10]:
-            lines.append(f"- {row}")
+            detail_rows.append(str(row))
         if len(details) > 10:
-            lines.append(f"- ... {len(details) - 10} linea(s) mas.")
+            detail_rows.append(f"+{len(details) - 10} línea(s) más")
 
     errors = summary.get("errors", [])
+    error_rows: list[str] = []
     if isinstance(errors, list) and errors:
-        lines.append("")
-        lines.append(f"Errores ({len(errors)}):")
         for err in errors[:8]:
-            lines.append(f"- {_compact_text(err, 220)}")
+            error_rows.append(_compact_text(err, 220))
         if len(errors) > 8:
-            lines.append(f"- ... {len(errors) - 8} error(es) mas.")
+            error_rows.append(f"+{len(errors) - 8} error(es) más")
 
-    return "\n".join(lines).strip()
+    sections: list[tuple[str, list[str] | str]] = [("Resultado", result_rows)]
+    if balance_rows:
+        sections.append(("Saldo", balance_rows))
+    if rule_rows:
+        sections.append(("Reglas aplicadas", rule_rows))
+    if detail_rows:
+        sections.append(("Detalle", detail_rows))
+    if error_rows:
+        sections.append((f"Errores ({len(errors)})", error_rows))
+
+    status = "Ejecutada con errores" if error_rows else "Plan ejecutado"
+    return build_standard_message(
+        title="💸 Compraventa IA",
+        status=status,
+        league_name=league_name,
+        market_key=market_key,
+        sections=sections,
+    )
 
 def _market_key_for_league(league_id: str) -> tuple[str, str]:
     sched, err = build_market_schedule(
@@ -678,91 +648,375 @@ def _save_report_plan_cache(payload: dict, path: Path = REPORT_PLAN_CACHE_FILE) 
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
-def _execute_cached_actions(league_id: str, actions: list[dict]) -> dict:
-    client = LaLigaFantasyClient.from_saved_token(league_id=league_id)
-    summary = {
-        "actions_total": len(actions),
-        "actions_ok": 0,
-        "ventas": 0,
-        "pujas": 0,
-        "clausulazos": 0,
-        "clausulas_subidas": 0,
-        "details": [],
-        "errors": [],
+def _action_cash_cost(tool: str, payload: dict) -> int:
+    if tool == "place_bid_tool":
+        return _safe_int(payload.get("amount"), 0)
+    if tool == "buyout_player_tool":
+        return _safe_int(payload.get("clause_to_pay"), 0)
+    if tool == "increase_clause_tool":
+        return _safe_int(payload.get("value_to_increase"), 0)
+    return 0
+
+
+def _resolve_current_balance(
+    client: LaLigaFantasyClient,
+    fallback_balance: object = None,
+) -> tuple[int | None, str, str]:
+    try:
+        return int(client.get_my_team_money()), "api", ""
+    except Exception as exc:
+        if fallback_balance not in (None, ""):
+            fallback = _safe_int(fallback_balance, 0)
+            return fallback, "cache", f"{type(exc).__name__}: {exc}"
+        return None, "unknown", f"{type(exc).__name__}: {exc}"
+
+
+def _current_player_sale_state(
+    client: LaLigaFantasyClient,
+    player_team_id: str,
+) -> dict:
+    ptid = str(player_team_id or "").strip()
+    if not ptid:
+        return {"found": False, "en_venta": False, "error": "player_team_id vacio"}
+
+    def _extract_ptid(player: dict) -> str:
+        player_team = player.get("playerTeam") or {}
+        return str(
+            player.get("id")
+            or player.get("playerTeamId")
+            or player_team.get("id")
+            or player_team.get("playerTeamId")
+            or ""
+        ).strip()
+
+    def _state_from_player(player: dict, source: str) -> dict:
+        pm = player.get("playerMaster") or {}
+        market = player.get("playerMarket") or {}
+        return {
+            "found": True,
+            "source": source,
+            "en_venta": bool(market),
+            "nombre": pm.get("nickname") or pm.get("name") or "",
+            "player_id": pm.get("id"),
+            "precio_venta": market.get("salePrice"),
+            "market_player_id": str(market.get("id") or ""),
+            "expiracion": market.get("expirationDate"),
+        }
+
+    try:
+        my_team_id = client.find_my_team_id()
+        for source, getter in (
+            ("league_me", client.get_league_me_raw),
+            ("team_v4", lambda: client.get_team_raw_v4(my_team_id)),
+            ("team_v3", lambda: client.get_team_raw(my_team_id)),
+        ):
+            data = getter()
+            if not isinstance(data, dict):
+                continue
+            players = data.get("players", data.get("squad", []))
+            if not isinstance(players, list):
+                continue
+            for player in players:
+                if isinstance(player, dict) and _extract_ptid(player) == ptid:
+                    return _state_from_player(player, source)
+
+        for item in client.get_daily_market_raw():
+            if not isinstance(item, dict):
+                continue
+            seller = item.get("sellerTeam") or {}
+            player_team = item.get("playerTeam") or {}
+            market_ptid = str(
+                player_team.get("id")
+                or player_team.get("playerTeamId")
+                or item.get("playerTeamId")
+                or ""
+            ).strip()
+            if market_ptid != ptid or str(seller.get("id", "")) != str(my_team_id):
+                continue
+            pm = item.get("playerMaster") or {}
+            return {
+                "found": True,
+                "source": "market",
+                "en_venta": True,
+                "nombre": pm.get("nickname") or pm.get("name") or "",
+                "player_id": pm.get("id"),
+                "precio_venta": item.get("salePrice"),
+                "market_player_id": str(item.get("id") or ""),
+                "expiracion": item.get("expirationDate"),
+            }
+    except Exception as exc:
+        return {"found": None, "en_venta": False, "error": _exception_detail(exc, 220)}
+
+    return {"found": False, "en_venta": False}
+
+
+def _buyout_window_for_execution() -> dict:
+    available, hours_to_match, source = current_week_clausulazos_available(
+        fail_closed=True,
+    )
+
+    if available:
+        return {
+            "available": True,
+            "hours_to_first_match": round(float(hours_to_match), 1),
+            "source": source,
+            "reason": "",
+        }
+
+    return {
+        "available": False,
+        "hours_to_first_match": round(float(hours_to_match), 1),
+        "source": source,
+        "reason": (
+            f"Regla 24h: LaLiga Fantasy no permite comprar mediante clausulazo "
+            f"desde {CLAUSULAZO_LOCKOUT_HOURS}h antes del primer partido de la jornada."
+        ),
     }
 
-    for idx, action in enumerate(actions, 1):
-        tool = str(action.get("tool", "")).strip()
-        payload = _tool_input_dict(action.get("tool_input"))
-        label = str(action.get("label", "")).strip() or _format_action_label(tool, payload)
-        try:
-            if tool == "sell_player_phase1_tool":
-                player_team_id = str(payload.get("player_team_id", "")).strip()
-                sale_price = _safe_int(payload.get("sale_price"), 0)
-                if not player_team_id or sale_price <= 0:
-                    raise ValueError("faltan player_team_id o sale_price")
-                client.sell_player_phase1(player_team_id=player_team_id, price=sale_price)
-                summary["actions_ok"] += 1
-                summary["ventas"] += 1
-                summary["details"].append(f"[OK] {idx}. {label}")
-                continue
 
-            if tool == "place_bid_tool":
-                market_item_id = str(payload.get("market_item_id", "")).strip()
-                amount = _safe_int(payload.get("amount"), 0)
-                player_id = payload.get("player_id")
-                player_id_int = _safe_int(player_id, 0) if player_id not in (None, "") else 0
-                if not market_item_id or amount <= 0:
-                    raise ValueError("faltan market_item_id o amount")
-                client.buy_player_bid(
-                    market_player_id=market_item_id,
-                    amount=amount,
-                    player_id=player_id_int or None,
+def _execute_cached_actions(
+    league_id: str,
+    actions: list[dict],
+    *,
+    fallback_balance: object = None,
+    trace_command: str = "compraventa",
+    trace_channel: str = "telegram",
+    trace_session: str = "telegram",
+    market_cycle_id: str | None = None,
+) -> dict:
+    with langsmith_run_span(
+        "fantasy-bot.execute-cached-plan",
+        run_type="chain",
+        phase="pre",
+        command=trace_command,
+        league_id=league_id,
+        market_cycle_id=market_cycle_id,
+        dry_run=False,
+        extra_metadata={"channel": trace_channel, "session": trace_session},
+        inputs={"actions_total": len(actions)},
+    ) as plan_span:
+        client = LaLigaFantasyClient.from_saved_token(league_id=league_id)
+        current_balance, balance_source, balance_warning = _resolve_current_balance(
+            client,
+            fallback_balance=fallback_balance,
+        )
+        summary = {
+            "actions_total": len(actions),
+            "actions_ok": 0,
+            "actions_skipped": 0,
+            "debt_mode": current_balance is not None and current_balance < 0,
+            "ventas": 0,
+            "pujas": 0,
+            "clausulazos": 0,
+            "clausulas_subidas": 0,
+            "clausulazos_bloqueados_24h": 0,
+            "clausulazos_window": {},
+            "saldo_actual": current_balance,
+            "saldo_source": balance_source,
+            "saldo_warning": balance_warning,
+            "details": [],
+            "errors": [],
+        }
+        remaining_balance = current_balance
+        buyout_window = (
+            _buyout_window_for_execution()
+            if any(str(a.get("tool", "")).strip() == "buyout_player_tool" for a in actions if isinstance(a, dict))
+            else {"available": True, "hours_to_first_match": None, "reason": ""}
+        )
+        summary["clausulazos_window"] = buyout_window
+
+        for idx, action in enumerate(actions, 1):
+            tool = str(action.get("tool", "")).strip()
+            payload = _tool_input_dict(action.get("tool_input"))
+            label = str(action.get("label", "")).strip() or _format_action_label(tool, payload)
+            cash_cost = _action_cash_cost(tool, payload)
+            if bool(summary.get("debt_mode")) and tool != "sell_player_phase1_tool":
+                summary["actions_skipped"] += 1
+                summary["details"].append(
+                    f"[SKIP] {idx}. {label} -> modo deuda activo "
+                    f"({_money_short(current_balance)}): solo se permiten ventas"
                 )
-                summary["actions_ok"] += 1
-                summary["pujas"] += 1
-                summary["details"].append(f"[OK] {idx}. {label}")
                 continue
-
-            if tool == "buyout_player_tool":
-                player_team_id = str(payload.get("player_team_id", "")).strip()
-                clause = payload.get("clause_to_pay")
-                clause_int = _safe_int(clause, 0) if clause not in (None, "") else 0
-                if not player_team_id:
-                    raise ValueError("falta player_team_id")
-                client.buy_player_clausulazo(
-                    player_team_id=player_team_id,
-                    buyout_clause_to_pay=clause_int or None,
+            if tool == "buyout_player_tool" and not bool(buyout_window.get("available")):
+                summary["actions_skipped"] += 1
+                summary["clausulazos_bloqueados_24h"] += 1
+                hours = buyout_window.get("hours_to_first_match")
+                hours_txt = (
+                    f" Quedan {float(hours):.1f}h para el primer partido."
+                    if isinstance(hours, (int, float))
+                    else ""
                 )
-                summary["actions_ok"] += 1
-                summary["clausulazos"] += 1
-                summary["details"].append(f"[OK] {idx}. {label}")
-                continue
-
-            if tool == "increase_clause_tool":
-                player_team_id = str(payload.get("player_team_id", "")).strip()
-                value_to_increase = _safe_int(payload.get("value_to_increase"), 0)
-                if not player_team_id or value_to_increase <= 0:
-                    raise ValueError("faltan player_team_id o value_to_increase")
-                client.increase_player_clause(
-                    player_team_id=player_team_id,
-                    value_to_increase=value_to_increase,
-                    factor=2.0,
+                summary["details"].append(
+                    f"[SKIP] {idx}. {label} -> clausulazos bloqueados por regla 24h."
+                    f"{hours_txt}"
                 )
-                summary["actions_ok"] += 1
-                summary["clausulas_subidas"] += 1
-                summary["details"].append(f"[OK] {idx}. {label}")
                 continue
+            if remaining_balance is not None and cash_cost > remaining_balance:
+                summary["actions_skipped"] += 1
+                summary["details"].append(
+                    f"[SKIP] {idx}. {label} -> saldo insuficiente "
+                    f"({_money_short(remaining_balance)} disponible, {_money_short(cash_cost)} requerido)"
+                )
+                continue
+            with langsmith_run_span(
+                f"fantasy-bot.cached-action.{tool or 'unknown'}",
+                run_type="tool",
+                phase="pre",
+                command=trace_command,
+                league_id=league_id,
+                market_cycle_id=market_cycle_id,
+                dry_run=False,
+                extra_metadata={"action_index": idx, "tool_name": tool},
+                inputs={
+                    "tool": tool,
+                    "label": label,
+                    "market_item_id": payload.get("market_item_id"),
+                    "player_team_id": payload.get("player_team_id"),
+                    "player_id": payload.get("player_id"),
+                    "amount": payload.get("amount"),
+                    "sale_price": payload.get("sale_price"),
+                    "value_to_increase": payload.get("value_to_increase"),
+                    "clause_to_pay": payload.get("clause_to_pay"),
+                },
+            ) as action_span:
+                try:
+                    if tool == "sell_player_phase1_tool":
+                        player_team_id = str(payload.get("player_team_id", "")).strip()
+                        sale_price = _safe_int(payload.get("sale_price"), 0)
+                        if not player_team_id or sale_price <= 0:
+                            raise ValueError("faltan player_team_id o sale_price")
+                        sale_state = _current_player_sale_state(client, player_team_id)
+                        if bool(sale_state.get("en_venta")):
+                            summary["actions_skipped"] += 1
+                            summary["details"].append(
+                                f"[SKIP] {idx}. {label} -> ya esta en venta"
+                                + (
+                                    f" (market_item_id={sale_state.get('market_player_id')}, "
+                                    f"precio={_money_short(sale_state.get('precio_venta'))})"
+                                    if sale_state.get("market_player_id")
+                                    else ""
+                                )
+                            )
+                            finish_langsmith_span(
+                                action_span,
+                                {
+                                    "ok": True,
+                                    "skipped": True,
+                                    "already_on_market": True,
+                                    "tool": tool,
+                                    "player_team_id": player_team_id,
+                                    "market_player_id": sale_state.get("market_player_id"),
+                                    "precio_venta": sale_state.get("precio_venta"),
+                                },
+                            )
+                            continue
+                        client.sell_player_phase1(player_team_id=player_team_id, price=sale_price)
+                        summary["actions_ok"] += 1
+                        summary["ventas"] += 1
+                        summary["details"].append(f"[OK] {idx}. {label}")
+                        finish_langsmith_span(
+                            action_span,
+                            {"ok": True, "tool": tool, "player_team_id": player_team_id, "sale_price": sale_price},
+                        )
+                        continue
 
-            msg = f"Paso {idx}: tool no soportada ({tool})"
-            summary["errors"].append(msg)
-            summary["details"].append(f"[ERROR] {idx}. {label} -> {msg}")
-        except Exception as exc:
-            msg = f"Paso {idx} ({tool}): {type(exc).__name__}: {exc}"
-            summary["errors"].append(msg)
-            summary["details"].append(f"[ERROR] {idx}. {label} -> {type(exc).__name__}: {exc}")
+                    if tool == "place_bid_tool":
+                        market_item_id = str(payload.get("market_item_id", "")).strip()
+                        amount = _safe_int(payload.get("amount"), 0)
+                        player_id = payload.get("player_id")
+                        player_id_int = _safe_int(player_id, 0) if player_id not in (None, "") else 0
+                        if not market_item_id or amount <= 0:
+                            raise ValueError("faltan market_item_id o amount")
+                        client.buy_player_bid(
+                            market_player_id=market_item_id,
+                            amount=amount,
+                            player_id=player_id_int or None,
+                        )
+                        summary["actions_ok"] += 1
+                        summary["pujas"] += 1
+                        if remaining_balance is not None:
+                            remaining_balance -= cash_cost
+                        summary["details"].append(f"[OK] {idx}. {label}")
+                        finish_langsmith_span(
+                            action_span,
+                            {"ok": True, "tool": tool, "market_item_id": market_item_id, "amount": amount},
+                        )
+                        continue
 
-    return summary
+                    if tool == "buyout_player_tool":
+                        player_team_id = str(payload.get("player_team_id", "")).strip()
+                        clause = payload.get("clause_to_pay")
+                        clause_int = _safe_int(clause, 0) if clause not in (None, "") else 0
+                        if not player_team_id:
+                            raise ValueError("falta player_team_id")
+                        client.buy_player_clausulazo(
+                            player_team_id=player_team_id,
+                            buyout_clause_to_pay=clause_int or None,
+                        )
+                        summary["actions_ok"] += 1
+                        summary["clausulazos"] += 1
+                        if remaining_balance is not None:
+                            remaining_balance -= cash_cost
+                        summary["details"].append(f"[OK] {idx}. {label}")
+                        finish_langsmith_span(
+                            action_span,
+                            {"ok": True, "tool": tool, "player_team_id": player_team_id, "clause_to_pay": clause_int or None},
+                        )
+                        continue
+
+                    if tool == "increase_clause_tool":
+                        player_team_id = str(payload.get("player_team_id", "")).strip()
+                        value_to_increase = _safe_int(payload.get("value_to_increase"), 0)
+                        if not player_team_id or value_to_increase <= 0:
+                            raise ValueError("faltan player_team_id o value_to_increase")
+                        client.increase_player_clause(
+                            player_team_id=player_team_id,
+                            value_to_increase=value_to_increase,
+                            factor=2.0,
+                        )
+                        summary["actions_ok"] += 1
+                        summary["clausulas_subidas"] += 1
+                        if remaining_balance is not None:
+                            remaining_balance -= cash_cost
+                        summary["details"].append(f"[OK] {idx}. {label}")
+                        finish_langsmith_span(
+                            action_span,
+                            {"ok": True, "tool": tool, "player_team_id": player_team_id, "value_to_increase": value_to_increase},
+                        )
+                        continue
+
+                    msg = f"Paso {idx}: tool no soportada ({tool})"
+                    summary["errors"].append(msg)
+                    summary["details"].append(f"[ERROR] {idx}. {label} -> {msg}")
+                    finish_langsmith_span(action_span, {"ok": False, "tool": tool, "error": msg})
+                except Exception as exc:
+                    detail = _exception_detail(exc)
+                    msg = f"Paso {idx} ({tool}): {detail}"
+                    summary["errors"].append(msg)
+                    summary["details"].append(f"[ERROR] {idx}. {label} -> {detail}")
+                    finish_langsmith_span(
+                        action_span,
+                        {"ok": False, "tool": tool, "error_type": type(exc).__name__, "error": detail},
+                    )
+
+        summary["saldo_restante_estimado"] = remaining_balance
+        finish_langsmith_span(
+            plan_span,
+            {
+                "ok": not bool(summary["errors"]),
+                "actions_total": summary["actions_total"],
+                "actions_ok": summary["actions_ok"],
+                "actions_skipped": summary["actions_skipped"],
+                "ventas": summary["ventas"],
+                "pujas": summary["pujas"],
+                "clausulazos": summary["clausulazos"],
+                "clausulas_subidas": summary["clausulas_subidas"],
+                "errors": len(summary["errors"]),
+                "saldo_actual": summary["saldo_actual"],
+                "saldo_restante_estimado": summary["saldo_restante_estimado"],
+            },
+        )
+        return summary
 
 
 def _api(bot_token: str, method: str, payload: dict | None = None) -> dict:
@@ -913,36 +1167,48 @@ def _norm(text: str) -> str:
 def _cmd_list_leagues() -> str:
     leagues, err = _list_user_leagues()
     if err:
-        return f"No se pudieron listar ligas: {err}"
+        return build_error_message("No se pudieron listar ligas", err)
     if not leagues:
-        return "No se encontraron ligas para este usuario."
+        return build_standard_message(
+            title="🏆 Ligas",
+            status="Sin resultados",
+            sections=[("Resultado", ["No se encontraron ligas para este usuario."])],
+        )
 
     selected_id = resolve_league_id("")
-    lines = ["Ligas disponibles:"]
+    rows = []
     for i, lg in enumerate(leagues, 1):
-        mark = " ✅" if str(lg["id"]) == str(selected_id) else ""
-        lines.append(f"{i}. {lg['name']}{mark}")
-    lines.append("")
-    lines.append("Usa /liga <nombre> para seleccionarla.")
-    return "\n".join(lines)
+        mark = " · activa" if str(lg["id"]) == str(selected_id) else ""
+        rows.append(f"{i}. {lg['name']}{mark}")
+    return build_standard_message(
+        title="🏆 Ligas disponibles",
+        status=f"{len(leagues)} liga(s) encontradas",
+        sections=[("Opciones", rows)],
+        footer="Usa /liga <nombre> o /liga <número> para seleccionarla.",
+    )
 
 
 def _cmd_select_league(raw_text: str) -> str:
     parts = raw_text.strip().split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         current = _selected_league_text()
-        return (
-            f"{current}\n"
-            "Para seleccionar liga: /liga <nombre>\n"
-            "Para ver ligas: /ligas"
+        return build_standard_message(
+            title="🏆 Liga activa",
+            status="Sin cambios",
+            sections=[("Estado", [current])],
+            footer="Para seleccionar liga: /liga <nombre>. Para ver opciones: /ligas.",
         )
     target = parts[1].strip()
 
     leagues, err = _list_user_leagues()
     if err:
-        return f"No se pudo seleccionar liga: {err}"
+        return build_error_message("No se pudo seleccionar liga", err)
     if not leagues:
-        return "No se encontraron ligas para este usuario."
+        return build_standard_message(
+            title="🏆 Liga activa",
+            status="Sin resultados",
+            sections=[("Resultado", ["No se encontraron ligas para este usuario."])],
+        )
 
     chosen = None
     if target.isdigit():
@@ -955,28 +1221,30 @@ def _cmd_select_league(raw_text: str) -> str:
         if len(exact) == 1:
             chosen = exact[0]
         elif len(exact) > 1:
-            names = "\n".join(f"- {lg['name']}" for lg in exact[:10])
-            return (
-                "Hay varias ligas con ese nombre exacto. "
-                "Escribe el nombre completo tal cual o usa el número:\n"
-                f"{names}"
+            return build_standard_message(
+                title="🏆 Liga activa",
+                status="Coincidencia múltiple",
+                sections=[("Opciones", [lg["name"] for lg in exact[:10]])],
+                footer="Escribe el nombre completo tal cual o usa el número de /ligas.",
             )
         else:
             partial = [lg for lg in leagues if norm_target in _norm(lg.get("name", ""))]
             if len(partial) == 1:
                 chosen = partial[0]
             elif len(partial) > 1:
-                names = "\n".join(f"- {lg['name']}" for lg in partial[:10])
-                return (
-                    "Coinciden varias ligas con ese texto. "
-                    "Escribe un nombre más específico o usa el número:\n"
-                    f"{names}"
+                return build_standard_message(
+                    title="🏆 Liga activa",
+                    status="Coincidencia múltiple",
+                    sections=[("Opciones", [lg["name"] for lg in partial[:10]])],
+                    footer="Escribe un nombre más específico o usa el número de /ligas.",
                 )
 
     if not chosen:
-        return (
-            f"No encontré la liga '{target}'.\n"
-            "Usa /ligas para ver opciones y luego /liga <nombre>."
+        return build_standard_message(
+            title="🏆 Liga activa",
+            status="No encontrada",
+            sections=[("Búsqueda", [f"No encontré la liga '{target}'."])],
+            footer="Usa /ligas para ver opciones y luego /liga <nombre>.",
         )
 
     save_selected_league(chosen["id"], chosen["name"], source="telegram")
@@ -984,15 +1252,16 @@ def _cmd_select_league(raw_text: str) -> str:
         chosen["id"],
         timezone_name=os.getenv("TZ", "Europe/Madrid"),
     )
-    schedule_txt = (
-        "\n\n" + schedule_message(sched)
+    schedule_rows = (
+        schedule_message(sched).splitlines()
         if sched
-        else f"\n\nNo pude calcular la hora de mercado ahora: {sched_err}"
+        else [f"No pude calcular la hora de mercado ahora: {sched_err}"]
     )
-    return (
-        "Liga seleccionada correctamente.\n"
-        f"{chosen['name']}"
-        f"{schedule_txt}"
+    return build_standard_message(
+        title="🏆 Liga activa",
+        status="Seleccionada correctamente",
+        league_name=chosen["name"],
+        sections=[("Horario", schedule_rows)],
     )
 
 
@@ -1008,136 +1277,258 @@ def _run_langchain_agent_cmd(
     send_telegram_message(
         bot_token,
         chat_id,
-        "Generando informe IA (LangChain)..."
-        if dry_run
-        else "Ejecutando plan IA de compraventa (LangChain)...",
+        build_progress_message(
+            "📊 Informe IA" if dry_run else "💸 Compraventa IA",
+            "Generando informe y preparando plan cacheado."
+            if dry_run
+            else "Ejecutando el plan cacheado del ciclo actual.",
+        ),
+        parse_mode=TELEGRAM_PARSE_MODE,
     )
 
     league_id, league_err = _resolve_operational_league_id()
     if not league_id:
-        return f"Error de liga: {league_err}"
+        return build_error_message("Liga no disponible", league_err, footer="Usa /ligas y /liga <nombre> para seleccionar una liga.")
 
     status, _ = _token_status(max_age_hours=float(os.getenv("TOKEN_MAX_AGE_HOURS", "23")))
     if status != "ok":
-        return f"Error: token no valido ({status}). Renuevalo con /help."
+        return build_error_message("Token no válido", f"Estado: {status}", footer="Renueva el token siguiendo /help.")
 
-    try:
-        market_key, market_err = _market_key_for_league(league_id)
-        if not market_key:
-            return f"No se pudo resolver ciclo de mercado actual: {market_err}"
+    selected = load_selected_league() or {}
+    league_name = str(selected.get("league_name", "")).strip() or league_id
+    command_name = "informe" if dry_run else "compraventa"
+    span_run_name = "fantasy-bot.manual-report" if dry_run else "fantasy-bot.manual-compraventa"
 
-        selected = load_selected_league() or {}
-        league_name = str(selected.get("league_name", "")).strip() or league_id
+    with langsmith_run_span(
+        span_run_name,
+        run_type="chain",
+        phase="pre",
+        command=command_name,
+        league_id=league_id,
+        dry_run=bool(dry_run),
+        extra_metadata={
+            "channel": "telegram",
+            "session": _telegram_session_label(chat_id),
+        },
+        inputs={"command": command_name},
+    ) as span:
+        try:
+            market_key, market_err = _market_key_for_league(league_id)
+            if not market_key:
+                finish_langsmith_span(span, {"ok": False, "error": market_err or "market_key vacío"})
+                return build_error_message("Ciclo de mercado no disponible", market_err)
 
-        if dry_run:
-            res = run_agent_objective(
+            if dry_run:
+                res = run_agent_objective(
+                    league_id=league_id,
+                    objective=REPORT_PLAN_OBJECTIVE,
+                    phase="pre",
+                    llm_model=os.getenv("LANGCHAIN_LLM_MODEL", "gpt-5-mini"),
+                    temperature=float(os.getenv("LANGCHAIN_TEMPERATURE", "0.1")),
+                    max_iterations=max(1, int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20"))),
+                    dry_run=True,
+                    verbose=False,
+                    trace_run_name="fantasy-bot.manual-report",
+                    trace_command="informe",
+                    trace_market_cycle_id=market_key,
+                    trace_extra_metadata={
+                        "channel": "telegram",
+                        "session": _telegram_session_label(chat_id),
+                    },
+                )
+
+                output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
+                steps = res.get("steps", []) or []
+                simulation_payload = _extract_latest_simulation_payload(steps)
+                actions, action_source = _extract_executable_actions(steps)
+                sim_summary = (
+                    simulation_payload.get("summary")
+                    if isinstance(simulation_payload.get("summary"), dict)
+                    else {}
+                )
+                debt_mode = _summary_requires_debt_mode(sim_summary)
+                if debt_mode:
+                    filtered_actions = _filter_debt_mode_actions(actions)
+                    if len(filtered_actions) != len(actions):
+                        action_source = f"{action_source}+debt_filter"
+                    actions = filtered_actions
+
+                cache_payload = {
+                    "version": 1,
+                    "created_at": _now_iso(),
+                    "league_id": league_id,
+                    "league_name": league_name,
+                    "market_key": market_key,
+                    "llm_model": str(res.get("llm_model", "")),
+                    "objective": REPORT_PLAN_OBJECTIVE,
+                    "output": output,
+                    "action_source": action_source,
+                    "simulation_summary": sim_summary,
+                    "actions": actions,
+                    "actions_count": len(actions),
+                    "executed_at": "",
+                }
+                _save_report_plan_cache(cache_payload)
+
+                report_text = _build_informe_message(
+                    league_name=league_name,
+                    market_key=market_key,
+                    steps=steps,
+                    output=output,
+                    actions=actions,
+                    action_source=action_source,
+                    simulation_payload=simulation_payload,
+                )
+                send_telegram_message(bot_token, chat_id, report_text, parse_mode=TELEGRAM_PARSE_MODE)
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": True,
+                        "market_key": market_key,
+                        "actions_count": len(actions),
+                        "tools_count": len(steps),
+                    },
+                )
+                return build_standard_message(
+                    title="📊 Informe IA",
+                    status="Completado",
+                    league_name=league_name,
+                    market_key=market_key,
+                    sections=[("Resultado", ["Informe generado", "Plan cacheado para este ciclo"])],
+                    footer="Revisa el informe anterior y usa /compraventa si quieres ejecutar el plan.",
+                )
+
+            cache = _load_report_plan_cache()
+            if not cache:
+                finish_langsmith_span(span, {"ok": False, "reason": "sin_plan_cacheado", "market_key": market_key})
+                return build_standard_message(
+                    title="💸 Compraventa IA",
+                    status="Sin plan cacheado",
+                    league_name=league_name,
+                    market_key=market_key,
+                    sections=[("Resultado", ["No hay plan de /informe disponible para este ciclo."])],
+                    footer="Primero ejecuta /informe.",
+                )
+
+            cached_league = str(cache.get("league_id", "")).strip()
+            cached_market_key = str(cache.get("market_key", "")).strip()
+            if cached_league != league_id or cached_market_key != market_key:
+                finish_langsmith_span(
+                    span,
+                    {
+                        "ok": False,
+                        "reason": "plan_desactualizado",
+                        "market_key": market_key,
+                        "cached_market_key": cached_market_key,
+                    },
+                )
+                return build_standard_message(
+                    title="💸 Compraventa IA",
+                    status="Plan desactualizado",
+                    league_name=league_name,
+                    market_key=market_key,
+                    sections=[
+                        (
+                            "Ciclos",
+                            [
+                                f"Actual: {market_key}",
+                                f"Informe cacheado: {cached_market_key or '(sin ciclo)'}",
+                            ],
+                        )
+                    ],
+                    footer="Vuelve a ejecutar /informe y después /compraventa.",
+                )
+
+            if str(cache.get("executed_at", "")).strip():
+                finish_langsmith_span(span, {"ok": False, "reason": "plan_ya_ejecutado", "market_key": market_key})
+                return build_standard_message(
+                    title="💸 Compraventa IA",
+                    status="Plan ya ejecutado",
+                    league_name=league_name,
+                    market_key=market_key,
+                    sections=[("Resultado", ["Este plan ya fue ejecutado en este ciclo."])],
+                    footer="Ejecuta /informe para generar uno nuevo.",
+                )
+
+            actions = cache.get("actions", [])
+            if not isinstance(actions, list) or not actions:
+                finish_langsmith_span(span, {"ok": False, "reason": "sin_acciones", "market_key": market_key})
+                return build_standard_message(
+                    title="💸 Compraventa IA",
+                    status="Sin acciones ejecutables",
+                    league_name=league_name,
+                    market_key=market_key,
+                    sections=[("Resultado", ["El /informe de este ciclo no dejó acciones ejecutables."])],
+                    footer="Genera un nuevo /informe y revisa el plan propuesto.",
+                )
+
+            sim_summary = cache.get("simulation_summary", {})
+            sim_summary = sim_summary if isinstance(sim_summary, dict) else {}
+            summary = _execute_cached_actions(
                 league_id=league_id,
-                objective=REPORT_PLAN_OBJECTIVE,
-                phase="pre",
-                llm_model=os.getenv("LANGCHAIN_LLM_MODEL", "gpt-5-mini"),
-                temperature=float(os.getenv("LANGCHAIN_TEMPERATURE", "0.1")),
-                max_iterations=max(1, int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20"))),
-                dry_run=True,
-                verbose=False,
+                actions=actions,
+                fallback_balance=sim_summary.get("saldo_actual"),
+                trace_command="compraventa",
+                trace_channel="telegram",
+                trace_session=_telegram_session_label(chat_id),
+                market_cycle_id=market_key,
             )
+            cache["executed_at"] = _now_iso()
+            cache["execution_summary"] = summary
+            _save_report_plan_cache(cache)
 
-            output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
-            steps = res.get("steps", []) or []
-            simulation_payload = _extract_latest_simulation_payload(steps)
-            actions, action_source = _extract_executable_actions(steps)
-            report_payload = _extract_agent_report_payload(output)
-            if not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions):
-                inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
-                if inferred_clause_actions:
-                    actions.extend(inferred_clause_actions)
-                    action_source = (
-                        "tool_calls+report_clause_fallback"
-                        if action_source == "tool_calls"
-                        else "simulate_transfer_plan+report_clause_fallback"
-                    )
-            sim_summary = (
-                simulation_payload.get("summary")
-                if isinstance(simulation_payload.get("summary"), dict)
-                else {}
-            )
-
-            cache_payload = {
-                "version": 1,
-                "created_at": _now_iso(),
-                "league_id": league_id,
-                "league_name": league_name,
-                "market_key": market_key,
-                "llm_model": str(res.get("llm_model", "")),
-                "objective": REPORT_PLAN_OBJECTIVE,
-                "output": output,
-                "action_source": action_source,
-                "simulation_summary": sim_summary,
-                "actions": actions,
-                "actions_count": len(actions),
-                "executed_at": "",
-            }
-            _save_report_plan_cache(cache_payload)
-
-            report_text = _build_informe_message(
+            errors = summary.get("errors", []) or []
+            resume = _build_compraventa_message(
                 league_name=league_name,
                 market_key=market_key,
-                steps=steps,
-                output=output,
-                actions=actions,
-                action_source=action_source,
-                simulation_payload=simulation_payload,
-            )
-            send_telegram_message(bot_token, chat_id, report_text)
-            return "Informe IA generado y plan cacheado para este ciclo."
-
-        # /compraventa: ejecutar EXACTAMENTE el último plan de /informe del mismo ciclo.
-        cache = _load_report_plan_cache()
-        if not cache:
-            return (
-                "No hay plan cacheado de /informe para ejecutar.\n"
-                "Primero ejecuta /informe en este ciclo de mercado."
+                action_source=str(cache.get("action_source", "")).strip() or "none",
+                summary=summary,
             )
 
-        cached_league = str(cache.get("league_id", "")).strip()
-        cached_market_key = str(cache.get("market_key", "")).strip()
-        if cached_league != league_id or cached_market_key != market_key:
-            return (
-                "El ultimo /informe no pertenece al ciclo de mercado actual.\n"
-                f"Actual: {market_key} | Informe cacheado: {cached_market_key or '(sin ciclo)'}\n"
-                "Vuelve a ejecutar /informe y despues /compraventa."
+            send_telegram_message(bot_token, chat_id, resume, parse_mode=TELEGRAM_PARSE_MODE)
+            finish_langsmith_span(
+                span,
+                {
+                    "ok": not bool(errors),
+                    "market_key": market_key,
+                    "actions_total": summary.get("actions_total"),
+                    "actions_ok": summary.get("actions_ok"),
+                    "actions_skipped": summary.get("actions_skipped"),
+                    "errors": len(errors),
+                },
             )
-
-        if str(cache.get("executed_at", "")).strip():
-            return "Este plan ya fue ejecutado en este ciclo. Ejecuta /informe para generar uno nuevo."
-
-        actions = cache.get("actions", [])
-        if not isinstance(actions, list) or not actions:
-            return (
-                "El /informe de este ciclo no dejó acciones ejecutables.\n"
-                "Genera un nuevo /informe y revisa que incluya plan de compraventa."
+            if errors:
+                return build_standard_message(
+                    title="💸 Compraventa IA",
+                    status="Ejecutada con errores",
+                    league_name=league_name,
+                    market_key=market_key,
+                    sections=[("Resultado", [f"Errores detectados: {len(errors)}"])],
+                    footer="Revisa el resumen anterior antes de lanzar otra acción.",
+                )
+            return build_standard_message(
+                title="💸 Compraventa IA",
+                status="Completada",
+                league_name=league_name,
+                market_key=market_key,
+                sections=[("Resultado", ["Plan cacheado ejecutado correctamente."])],
             )
-
-        summary = _execute_cached_actions(league_id=league_id, actions=actions)
-        cache["executed_at"] = _now_iso()
-        cache["execution_summary"] = summary
-        _save_report_plan_cache(cache)
-
-        errors = summary.get("errors", []) or []
-        resume = _build_compraventa_message(
-            league_name=league_name,
-            market_key=market_key,
-            action_source=str(cache.get("action_source", "")).strip() or "none",
-            summary=summary,
-        )
-
-        send_telegram_message(bot_token, chat_id, resume)
-        if errors:
-            return f"Compraventa ejecutada con errores ({len(errors)})."
-        return "Compraventa ejecutada con el plan cacheado del informe."
-    except Exception as exc:
-        cmd = "/informe" if dry_run else "/compraventa"
-        logger.exception("Error en %s (LangChain): %s", cmd, exc)
-        return f"Error ejecutando {cmd} (LangChain): {type(exc).__name__}: {exc}"
+        except Exception as exc:
+            cmd = "/informe" if dry_run else "/compraventa"
+            logger.exception("Error en %s (LangChain): %s", cmd, exc)
+            finish_langsmith_span(
+                span,
+                {
+                    "ok": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            return build_error_message(
+                f"Error ejecutando {cmd}",
+                f"{type(exc).__name__}: {exc}",
+                footer="Revisa logs si el error se repite.",
+            )
 
 
 def _run_optimize_lineup_cmd(
@@ -1148,62 +1539,116 @@ def _run_optimize_lineup_cmd(
     """
     Recalcula y guarda la mejor alineación actual por xP (xgboost).
     """
-    send_telegram_message(bot_token, chat_id, "Optimizando alineacion actual por xP...")
+    send_telegram_message(
+        bot_token,
+        chat_id,
+        build_progress_message("🧩 Optimizar alineación", "Calculando el mejor once por xP."),
+        parse_mode=TELEGRAM_PARSE_MODE,
+    )
 
     league_id, league_err = _resolve_operational_league_id()
     if not league_id:
-        return f"Error de liga: {league_err}"
+        return build_error_message("Liga no disponible", league_err, footer="Usa /ligas y /liga <nombre> para seleccionar una liga.")
 
     status, _ = _token_status(max_age_hours=float(os.getenv("TOKEN_MAX_AGE_HOURS", "23")))
     if status != "ok":
-        return f"Error: token no valido ({status}). Renuevalo con /help."
+        return build_error_message("Token no válido", f"Estado: {status}", footer="Renueva el token siguiendo /help.")
 
     selected = load_selected_league() or {}
     league_name = str(selected.get("league_name", "")).strip() or league_id
 
-    try:
-        result = autoset_best_lineup(
-            league_id=league_id,
-            model="xgboost",
-            day_before_only=False,
-            after_market_time="00:00",
-            timezone_name=os.getenv("TZ", "Europe/Madrid"),
-            force=True,
-            dry_run=False,
+    with langsmith_run_span(
+        "fantasy-bot.manual-optimizar",
+        run_type="chain",
+        phase="post",
+        command="optimizar",
+        league_id=league_id,
+        dry_run=False,
+        extra_metadata={
+            "channel": "telegram",
+            "session": _telegram_session_label(chat_id),
+        },
+        inputs={"command": "optimizar"},
+    ) as span:
+        try:
+            result = autoset_best_lineup(
+                league_id=league_id,
+                model="xgboost",
+                day_before_only=False,
+                after_market_time="00:00",
+                timezone_name=os.getenv("TZ", "Europe/Madrid"),
+                force=True,
+                dry_run=False,
+            )
+        except Exception as exc:
+            logger.exception("Error en /optimizar: %s", exc)
+            finish_langsmith_span(
+                span,
+                {"ok": False, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            return build_error_message("Error ejecutando /optimizar", _exception_detail(exc))
+
+        finish_langsmith_span(
+            span,
+            {
+                "ok": bool(result.get("applied")),
+                "applied": bool(result.get("applied")),
+                "skipped": bool(result.get("skipped")),
+                "formation": result.get("formation"),
+                "xp_once": result.get("xp_once"),
+                "jornada": result.get("jornada"),
+            },
         )
-    except Exception as exc:
-        logger.exception("Error en /optimizar: %s", exc)
-        return f"Error ejecutando /optimizar: {type(exc).__name__}: {exc}"
+        if result.get("applied"):
+            formation = result.get("formation") or []
+            form_txt = "-".join(str(x) for x in formation) if formation else "?"
+            xp_once = result.get("xp_once")
+            xp_txt = (
+                f"{_safe_float(xp_once):.1f}"
+                if xp_once not in (None, "")
+                else "?"
+            )
+            jornada = result.get("jornada", "?")
+            return build_standard_message(
+                title="🧩 Alineación optimizada",
+                status="Guardada en LaLiga Fantasy",
+                league_name=league_name,
+                sections=[
+                    (
+                        "Once",
+                        [
+                            f"Jornada: {jornada}",
+                            f"Formación: {form_txt}",
+                            f"xP del once: {xp_txt}",
+                        ],
+                    )
+                ],
+            )
 
-    if result.get("applied"):
-        formation = result.get("formation") or []
-        form_txt = "-".join(str(x) for x in formation) if formation else "?"
-        xp_once = result.get("xp_once")
-        xp_txt = (
-            f"{_safe_float(xp_once):.1f}"
-            if xp_once not in (None, "")
-            else "?"
+        if result.get("skipped"):
+            reason = str(result.get("reason", "sin detalle"))
+            return build_standard_message(
+                title="🧩 Alineación optimizada",
+                status="No aplicada",
+                league_name=league_name,
+                sections=[("Motivo", [reason])],
+            )
+
+        if result.get("dry_run"):
+            return build_standard_message(
+                title="🧩 Alineación optimizada",
+                status="Dry-run",
+                league_name=league_name,
+                sections=[("Resultado", ["Simulación completada sin cambios reales."])],
+            )
+
+        reason = str(result.get("reason", "resultado no esperado"))
+        return build_standard_message(
+            title="🧩 Alineación optimizada",
+            status="No aplicada",
+            league_name=league_name,
+            sections=[("Motivo", [reason])],
         )
-        jornada = result.get("jornada", "?")
-        text = (
-            "ALINEACION OPTIMIZADA\n"
-            f"Liga: {league_name}\n"
-            f"Jornada: {jornada}\n"
-            f"Formacion: {form_txt}\n"
-            f"xP del once: {xp_txt}\n"
-            "Estado: guardada en LaLiga Fantasy."
-        )
-        return text
-
-    if result.get("skipped"):
-        reason = str(result.get("reason", "sin detalle"))
-        return f"No se pudo optimizar ahora: {reason}"
-
-    if result.get("dry_run"):
-        return "Optimizacion en dry-run (sin cambios)."
-
-    reason = str(result.get("reason", "resultado no esperado"))
-    return f"No se pudo optimizar la alineacion: {reason}"
 
 
 def _run_pending_sales_cmd(
@@ -1215,37 +1660,66 @@ def _run_pending_sales_cmd(
     Acepta ofertas de liga pendientes (fase 2 de ventas) una vez cerrado mercado.
     Equivale a `python -m prediction.advisor_execute --aceptar-ofertas`.
     """
-    send_telegram_message(bot_token, chat_id, "Ejecutando ventas pendientes (fase 2)...")
+    send_telegram_message(
+        bot_token,
+        chat_id,
+        build_progress_message("🤝 Ventas pendientes", "Revisando ofertas cerradas de la liga."),
+        parse_mode=TELEGRAM_PARSE_MODE,
+    )
 
     league_id, league_err = _resolve_operational_league_id()
     if not league_id:
-        return f"Error de liga: {league_err}"
+        return build_error_message("Liga no disponible", league_err, footer="Usa /ligas y /liga <nombre> para seleccionar una liga.")
 
     status, _ = _token_status(max_age_hours=float(os.getenv("TOKEN_MAX_AGE_HOURS", "23")))
     if status != "ok":
-        return f"Error: token no valido ({status}). Renuevalo con /help."
+        return build_error_message("Token no válido", f"Estado: {status}", footer="Renueva el token siguiendo /help.")
 
     selected = load_selected_league() or {}
     league_name = str(selected.get("league_name", "")).strip() or league_id
 
-    try:
-        accepted = int(run_aceptar_ofertas(argparse.Namespace(league=league_id)))
-    except Exception as exc:
-        logger.exception("Error en /ventas: %s", exc)
-        return f"Error ejecutando /ventas: {type(exc).__name__}: {exc}"
+    with langsmith_run_span(
+        "fantasy-bot.manual-ventas",
+        run_type="chain",
+        phase="post",
+        command="ventas",
+        league_id=league_id,
+        dry_run=False,
+        extra_metadata={
+            "channel": "telegram",
+            "session": _telegram_session_label(chat_id),
+        },
+        inputs={"command": "ventas"},
+    ) as span:
+        try:
+            accepted = int(run_aceptar_ofertas(argparse.Namespace(league=league_id)))
+        except Exception as exc:
+            logger.exception("Error en /ventas: %s", exc)
+            finish_langsmith_span(
+                span,
+                {"ok": False, "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            return build_error_message("Error ejecutando /ventas", f"{type(exc).__name__}: {exc}")
 
-    if accepted > 0:
-        return (
-            "VENTAS EJECUTADAS\n"
-            f"Liga: {league_name}\n"
-            f"Ofertas de liga aceptadas: {accepted}\n"
-            "Estado: fase 2 de ventas completada."
+        finish_langsmith_span(
+            span,
+            {"ok": True, "accepted_offers": accepted},
         )
+        if accepted > 0:
+            return build_standard_message(
+                title="🤝 Ventas pendientes",
+                status="Fase 2 completada",
+                league_name=league_name,
+                sections=[("Resultado", [f"Ofertas de liga aceptadas: {accepted}"])],
+            )
 
-    return (
-        "No hay ventas pendientes para aceptar ahora.\n"
-        "Si acabas de publicar ventas, espera al cierre de mercado y vuelve a usar /ventas."
-    )
+        return build_standard_message(
+            title="🤝 Ventas pendientes",
+            status="Sin acciones",
+            league_name=league_name,
+            sections=[("Resultado", ["No hay ventas pendientes para aceptar ahora."])],
+            footer="Si acabas de publicar ventas, espera al cierre de mercado y vuelve a usar /ventas.",
+        )
 
 
 def _handle_text(
@@ -1256,24 +1730,31 @@ def _handle_text(
 ) -> tuple[bool, str]:
     t = text.strip().lower()
     if t.startswith("/start") or t.startswith("/help"):
-        return (
-            False,
-            "Comandos:\n"
-            "• /help - Esta ayuda\n"
-            "• /status - Estado del token\n"
-            "• /ligas - Listar ligas disponibles\n"
-            "• /liga <nombre> - Seleccionar liga activa\n"
-            "• /informe - Generar informe IA y cachear plan del ciclo\n"
-            "• /compraventa - Ejecutar en real el plan del ultimo /informe (mismo ciclo)\n\n"
-            "• /ventas - Aceptar ofertas de liga pendientes (fase 2 tras cierre)\n"
-            "• /optimizar - Guardar ahora la mejor alineacion por xP\n\n"
-            "Para renovar token: envia JWT (eyJ...) o URL de jwt.ms con id_token.",
+        return False, build_help_message()
+
+    if t.startswith("/token") or t.startswith("/renovar"):
+        token_max_age = float(os.getenv("TOKEN_MAX_AGE_HOURS", "23"))
+        status, age_h = _token_status(max_age_hours=token_max_age)
+        # Aunque el token siga vivo, /token debe devolver SIEMPRE el flujo de
+        # renovación con la URL completa: el usuario lo lanza precisamente
+        # cuando quiere renovar antes de la caducidad.
+        renewal_status = status if status != "ok" else "renovacion_manual"
+        return False, build_token_renewal_message(
+            status=renewal_status, age_h=age_h
         )
+
     if t.startswith("/status"):
         age = _token_age_hours()
         if age is None:
-            return False, "No hay token valido guardado."
-        return False, f"Token guardado. Edad aproximada: {age:.1f}h.\n{_selected_league_text()}"
+            return False, build_token_renewal_message(status="missing")
+        return False, build_standard_message(
+            title="🩺 Estado del bot",
+            status="Operativo",
+            sections=[
+                ("Token", [f"Edad aproximada: {age:.1f}h"]),
+                ("Liga", [_selected_league_text()]),
+            ],
+        )
 
     if t.startswith("/ligas"):
         return False, _cmd_list_leagues()
@@ -1289,7 +1770,7 @@ def _handle_text(
                 dry_run=True,
             )
         else:
-            msg = "Comando /informe requiere contexto de bot."
+            msg = build_error_message("Comando no disponible", "/informe requiere contexto de bot.")
         return False, msg
 
     if t.startswith("/compraventa"):
@@ -1300,7 +1781,7 @@ def _handle_text(
                 dry_run=False,
             )
         else:
-            msg = "Comando /compraventa requiere contexto de bot."
+            msg = build_error_message("Comando no disponible", "/compraventa requiere contexto de bot.")
         return False, msg
 
     if t.startswith("/ventas"):
@@ -1310,7 +1791,7 @@ def _handle_text(
                 chat_id=chat_id,
             )
         else:
-            msg = "Comando /ventas requiere contexto de bot."
+            msg = build_error_message("Comando no disponible", "/ventas requiere contexto de bot.")
         return False, msg
 
     if t.startswith("/optimizar"):
@@ -1320,12 +1801,17 @@ def _handle_text(
                 chat_id=chat_id,
             )
         else:
-            msg = "Comando /optimizar requiere contexto de bot."
+            msg = build_error_message("Comando no disponible", "/optimizar requiere contexto de bot.")
         return False, msg
 
     token = _extract_token_from_text(text.strip())
     if not token:
-        return False, "No detecte un token valido. Usa /help para instrucciones."
+        return False, build_standard_message(
+            title="🤖 Fantasy Bot",
+            status="Mensaje no reconocido",
+            sections=[("Detalle", ["No detecté un comando ni un token válido."])],
+            footer="Usa /help para ver instrucciones.",
+        )
 
     save_token(token)
     leagues, err = _list_user_leagues()
@@ -1336,21 +1822,25 @@ def _handle_text(
             lg["id"],
             timezone_name=os.getenv("TZ", "Europe/Madrid"),
         )
-        schedule_txt = (
-            "\n\n" + schedule_message(sched)
+        schedule_rows = (
+            schedule_message(sched).splitlines()
             if sched
-            else f"\n\nNo pude calcular la hora de mercado ahora: {sched_err}"
+            else [f"No pude calcular la hora de mercado ahora: {sched_err}"]
         )
-        return (
-            True,
-            "Token guardado correctamente en .laliga_token.\n"
-            f"Liga auto-seleccionada: {lg['name']}"
-            f"{schedule_txt}",
+        return True, build_standard_message(
+            title="🔐 Token actualizado",
+            status="Guardado correctamente",
+            league_name=lg["name"],
+            sections=[
+                ("Liga", ["Liga auto-seleccionada al ser la única disponible."]),
+                ("Horario", schedule_rows),
+            ],
         )
-    return (
-        True,
-        "Token guardado correctamente en .laliga_token.\n"
-        "Si tienes varias ligas, usa /ligas y /liga para elegir la activa.",
+    return True, build_standard_message(
+        title="🔐 Token actualizado",
+        status="Guardado correctamente",
+        sections=[("Liga", ["Hay varias ligas disponibles."])],
+        footer="Usa /ligas y /liga para elegir la activa.",
     )
 
 
@@ -1364,6 +1854,7 @@ def _set_bot_commands(bot_token: str) -> None:
         {"command": "ligas", "description": "Listar ligas disponibles"},
         {"command": "liga", "description": "Seleccionar liga por nombre"},
         {"command": "status", "description": "Estado del token"},
+        {"command": "token", "description": "Enviar enlace para renovar el token"},
         {"command": "help", "description": "Ayuda y lista de comandos"},
     ]
     try:
@@ -1407,22 +1898,19 @@ def run_token_bot(
     if notify_chat_id:
         token_max_age = float(os.getenv("TOKEN_MAX_AGE_HOURS", "23"))
         status, age_h = _token_status(max_age_hours=token_max_age)
-        if status == "missing":
-            msg = "Fantasy Autopilot TOKEN AUSENTE" + GUIDA_RENOVACION_TOKEN
-        elif status == "expired":
-            msg = (
-                f"Fantasy Autopilot TOKEN CADUCADO (edad ~{age_h:.1f}h)"
-                + GUIDA_RENOVACION_TOKEN
-            )
-        elif status == "invalid":
-            msg = "Fantasy Autopilot TOKEN INVALIDO" + GUIDA_RENOVACION_TOKEN
+        if status in ("missing", "expired", "invalid"):
+            msg = build_token_renewal_message(status=status, age_h=age_h)
         else:
-            msg = (
-                "Token bot iniciado. Envíame token/URL para refrescar .laliga_token.\n"
-                f"{_selected_league_text()}\n"
-                "Puedes cambiarla con /ligas y /liga <nombre>."
+            msg = build_standard_message(
+                title="🤖 Fantasy Bot iniciado",
+                status="Escuchando Telegram",
+                sections=[
+                    ("Token", ["Token actual válido"]),
+                    ("Liga", [_selected_league_text()]),
+                ],
+                footer="Puedes cambiar la liga con /ligas y /liga <nombre>.",
             )
-        send_telegram_message(bot_token, notify_chat_id, msg)
+        send_telegram_message(bot_token, notify_chat_id, msg, parse_mode=TELEGRAM_PARSE_MODE)
 
     _set_bot_commands(bot_token)
 
@@ -1462,6 +1950,7 @@ def run_token_bot(
                         "chat_id": chat_id,
                         "text": response,
                         "disable_web_page_preview": True,
+                        "parse_mode": TELEGRAM_PARSE_MODE,
                     },
                 )
                 if changed:

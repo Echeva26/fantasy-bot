@@ -1,5 +1,5 @@
 """
-Daemon autónomo para el agente LangChain.
+Daemon autónomo para el agente LangGraph/LangChain.
 
 Ejemplo:
   python -m prediction.langchain_autonomous
@@ -20,17 +20,23 @@ from zoneinfo import ZoneInfo
 from laliga_fantasy_client import TOKEN_FILE, load_token
 from prediction.league_selection import load_selected_league, resolve_league_id
 from prediction.langchain_agent import run_agent_objective, run_agent_phase
+from prediction.langsmith_config import finish_langsmith_span, langsmith_run_span
 from prediction.lineup_autoset import autoset_best_lineup
 from prediction.market_schedule import build_market_schedule, schedule_message
 from prediction.predict import get_next_round, get_sofascore_season_id
-from prediction.telegram_notify import GUIDA_RENOVACION_TOKEN, send_telegram_message
+from prediction.telegram_messages import (
+    TELEGRAM_PARSE_MODE,
+    build_agent_cycle_message,
+    build_error_message,
+    build_standard_message,
+    build_token_renewal_message,
+)
+from prediction.telegram_notify import send_telegram_message
 from prediction.token_bot import (
     REPORT_PLAN_OBJECTIVE,
-    _build_clause_actions_from_report,
     _build_compraventa_message,
     _build_informe_message,
     _execute_cached_actions,
-    _extract_agent_report_payload,
     _extract_executable_actions,
     _extract_latest_simulation_payload,
     _now_iso,
@@ -45,6 +51,16 @@ POLL_SECONDS = 30
 MARKET_REFRESH_SECONDS = 300
 LINEUP_REFRESH_SECONDS = 900
 LINEUP_MINUTES_BEFORE_FIRST_MATCH = 23 * 60 + 55
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default)) or default))
+    except Exception:
+        return default
+
+
+LINEUP_ERROR_RETRY_SECONDS = _env_int("LINEUP_ERROR_RETRY_SECONDS", 3600)
 
 
 def _parse_iso_dt(raw: str | None) -> datetime | None:
@@ -86,11 +102,11 @@ def _save_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
-def _notify(text: str) -> None:
+def _notify(text: str, *, parse_mode: str | None = None) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if token and chat_id:
-        send_telegram_message(token, chat_id, text)
+        send_telegram_message(token, chat_id, text, parse_mode=parse_mode)
 
 
 def _token_ok() -> bool:
@@ -139,17 +155,9 @@ def _maybe_alert_token_issue(state: dict, cooldown_minutes: int) -> dict:
     )
 
     if should_alert:
-        if status == "expired":
-            msg = (
-                f"Fantasy LangChain Agent: TOKEN CADUCADO (edad ~{(age_h or 0.0):.1f}h)"
-                + GUIDA_RENOVACION_TOKEN
-            )
-        elif status == "missing":
-            msg = "Fantasy LangChain Agent: TOKEN AUSENTE" + GUIDA_RENOVACION_TOKEN
-        else:
-            msg = "Fantasy LangChain Agent: TOKEN INVALIDO" + GUIDA_RENOVACION_TOKEN
+        msg = build_token_renewal_message(status=status, age_h=age_h)
         logger.warning(msg.replace("\n", " | "))
-        _notify(msg)
+        _notify(msg, parse_mode=TELEGRAM_PARSE_MODE)
         new_state["token_alert_at"] = now_utc.isoformat()
 
     return new_state
@@ -168,8 +176,13 @@ def _maybe_alert_missing_league(state: dict, cooldown_minutes: int) -> dict:
 
     if should_alert:
         _notify(
-            "Fantasy LangChain Agent: no hay liga seleccionada.\n"
-            "Usa el bot de Telegram: /ligas y /liga <nombre>."
+            build_standard_message(
+                title="🏆 Liga activa",
+                status="No seleccionada",
+                sections=[("Estado", ["No hay liga seleccionada para operar."])],
+                footer="Usa /ligas y /liga <nombre> en Telegram.",
+            ),
+            parse_mode=TELEGRAM_PARSE_MODE,
         )
         new_state["league_alert_at"] = now_utc.isoformat()
 
@@ -189,8 +202,11 @@ def _maybe_alert_market_unknown(state: dict, cooldown_minutes: int, err: str) ->
 
     if should_alert:
         _notify(
-            "Fantasy LangChain Agent: no pude calcular la hora del mercado ahora.\n"
-            f"Detalle: {err}"
+            build_error_message(
+                "Horario de mercado",
+                f"No pude calcular la hora del mercado ahora. Detalle: {err}",
+            ),
+            parse_mode=TELEGRAM_PARSE_MODE,
         )
         new_state["market_alert_at"] = now_utc.isoformat()
 
@@ -205,8 +221,21 @@ def _build_objective(phase: str, custom_pre: str, custom_post: str) -> str | Non
     return None
 
 
-def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
+def _run_phase(
+    phase: str,
+    args: argparse.Namespace,
+    league_id: str,
+    *,
+    market_cycle_id: str | None = None,
+) -> dict:
     custom_objective = _build_objective(phase, args.pre_objective, args.post_objective)
+    trace_run_name = (
+        "fantasy-bot.pre-market-agent"
+        if phase == "pre"
+        else "fantasy-bot.post-market-agent"
+        if phase == "post"
+        else "fantasy-bot.daemon-cycle"
+    )
     if custom_objective:
         return run_agent_objective(
             league_id=league_id,
@@ -218,6 +247,11 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
             max_iterations=args.max_iterations,
             dry_run=args.dry_run,
             verbose=args.verbose,
+            engine=getattr(args, "agent_engine", None),
+            trace_run_name=trace_run_name,
+            trace_command="daemon",
+            trace_market_cycle_id=market_cycle_id,
+            trace_extra_metadata={"trigger": "daemon"},
         )
     return run_agent_phase(
         league_id=league_id,
@@ -228,6 +262,11 @@ def _run_phase(phase: str, args: argparse.Namespace, league_id: str) -> dict:
         max_iterations=args.max_iterations,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        engine=getattr(args, "agent_engine", None),
+        trace_run_name=trace_run_name,
+        trace_command="daemon",
+        trace_market_cycle_id=market_cycle_id,
+        trace_extra_metadata={"trigger": "daemon"},
     )
 
 
@@ -243,98 +282,131 @@ def _run_pre_informe_plus_compraventa(
     - Siempre genera plan en dry-run (como /informe).
     - Si el daemon NO está en dry-run, ejecuta el plan resultante (como /compraventa).
     """
-    res = run_agent_objective(
-        league_id=league_id,
-        objective=REPORT_PLAN_OBJECTIVE,
+    with langsmith_run_span(
+        "fantasy-bot.daemon-cycle",
+        run_type="chain",
         phase="pre",
-        llm_model=args.llm_model,
-        temperature=args.temperature,
-        max_iterations=args.max_iterations,
-        dry_run=True,
-        verbose=args.verbose,
-    )
+        command="daemon",
+        league_id=league_id,
+        market_cycle_id=market_key,
+        dry_run=bool(args.dry_run),
+        extra_metadata={"trigger": "daemon"},
+        inputs={"market_key": market_key, "league_name": league_name},
+    ) as span:
+        res = run_agent_objective(
+            league_id=league_id,
+            objective=REPORT_PLAN_OBJECTIVE,
+            phase="pre",
+            llm_model=args.llm_model,
+            temperature=args.temperature,
+            max_iterations=args.max_iterations,
+            dry_run=True,
+            verbose=args.verbose,
+            engine=getattr(args, "agent_engine", None),
+            trace_run_name="fantasy-bot.pre-market-agent",
+            trace_command="daemon",
+            trace_market_cycle_id=market_key,
+            trace_extra_metadata={"trigger": "daemon"},
+        )
 
-    output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
-    steps = res.get("steps", []) or []
-    simulation_payload = _extract_latest_simulation_payload(steps)
-    actions, action_source = _extract_executable_actions(steps)
-    report_payload = _extract_agent_report_payload(output)
-    if not any(str(a.get("tool", "")).strip() == "increase_clause_tool" for a in actions):
-        inferred_clause_actions = _build_clause_actions_from_report(report_payload, steps)
-        if inferred_clause_actions:
-            actions.extend(inferred_clause_actions)
-            action_source = (
-                "tool_calls+report_clause_fallback"
-                if action_source == "tool_calls"
-                else "simulate_transfer_plan+report_clause_fallback"
+        output = str(res.get("output", "") or "").strip() or "Sin salida textual del agente."
+        steps = res.get("steps", []) or []
+        simulation_payload = _extract_latest_simulation_payload(steps)
+        actions, action_source = _extract_executable_actions(steps)
+
+        sim_summary = (
+            simulation_payload.get("summary")
+            if isinstance(simulation_payload, dict) and isinstance(simulation_payload.get("summary"), dict)
+            else {}
+        )
+
+        cache_payload = {
+            "version": 1,
+            "created_at": _now_iso(),
+            "league_id": league_id,
+            "league_name": league_name,
+            "market_key": market_key,
+            "llm_model": str(res.get("llm_model", "")),
+            "objective": REPORT_PLAN_OBJECTIVE,
+            "output": output,
+            "action_source": action_source,
+            "simulation_summary": sim_summary,
+            "actions": actions,
+            "actions_count": len(actions),
+            "executed_at": "",
+        }
+
+        report_text = _build_informe_message(
+            league_name=league_name,
+            market_key=market_key,
+            steps=steps,
+            output=output,
+            actions=actions,
+            action_source=action_source,
+            simulation_payload=simulation_payload,
+        )
+
+        out = {
+            "output": output,
+            "steps": steps,
+            "actions": actions,
+            "action_source": action_source,
+            "report_text": report_text,
+            "compraventa_text": "",
+            "execution_summary": {},
+            "executed": False,
+            "dry_run": bool(args.dry_run),
+        }
+
+        if args.dry_run:
+            _save_report_plan_cache(cache_payload)
+            finish_langsmith_span(
+                span,
+                {"ok": True, "dry_run": True, "actions_count": len(actions), "tools_count": len(steps)},
             )
+            return out
 
-    sim_summary = (
-        simulation_payload.get("summary")
-        if isinstance(simulation_payload, dict) and isinstance(simulation_payload.get("summary"), dict)
-        else {}
-    )
+        if not actions:
+            _save_report_plan_cache(cache_payload)
+            finish_langsmith_span(
+                span,
+                {"ok": True, "dry_run": False, "actions_count": 0, "tools_count": len(steps)},
+            )
+            return out
 
-    cache_payload = {
-        "version": 1,
-        "created_at": _now_iso(),
-        "league_id": league_id,
-        "league_name": league_name,
-        "market_key": market_key,
-        "llm_model": str(res.get("llm_model", "")),
-        "objective": REPORT_PLAN_OBJECTIVE,
-        "output": output,
-        "action_source": action_source,
-        "simulation_summary": sim_summary,
-        "actions": actions,
-        "actions_count": len(actions),
-        "executed_at": "",
-    }
-
-    report_text = _build_informe_message(
-        league_name=league_name,
-        market_key=market_key,
-        steps=steps,
-        output=output,
-        actions=actions,
-        action_source=action_source,
-        simulation_payload=simulation_payload,
-    )
-
-    out = {
-        "output": output,
-        "steps": steps,
-        "actions": actions,
-        "action_source": action_source,
-        "report_text": report_text,
-        "compraventa_text": "",
-        "execution_summary": {},
-        "executed": False,
-        "dry_run": bool(args.dry_run),
-    }
-
-    if args.dry_run:
+        summary = _execute_cached_actions(
+            league_id=league_id,
+            actions=actions,
+            fallback_balance=sim_summary.get("saldo_actual"),
+            trace_command="daemon",
+            trace_channel="daemon",
+            trace_session="daemon",
+            market_cycle_id=market_key,
+        )
+        cache_payload["executed_at"] = _now_iso()
+        cache_payload["execution_summary"] = summary
         _save_report_plan_cache(cache_payload)
+
+        out["execution_summary"] = summary
+        out["executed"] = True
+        out["compraventa_text"] = _build_compraventa_message(
+            league_name=league_name,
+            market_key=market_key,
+            action_source=action_source,
+            summary=summary,
+        )
+        finish_langsmith_span(
+            span,
+            {
+                "ok": not bool(summary.get("errors")),
+                "dry_run": False,
+                "actions_count": len(actions),
+                "actions_ok": summary.get("actions_ok"),
+                "actions_skipped": summary.get("actions_skipped"),
+                "errors": len(summary.get("errors", []) or []),
+            },
+        )
         return out
-
-    if not actions:
-        _save_report_plan_cache(cache_payload)
-        return out
-
-    summary = _execute_cached_actions(league_id=league_id, actions=actions)
-    cache_payload["executed_at"] = _now_iso()
-    cache_payload["execution_summary"] = summary
-    _save_report_plan_cache(cache_payload)
-
-    out["execution_summary"] = summary
-    out["executed"] = True
-    out["compraventa_text"] = _build_compraventa_message(
-        league_name=league_name,
-        market_key=market_key,
-        action_source=action_source,
-        summary=summary,
-    )
-    return out
 
 
 def _market_schedule_from_state(state: dict) -> dict | None:
@@ -445,28 +517,77 @@ def _maybe_run_lineup(
         new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
         return new_state, "lineup saltado: jornada ya iniciada"
 
-    result = autoset_best_lineup(
+    last_error_at = _parse_iso_dt(new_state.get("last_lineup_error_at"))
+    if last_error_at:
+        elapsed = (datetime.now(timezone.utc) - last_error_at).total_seconds()
+        if elapsed < LINEUP_ERROR_RETRY_SECONDS:
+            return new_state, ""
+
+    with langsmith_run_span(
+        "fantasy-bot.daemon-lineup",
+        run_type="chain",
+        phase="post",
+        command="daemon",
         league_id=league_id,
-        model=MODEL_TYPE,
-        day_before_only=False,
-        after_market_time="00:00",
-        timezone_name=os.getenv("TZ", "Europe/Madrid"),
-        force=True,
-        dry_run=dry_run,
-    )
+        market_cycle_id=str(jornada),
+        dry_run=bool(dry_run),
+        extra_metadata={"trigger": "daemon", "component": "lineup-autoset"},
+        inputs={"jornada": jornada, "target_ts": target_ts, "first_match_ts": first_ts},
+    ) as span:
+        try:
+            result = autoset_best_lineup(
+                league_id=league_id,
+                model=MODEL_TYPE,
+                day_before_only=False,
+                after_market_time="00:00",
+                timezone_name=os.getenv("TZ", "Europe/Madrid"),
+                force=True,
+                dry_run=dry_run,
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            finish_langsmith_span(
+                span,
+                {
+                    "ok": False,
+                    "applied": False,
+                    "dry_run": bool(dry_run),
+                    "jornada": jornada,
+                    "error": reason,
+                },
+            )
+            new_state["last_lineup_error_at"] = datetime.now(timezone.utc).isoformat()
+            new_state["last_lineup_error"] = reason
+            return new_state, f"lineup no aplicada: {reason}"
 
-    if result.get("applied") or result.get("dry_run"):
-        new_state["last_lineup_applied_jornada"] = int(jornada)
-        new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
-        msg = (
-            "Fantasy LangChain LINEUP\n"
-            f"Jornada: {jornada}\n"
-            f"Objetivo: 23h55 antes del inicio"
+        finish_langsmith_span(
+            span,
+            {
+                "ok": bool(result.get("applied") or result.get("dry_run")),
+                "applied": bool(result.get("applied")),
+                "dry_run": bool(result.get("dry_run")),
+                "formation": result.get("formation"),
+                "xp_once": result.get("xp_once"),
+                "jornada": jornada,
+            },
         )
-        return new_state, msg
 
-    reason = str(result.get("reason", "no aplicada"))
-    return new_state, f"lineup no aplicada: {reason}"
+        if result.get("applied") or result.get("dry_run"):
+            new_state["last_lineup_applied_jornada"] = int(jornada)
+            new_state["last_lineup_applied_at"] = datetime.now(timezone.utc).isoformat()
+            new_state.pop("last_lineup_error_at", None)
+            new_state.pop("last_lineup_error", None)
+            msg = (
+                "Fantasy LangChain LINEUP\n"
+                f"Jornada: {jornada}\n"
+                f"Objetivo: 23h55 antes del inicio"
+            )
+            return new_state, msg
+
+        reason = str(result.get("reason", "no aplicada"))
+        new_state["last_lineup_error_at"] = datetime.now(timezone.utc).isoformat()
+        new_state["last_lineup_error"] = reason
+        return new_state, f"lineup no aplicada: {reason}"
 
 
 def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> None:
@@ -491,10 +612,21 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
         startup_league_desc = "pendiente (usa /ligas y /liga en Telegram)"
 
     _notify(
-        "Fantasy LangChain daemon iniciado\n"
-        f"Liga: {startup_league_desc}\n"
-        "PRE/POST: automáticos a 10 min antes/después del cierre real de mercado\n"
-        "Alineación: 23h55 antes del inicio de jornada"
+        build_standard_message(
+            title="🤖 Fantasy Bot iniciado",
+            status="Scheduler activo",
+            sections=[
+                ("Liga", [startup_league_desc]),
+                (
+                    "Automatizaciones",
+                    [
+                        "PRE/POST: 10 min antes/después del cierre real de mercado",
+                        "Alineación: 23h55 antes del inicio de jornada",
+                    ],
+                ),
+            ],
+        ),
+        parse_mode=TELEGRAM_PARSE_MODE,
     )
     logger.info(
         "LangChain daemon iniciado liga_inicial=%s llm=%s model_fijo=%s",
@@ -520,7 +652,14 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 sel = load_selected_league() or {}
                 league_name = sel.get("league_name", "")
                 if league_name:
-                    _notify(f"Fantasy LangChain Agent: liga activa\n{league_name}")
+                    _notify(
+                        build_standard_message(
+                            title="🏆 Liga activa",
+                            status="Actualizada",
+                            league_name=league_name,
+                        ),
+                        parse_mode=TELEGRAM_PARSE_MODE,
+                    )
 
                 # Reset de ciclo por cambio de liga
                 for key in (
@@ -587,7 +726,14 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 post_local = schedule["post_local"]
 
                 if market_changed:
-                    _notify("Horario de mercado detectado\n" + schedule_message(schedule))
+                    _notify(
+                        build_standard_message(
+                            title="🕒 Horario de mercado",
+                            status="Detectado",
+                            sections=[("Programación", schedule_message(schedule).splitlines())],
+                        ),
+                        parse_mode=TELEGRAM_PARSE_MODE,
+                    )
 
                 # PRE: 10 min antes del cierre y antes del cierre
                 if (
@@ -601,12 +747,18 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
 
                     if args.pre_objective.strip():
                         # Modo avanzado: objetivo PRE custom.
-                        res = _run_phase("pre", args, league_id)
+                        res = _run_phase("pre", args, league_id, market_cycle_id=market_key)
                         output = str(res.get("output", "") or "")
                         _notify(
-                            "Fantasy LangChain (PRE) completado\n"
-                            f"Tools: {len(res.get('steps', []))}\n"
-                            f"Resumen:\n{output[:1200]}"
+                            build_agent_cycle_message(
+                                phase="PRE",
+                                market_key=market_key,
+                                tools_count=len(res.get("steps", [])),
+                                output=output,
+                                steps=res.get("steps", []),
+                                league_name=league_name,
+                            ),
+                            parse_mode=TELEGRAM_PARSE_MODE,
                         )
                     else:
                         # Flujo estándar solicitado: PRE = /informe + /compraventa.
@@ -619,20 +771,32 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                         output = str(pre_run.get("output", "") or "")
                         report_text = str(pre_run.get("report_text", "") or "").strip()
                         if report_text:
-                            _notify(report_text)
+                            _notify(report_text, parse_mode=TELEGRAM_PARSE_MODE)
                         if pre_run.get("executed"):
                             resume_text = str(pre_run.get("compraventa_text", "") or "").strip()
                             if resume_text:
-                                _notify(resume_text)
+                                _notify(resume_text, parse_mode=TELEGRAM_PARSE_MODE)
                         elif args.dry_run:
                             _notify(
-                                "Fantasy LangChain (PRE)\n"
-                                "Dry-run activo: plan generado y cacheado sin ejecución real."
+                                build_standard_message(
+                                    title="📊 PRE mercado",
+                                    status="Dry-run",
+                                    league_name=league_name,
+                                    market_key=market_key,
+                                    sections=[("Resultado", ["Plan generado y cacheado sin ejecución real."])],
+                                ),
+                                parse_mode=TELEGRAM_PARSE_MODE,
                             )
                         else:
                             _notify(
-                                "Fantasy LangChain (PRE)\n"
-                                "El informe no dejó acciones ejecutables para este ciclo."
+                                build_standard_message(
+                                    title="📊 PRE mercado",
+                                    status="Sin acciones ejecutables",
+                                    league_name=league_name,
+                                    market_key=market_key,
+                                    sections=[("Resultado", ["El informe no dejó acciones ejecutables para este ciclo."])],
+                                ),
+                                parse_mode=TELEGRAM_PARSE_MODE,
                             )
 
                     state["last_pre_market_key"] = market_key
@@ -684,7 +848,9 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                     "Lanzando fase POST pendiente (pending_market_key=%s)...",
                     pending_post_key,
                 )
-                res = _run_phase("post", args, league_id)
+                selected = load_selected_league() or {}
+                league_name = str(selected.get("league_name", "")).strip() or league_id
+                res = _run_phase("post", args, league_id, market_cycle_id=pending_post_key)
                 output = res.get("output", "")
                 state["last_post_market_key"] = pending_post_key
                 state["last_post_run_at"] = now_utc.isoformat()
@@ -694,10 +860,15 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 state.pop("pending_post_local", None)
                 state.pop("pending_post_set_at", None)
                 _notify(
-                    "Fantasy LangChain (POST) completado\n"
-                    f"Ciclo: {pending_post_key}\n"
-                    f"Tools: {len(res.get('steps', []))}\n"
-                    f"Resumen:\n{output[:1200]}"
+                    build_agent_cycle_message(
+                        phase="POST",
+                        market_key=pending_post_key,
+                        tools_count=len(res.get("steps", [])),
+                        output=output,
+                        steps=res.get("steps", []),
+                        league_name=league_name,
+                    ),
+                    parse_mode=TELEGRAM_PARSE_MODE,
                 )
 
             # 2) Programación de alineación exacta: 23h55 antes
@@ -710,7 +881,14 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
                 dry_run=args.dry_run,
             )
             if lineup_msg.startswith("Fantasy LangChain LINEUP"):
-                _notify(lineup_msg)
+                _notify(
+                    build_standard_message(
+                        title="🧩 Alineación programada",
+                        status="Ejecutada",
+                        sections=[("Resultado", lineup_msg.splitlines()[1:])],
+                    ),
+                    parse_mode=TELEGRAM_PARSE_MODE,
+                )
             elif lineup_msg:
                 logger.info(lineup_msg)
 
@@ -725,7 +903,10 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
             return
         except Exception as exc:
             logger.exception("Error en bucle LangChain daemon: %s", exc)
-            _notify(f"Fantasy LangChain daemon ERROR\n{type(exc).__name__}: {exc}")
+            _notify(
+                build_error_message("Daemon LangChain", f"{type(exc).__name__}: {exc}"),
+                parse_mode=TELEGRAM_PARSE_MODE,
+            )
             if stop_event:
                 stop_event.wait(timeout=POLL_SECONDS)
             else:
@@ -733,7 +914,7 @@ def run_daemon(args: argparse.Namespace, stop_event: Event | None = None) -> Non
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Daemon autónomo con agente LangChain")
+    parser = argparse.ArgumentParser(description="Daemon autónomo con agente LangGraph")
     parser.add_argument(
         "--league",
         default="",
@@ -761,6 +942,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20")),
+    )
+    parser.add_argument(
+        "--agent-engine",
+        choices=["langgraph", "legacy"],
+        default=(
+            os.getenv("FANTASY_AGENT_ENGINE")
+            or os.getenv("LANGCHAIN_AGENT_ENGINE")
+            or "langgraph"
+        ),
+        help="Motor del agente autónomo. Por defecto usa LangGraph.",
     )
     parser.add_argument(
         "--pre-objective",

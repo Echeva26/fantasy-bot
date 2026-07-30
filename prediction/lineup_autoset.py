@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -65,11 +66,13 @@ def _should_run_day_before(
 
 
 def _formation_parts(formation_str: str) -> tuple[int, int, int]:
-    try:
-        d, m, f = formation_str.split("-")
-        return int(d), int(m), int(f)
-    except Exception as exc:
-        raise ValueError(f"Formación inválida: {formation_str}") from exc
+    match = re.search(r"(\d+)\s*-\s*(\d+)\s*-\s*(\d+)", str(formation_str or ""))
+    if not match:
+        raise ValueError(f"Formación inválida: {formation_str}")
+    d, m, f = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    if d + m + f != 10:
+        raise ValueError(f"Formación inválida: {formation_str}")
+    return d, m, f
 
 
 def _build_lineup_payload(team_analysis: dict, snapshot: dict) -> dict:
@@ -140,9 +143,21 @@ def autoset_best_lineup(
 
     tz_name = timezone_name or os.getenv("TZ", "Europe/Madrid")
     snapshot = load_snapshot(league_id)
-    pred_df, first_match_ts = get_predictions(MODEL_TYPE)
+    try:
+        pred_df, first_match_ts = get_predictions(MODEL_TYPE)
+    except Exception as exc:
+        return {
+            "applied": False,
+            "skipped": True,
+            "reason": f"Predicciones no disponibles: {type(exc).__name__}: {exc}",
+            "error_type": type(exc).__name__,
+        }
     if pred_df.empty:
-        raise RuntimeError("Sin predicciones disponibles para calcular alineación")
+        return {
+            "applied": False,
+            "skipped": True,
+            "reason": "Sin predicciones disponibles para calcular alineación",
+        }
 
     jornada = int(pred_df["jornada"].iloc[0])
     if day_before_only and not force:

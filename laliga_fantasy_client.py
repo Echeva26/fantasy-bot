@@ -36,7 +36,7 @@ import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
@@ -211,12 +211,20 @@ def google_login_flow(redirect_url: str | None = None) -> dict:
 # ===========================================================================
 class LaLigaFantasyPublic:
     """
-    Endpoints de la API que NO requieren autenticación.
-    Funcionan sin token, sin proxy, sin parchear nada.
+    Endpoints de la API que no requieren autenticación y compatibilidad
+    con métodos antiguos de jugadores.
 
-    Datos disponibles:
-        - Todos los jugadores de LaLiga (675+)
-        - Detalle completo de cada jugador (stats por jornada)
+    En la API actual, los endpoints de jugadores dejaron de ser públicos
+    y devuelven 404 sin token. Los métodos de jugadores se mantienen por
+    compatibilidad y hacen fallback al cliente autenticado si hay token.
+
+    Datos públicos comprobados:
+        - Jornada actual
+        - Calendario
+
+    Datos con fallback autenticado:
+        - Jugadores de la liga
+        - Detalle completo de cada jugador
         - Historial de valor de mercado de cada jugador
 
     Datos que SÍ requieren token (usar LaLigaFantasyClient):
@@ -232,12 +240,56 @@ class LaLigaFantasyPublic:
         resp.raise_for_status()
         return resp.json()
 
+    def _get_authenticated_client(self) -> "LaLigaFantasyClient | None":
+        token = load_token()
+        if not token:
+            return None
+
+        league_id = os.getenv("LALIGA_LEAGUE_ID", "").strip()
+        if not league_id:
+            try:
+                from prediction.league_selection import resolve_league_id
+
+                league_id = resolve_league_id("")
+            except Exception:
+                league_id = ""
+
+        client = LaLigaFantasyClient.from_token(token, league_id=league_id, save=False)
+        if not client.league_id:
+            leagues = client.get_leagues() or []
+            if leagues:
+                client.league_id = str(leagues[0].get("id", "")).strip()
+        return client
+
+    def _fallback_authenticated(self, action: str, exc: Exception) -> Any:
+        client = self._get_authenticated_client()
+        if not client:
+            raise RuntimeError(
+                "Este endpoint ya no es público y no hay token válido para fallback autenticado."
+            ) from exc
+        if not client.league_id:
+            raise RuntimeError(
+                "Este endpoint ya no es público y no se pudo resolver league_id para fallback autenticado."
+            ) from exc
+        return getattr(client, action)
+
+    def get_current_week(self) -> dict:
+        """GET /api/v3/week/current (público)."""
+        url = f"{BASE_URL}/api/v3/week/current"
+        return self._get(url)
+
+    def get_calendar(self) -> list[dict]:
+        """GET /api/v3/calendar (público)."""
+        url = f"{BASE_URL}/api/v3/calendar"
+        data = self._get(url)
+        return data if isinstance(data, list) else []
+
     def get_players_raw(self) -> list[dict]:
         """
-        GET /api/v5/players  (PÚBLICO - sin token)
+        GET /api/v3/players  (legacy; actualmente 404 sin token)
 
-        Devuelve TODOS los jugadores de LaLiga con datos básicos.
-        NOTA: Migrado de /api/v3/players (404 desde ~Feb 2026) a /api/v5/players.
+        Si el endpoint público falla con 404, usa fallback autenticado:
+        GET /api/v3/players/league/{league_id}.
 
         Response por elemento (v5):
             {
@@ -257,9 +309,18 @@ class LaLigaFantasyPublic:
             - "team" objeto → "teamId" string
             - "images" objeto → "image" string (URL única)
         """
-        url = f"{BASE_URL}/api/v5/players"
-        logger.info("Obteniendo todos los jugadores (endpoint público v5)...")
-        return self._get(url)
+        url = f"{BASE_URL}/api/v3/players"
+        logger.info("Obteniendo todos los jugadores (endpoint público legacy)...")
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint público /api/v3/players devuelve 404; usando fallback autenticado."
+            )
+            return self._fallback_authenticated("get_players_raw", exc)()
 
     def get_players(self) -> list[dict]:
         """Versión formateada de todos los jugadores."""
@@ -267,7 +328,10 @@ class LaLigaFantasyPublic:
 
     def get_player_detail(self, player_id: int) -> dict:
         """
-        GET /api/v3/player/{player_id}  (PÚBLICO - sin token)
+        GET /api/v3/player/{player_id} (legacy; actualmente 404 sin token)
+
+        Si el endpoint público falla con 404, usa el mismo endpoint con
+        cliente autenticado.
 
         Detalle completo de un jugador: stats por jornada, equipo, etc.
 
@@ -298,12 +362,25 @@ class LaLigaFantasyPublic:
             }
         """
         url = f"{BASE_URL}/api/v3/player/{player_id}"
-        logger.info("Obteniendo detalle del jugador %s (público)...", player_id)
-        return self._get(url)
+        logger.info("Obteniendo detalle del jugador %s (endpoint legacy)...", player_id)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint público /api/v3/player/%s devuelve 404; usando fallback autenticado.",
+                player_id,
+            )
+            return self._fallback_authenticated("get_player_detail", exc)(player_id)
 
     def get_price_history(self, player_id: int) -> list[dict]:
         """
-        GET /api/v3/player/{player_id}/market-value  (PÚBLICO - sin token)
+        GET /api/v3/player/{player_id}/market-value (legacy; actualmente 404 sin token)
+
+        Si el endpoint público falla con 404, usa el mismo endpoint con
+        cliente autenticado.
 
         Historial completo de valor de mercado del jugador.
 
@@ -319,7 +396,17 @@ class LaLigaFantasyPublic:
             ]
         """
         url = f"{BASE_URL}/api/v3/player/{player_id}/market-value"
-        return self._get(url)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint público /api/v3/player/%s/market-value devuelve 404; usando fallback autenticado.",
+                player_id,
+            )
+            return self._fallback_authenticated("get_price_history", exc)(player_id)
 
     def get_all_price_histories(self, player_ids: list[int] | None = None, max_workers: int = 5) -> list[dict]:
         """
@@ -683,6 +770,39 @@ class LaLigaFantasyClient:
         logger.info("Aceptando oferta %s por item mercado %s...", offer_id, market_player_id)
         return self._post(url, {})
 
+    def get_market_player_offers(self, market_player_id: str) -> dict | list:
+        """
+        Devuelve el detalle de ofertas de un item en mercado.
+
+        En algunas respuestas de plantilla solo llega numberOfOffers, sin el
+        array con IDs. La fase 2 necesita ese offerId, así que consultamos el
+        recurso de ofertas del marketPlayer antes de aceptar.
+        """
+        item_id = str(market_player_id or "").strip()
+        if not item_id:
+            raise ValueError("market_player_id requerido para consultar ofertas")
+
+        errors: list[str] = []
+        for url in (
+            f"{BASE_URL}/api/v3/league/{self.league_id}/market/{item_id}/offer",
+            f"{BASE_URL}/api/v3/league/{self.league_id}/market/{item_id}/offers",
+            f"{BASE_URL}/api/v4/league/{self.league_id}/market/{item_id}/offer",
+            f"{BASE_URL}/api/v4/league/{self.league_id}/market/{item_id}/offers",
+        ):
+            try:
+                logger.info("Consultando ofertas del item mercado %s...", item_id)
+                return self._get(url)
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "?"
+                errors.append(f"{url} -> {status}")
+                if status not in (404, 405):
+                    raise
+
+        raise RuntimeError(
+            "No se pudo obtener el detalle de ofertas del mercado: "
+            + "; ".join(errors)
+        )
+
     def buy_player_bid(
         self,
         market_player_id: str,
@@ -1032,28 +1152,122 @@ class LaLigaFantasyClient:
           - coach: "playerTeamId"
         """
         tid = str(team_id)
-        gk = str(goalkeeper_id)
-        defs = [str(x) for x in defenders_ids]
-        mids = [str(x) for x in midfielders_ids]
-        fwds = [str(x) for x in strikers_ids]
         formation = [int(x) for x in tactical_formation]
+        goalkeeper = str(goalkeeper_id)
+        defenders = [str(x) for x in defenders_ids]
+        midfielders = [str(x) for x in midfielders_ids]
+        strikers = [str(x) for x in strikers_ids]
+        captain = str(captain_team_id) if captain_team_id else ""
+
+        primary_body = {
+            "tactical_formation": formation,
+            "goalkeeper": goalkeeper,
+            "defender": defenders,
+            "midfield": midfielders,
+            "striker": strikers,
+        }
+        if captain:
+            primary_body["captain"] = captain
+        if coach_id:
+            primary_body["coach"] = str(coach_id)
+
+        bodies: list[tuple[str, dict]] = [("snake_case", primary_body)]
+        if captain:
+            body_no_captain = dict(primary_body)
+            body_no_captain.pop("captain", None)
+            bodies.append(("snake_case_sin_capitan", body_no_captain))
+
+        formation_txt = "-".join(str(x) for x in formation)
+        string_formation_body = dict(primary_body)
+        string_formation_body["tactical_formation"] = formation_txt
+        bodies.append(("snake_case_formacion_texto", string_formation_body))
+        if captain:
+            string_formation_no_captain = dict(string_formation_body)
+            string_formation_no_captain.pop("captain", None)
+            bodies.append(("snake_case_formacion_texto_sin_capitan", string_formation_no_captain))
+
+        camel_body = {
+            "tacticalFormation": formation,
+            "goalkeeper": goalkeeper,
+            "defender": defenders,
+            "midfield": midfielders,
+            "striker": strikers,
+        }
+        if captain:
+            camel_body["captain"] = captain
+        if coach_id:
+            camel_body["coach"] = str(coach_id)
+        bodies.append(("camel_case", camel_body))
+        if captain:
+            camel_no_captain = dict(camel_body)
+            camel_no_captain.pop("captain", None)
+            bodies.append(("camel_case_sin_capitan", camel_no_captain))
+
+        camel_string_formation_body = dict(camel_body)
+        camel_string_formation_body["tacticalFormation"] = formation_txt
+        bodies.append(("camel_case_formacion_texto", camel_string_formation_body))
+        if captain:
+            camel_string_formation_no_captain = dict(camel_string_formation_body)
+            camel_string_formation_no_captain.pop("captain", None)
+            bodies.append(("camel_case_formacion_texto_sin_capitan", camel_string_formation_no_captain))
+
+        legacy_body = {
+            "tactical_formation": [int(x) for x in tactical_formation],
+            "goalkeeper": int(goalkeeper) if goalkeeper.isdigit() else goalkeeper,
+            "defender": [int(x) if str(x).isdigit() else x for x in defenders],
+            "midfield": [int(x) if str(x).isdigit() else x for x in midfielders],
+            "striker": [int(x) if str(x).isdigit() else x for x in strikers],
+        }
+        if captain:
+            legacy_body["captain"] = int(captain) if captain.isdigit() else captain
+        if coach_id:
+            coach = str(coach_id)
+            legacy_body["coach"] = int(coach) if coach.isdigit() else coach
+        bodies.append(("numeric_ids", legacy_body))
 
         url = f"{BASE_URL}/api/v3/teams/{tid}/lineup"
+        logger.info("Actualizando alineación del team %s...", tid)
 
-        body = {
-            "tactical_formation": formation,
-            "goalkeeper": gk,
-            "defender": defs,
-            "midfield": mids,
-            "striker": fwds,
+        headers = {
+            **self._auth_headers(),
+            "Content-Type": "application/json",
         }
-        if captain_team_id:
-            body["captain"] = str(captain_team_id)
-        if coach_id:
-            body["coach"] = str(coach_id)
+        last_error: dict = {}
+        retry_statuses = {400, 404, 405, 422, 500, 502, 503, 504}
+        for label, body in bodies:
+            resp = self.session.put(url, json=body, headers=headers)
+            if resp.ok:
+                if label != "snake_case":
+                    logger.info("Alineación guardada con payload fallback: %s", label)
+                return resp.json() if resp.content else {}
 
-        logger.info("Actualizando alineación del team %s ...", tid)
-        return self._put(url, body)
+            try:
+                err_body = resp.json() if resp.content else resp.text[:500]
+            except Exception:
+                err_body = resp.text[:500] if resp.text else ""
+            last_error = {
+                "status": resp.status_code,
+                "payload_variant": label,
+                "body": body,
+                "response": err_body,
+            }
+            logger.warning(
+                "PUT %s → %s | variante=%s | body: %s | response: %s",
+                url,
+                resp.status_code,
+                label,
+                body,
+                err_body,
+            )
+            if resp.status_code not in retry_statuses:
+                resp.raise_for_status()
+
+        raise RuntimeError(
+            "No se pudo guardar la alineación tras probar formatos compatibles. "
+            f"Último error: status={last_error.get('status')}, "
+            f"variante={last_error.get('payload_variant')}, "
+            f"respuesta={last_error.get('response')}"
+        )
 
     def get_team_lineup(
         self,
@@ -1277,10 +1491,11 @@ class LaLigaFantasyClient:
         """
         Ranking de la liga.
 
-        Intenta /api/v5 (sin trailing slash) y cae a /api/v4 y /api/v3 si falla.
-        NOTA: v3 devuelve 404 desde ~Mar 2026; v5 funciona sin trailing slash.
+        En la API actual este endpoint puede devolver 404. En ese caso se
+        usa fallback actualizado:
+        GET /api/v4/leagues/{league_id}/teams
 
-        Response por elemento (misma estructura en v3/v4/v5):
+        Response por elemento:
             {
                 "team": {"id": "abc123", "manager": {"managerName": "...", ...}},
                 "points": 350,
@@ -1289,18 +1504,48 @@ class LaLigaFantasyClient:
             }
         """
         logger.info("Obteniendo ranking...")
-        for ver in ("v5", "v4", "v3"):
-            url = f"{BASE_URL}/api/{ver}/leagues/{self.league_id}/ranking"
-            try:
-                data = self._get(url)
-                if isinstance(data, list):
-                    return data
-            except requests.exceptions.HTTPError as exc:
-                status = getattr(exc.response, "status_code", None) if getattr(exc, "response", None) else None
-                logger.warning("Ranking %s → %s, probando siguiente versión...", ver, status)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint ranking v3 devuelve 404; usando fallback v4 /leagues/{league_id}/teams."
+            )
+            return self._get_ranking_from_teams_v4()
+
+    def _get_ranking_from_teams_v4(self) -> list[dict]:
+        """Construye ranking compatible desde GET /api/v4/leagues/{league_id}/teams."""
+        url = f"{BASE_URL}/api/v4/leagues/{self.league_id}/teams"
+        teams = self._get(url)
+        if not isinstance(teams, list):
+            raise RuntimeError("Respuesta inesperada en fallback ranking v4: no es lista.")
+
+        ranking: list[dict] = []
+        for idx, team in enumerate(teams, 1):
+            if not isinstance(team, dict):
                 continue
-        url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/ranking/"
-        return self._get(url)
+            position = _to_int(team.get("position")) or idx
+            entry = {
+                "team": {
+                    "id": str(team.get("id", "")),
+                    "manager": team.get("manager", {}) or {},
+                    "teamValue": _to_int(team.get("teamValue")),
+                    "teamMoney": _to_int(team.get("teamMoney")),
+                    "banned": bool(team.get("banned", False)),
+                },
+                "points": _to_int(team.get("teamPoints")),
+                "rank": position,
+                "position": position,
+                "previousPosition": _to_int(team.get("previousPosition")),
+                "fixture_points": _to_int(team.get("fixture_points")),
+                "startingWeek": team.get("startingWeek"),
+            }
+            ranking.append(entry)
+
+        ranking.sort(key=lambda x: (_to_int(x.get("position")) or 9999, -(_to_int(x.get("points")) or 0)))
+        return ranking
 
     def get_manager_ids(self) -> list[str]:
         ranking = self.get_ranking_raw()
@@ -1330,7 +1575,20 @@ class LaLigaFantasyClient:
         """
         url = f"{BASE_URL}/api/v3/leagues/{self.league_id}/teams/{manager_id}"
         logger.info("Obteniendo plantilla del mánager %s...", manager_id)
-        return self._get(url)
+        try:
+            return self._get(url)
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status != 404:
+                raise
+            logger.warning(
+                "Endpoint plantilla v3 devuelve 404 para team_id=%s; usando fallback v4.",
+                manager_id,
+            )
+            v4 = self.get_team_raw_v4(manager_id)
+            if v4 is not None:
+                return v4
+            raise
 
     def get_team_raw_v4(self, team_id: str) -> dict | None:
         """
@@ -1435,6 +1693,66 @@ class LaLigaFantasyClient:
             f"en la liga {self.league_id}."
         )
 
+    def get_team_money(self, team_id: str) -> int:
+        """
+        Obtiene el saldo actual de un equipo.
+
+        La API ha movido este dato entre endpoints varias veces. Probamos el
+        endpoint específico de saldo primero y después reutilizamos respuestas
+        de equipo/liga que también suelen incluir `teamMoney`.
+        """
+        tid = str(team_id or "").strip()
+        if not tid:
+            raise ValueError("team_id vacío.")
+
+        attempts: list[tuple[str, Any]] = []
+
+        money_urls = [
+            f"{BASE_URL}/api/v3/teams/{tid}/money",
+            f"{BASE_URL}/api/v3/leagues/{self.league_id}/teams/{tid}/money",
+        ]
+        for url in money_urls:
+            try:
+                money = _extract_money_value(self._get(url))
+                if money is not None:
+                    return int(money)
+            except Exception as exc:
+                attempts.append((url, exc))
+
+        for label, getter in (
+            ("league_me", self.get_league_me_raw),
+            ("team_v4", lambda: self.get_team_raw_v4(tid)),
+            ("team_v3", lambda: self.get_team_raw(tid)),
+        ):
+            try:
+                money = _extract_money_value(getter())
+                if money is not None:
+                    return int(money)
+            except Exception as exc:
+                attempts.append((label, exc))
+
+        try:
+            ranking = self.get_ranking_raw()
+            for entry in ranking:
+                team = entry.get("team", {}) if isinstance(entry, dict) else {}
+                if str(team.get("id", "")).strip() != tid:
+                    continue
+                money = _extract_money_value(team)
+                if money is not None:
+                    return int(money)
+        except Exception as exc:
+            attempts.append(("ranking", exc))
+
+        detail = "; ".join(f"{label}: {type(exc).__name__}" for label, exc in attempts[-4:])
+        raise RuntimeError(
+            "No se pudo leer saldo actual desde API de liga."
+            + (f" Intentos fallidos: {detail}" if detail else "")
+        )
+
+    def get_my_team_money(self) -> int:
+        """Obtiene el saldo actual del equipo del usuario autenticado."""
+        return self.get_team_money(self.find_my_team_id())
+
     # -------------------------------------------------------------------
     # Actividad del mercado
     # -------------------------------------------------------------------
@@ -1511,6 +1829,50 @@ def _to_int(value) -> int | None:
             return int(value)
         except ValueError:
             return None
+    return None
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        parsed = _to_int(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_money_value(payload: Any) -> int | None:
+    """
+    Extrae saldo de respuestas de la API con formatos distintos.
+
+    Ejemplos vistos/esperados:
+    - {"money": 123}
+    - {"teamMoney": "123"}
+    - {"team": {"teamMoney": 123}}
+    - {"data": {"money": 123}}
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (int, float, str)):
+        return _to_int(payload)
+    if isinstance(payload, dict):
+        for key in (
+            "teamMoney",
+            "money",
+            "availableMoney",
+            "available_money",
+            "balance",
+            "saldo",
+            "saldo_disponible",
+        ):
+            if key in payload:
+                money = _to_int(payload.get(key))
+                if money is not None:
+                    return money
+        for key in ("team", "data", "result", "me"):
+            if key in payload:
+                money = _extract_money_value(payload.get(key))
+                if money is not None:
+                    return money
     return None
 
 
@@ -1641,10 +2003,12 @@ def get_league_snapshot(client: LaLigaFantasyClient) -> dict:
     logger.info("Obteniendo mi equipo...")
     my_team_raw = client.get_team_raw(my_team_id)
     my_team = my_ranking_entry.get("team", {})
+    my_team_v4 = client.get_team_raw_v4(my_team_id)
+    my_league_me_raw = client.get_league_me_raw()
 
     # Obtener player_team_id desde v4, league/me o mercado (v3 teams no lo incluye)
     v4_player_ids: dict[int, str] = {}  # player_id -> player_team_id
-    for src in [client.get_team_raw_v4(my_team_id), client.get_league_me_raw()]:
+    for src in [my_team_v4, my_league_me_raw]:
         if not src:
             continue
         players = src.get("players", src.get("squad", []))
@@ -1727,11 +2091,26 @@ def get_league_snapshot(client: LaLigaFantasyClient) -> dict:
 
         plantilla.append(player_data)
 
+    saldo_disponible = _first_int(
+        my_team_raw.get("teamMoney"),
+        my_team.get("teamMoney"),
+        (my_team_v4 or {}).get("teamMoney") if isinstance(my_team_v4, dict) else None,
+        (my_league_me_raw or {}).get("teamMoney") if isinstance(my_league_me_raw, dict) else None,
+        _extract_money_value(my_team_v4),
+        _extract_money_value(my_league_me_raw),
+    )
+    if saldo_disponible is None:
+        try:
+            saldo_disponible = client.get_team_money(my_team_id)
+        except Exception as exc:
+            logger.warning("No se pudo resolver saldo_disponible del snapshot: %s", exc)
+            saldo_disponible = 0
+
     mi_equipo = {
         "manager_id": my_manager_id,
         "manager_name": user_info.get("managerName", ""),
         "team_id": my_team_id,
-        "saldo_disponible": _to_int(my_team_raw.get("teamMoney")),
+        "saldo_disponible": int(saldo_disponible),
         "valor_equipo": _to_int(my_team.get("teamValue")),
         "puntos": my_team.get("teamPoints"),
         "posicion": my_ranking_entry.get("position"),

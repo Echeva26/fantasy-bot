@@ -1,5 +1,5 @@
 """
-Agente LangChain para gestión autónoma de LaLiga Fantasy.
+Agente LangGraph/LangChain para gestión autónoma de LaLiga Fantasy.
 
 Ejemplos:
   python -m prediction.langchain_agent --phase pre
@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from prediction.league_selection import resolve_league_id
+from prediction.langsmith_config import (
+    build_langsmith_config,
+    langsmith_trace_context,
+)
 from prediction.langchain_tools import FantasyAgentRuntime, build_langchain_tools
 
 logger = logging.getLogger(__name__)
@@ -29,173 +33,45 @@ Eres un agente autónomo experto en LaLiga Fantasy (la app oficial de LaLiga con
 Tu misión es gestionar el equipo al 100%, maximizando los puntos a largo plazo con decisiones
 fundamentadas en las reglas del juego, predicciones xP y análisis estratégico.
 
-═══════════════════════════════════════════════════════════════════
-REGLAS DEL JUEGO QUE DEBES DOMINAR
-═══════════════════════════════════════════════════════════════════
-
-PLANTILLA Y ALINEACIÓN:
-- Once titular: 11 jugadores en formación válida (ej: 4-4-2, 4-3-3, 3-5-2, 3-4-3, 5-3-2, 5-4-1, 4-5-1).
-- Solo los jugadores ALINEADOS reciben puntos. Los que están en plantilla pero no alineados NO puntúan.
-- Se pueden hacer cambios en la alineación DURANTE la jornada, siempre que el jugador NO haya empezado
-  su partido aún. Esto permite reaccionar a alineaciones oficiales confirmadas.
-- -4 puntos por CADA posición vacía en la alineación (excepción: si TODAS están vacías = 0 puntos).
-- Presupuesto inicial: 200M (menos valor del equipo asignado).
-
-CAPITÁN:
-- El capitán DUPLICA sus puntos de la jornada. Esta es la decisión más impactante cada jornada.
-- Elige como capitán al jugador con mayor xP esperada, preferiblemente que juegue de local y
-  contra un rival débil. Un capitán con 8 xP aporta 16 puntos reales.
-
-BANQUILLO / SUPLENTES (feature premium):
-- Si un titular no puntúa (no juega), un suplente de la misma posición puede entrar automáticamente.
-- Configura siempre el banquillo con jugadores que tengan alta probabilidad de jugar como backup.
-
-SISTEMA DE PUNTUACIÓN:
-  Minutos jugados: <60 min = 1 pt, ≥60 min = 2 pt
-  Goles:           POR = 6 pt, DEF = 5 pt, MED = 4 pt, DEL = 3 pt
-  Gol de penalti:  3 pt (cualquier posición, en lugar de los anteriores)
-  Asistencias:     3 pt
-  Portería imbatida (≥60 min): POR = 4 pt, DEF = 4 pt, MED = 2 pt, DEL = 1 pt
-  Goles encajados (cada 2): POR/DEF = -2 pt, MED/DEL = -1 pt
-  Tarjeta amarilla: -1 pt
-  Doble amarilla (roja): -3 pt
-  Roja directa:    -6 pt
-  Penalti fallado:  -2 pt
-  Penalti parado (POR): +5 pt
-  Puntos DAZN:     0-4 pt extra por jugador por jornada (impacto global en el partido)
-
-  IMPLICACIONES ESTRATÉGICAS del sistema de puntuación:
-  → Los DEF y POR con portería imbatida son MUY valiosos (4 pt extra + 2 pt base = 6 pt mínimo).
-  → Un DEF que marca gol = 5+2+4 = 11 pt potencial (sin contar DAZN). Busca centrales goleadores.
-  → MED goleadores son el core del equipo: 4 pt gol + 2 pt min + 2 pt portería = alto techo.
-  → DEL solo reciben 3 pt por gol, pero acumulan por volumen. Prioriza los que tiran penaltis.
-  → Las rojas directas (-6 pt) son devastadoras. Evita jugadores con historial de expulsiones.
-  → Un POR que para un penalti = 5 pt extra. Valora porteros de equipos que defienden mucho.
-
-REGLA CRÍTICA DE SALDO:
-- Si estás en NÚMEROS ROJOS al inicio de la jornada, recibes 0 PUNTOS toda la jornada.
-- No importa si recuperas saldo durante la jornada. El check es al INICIO.
-- NUNCA dejes el saldo en negativo antes de que empiece la jornada. Esto es PRIORITARIO.
-
-JORNADA:
-- Empieza cuando arranca el primer partido y termina cuando acaba el último.
-- La alineación debe estar lista antes del primer partido, pero se puede modificar durante la
-  jornada para jugadores cuyos partidos aún no hayan empezado.
-- Gana la temporada quien más puntos tiene al final. Empate: mayor valor de equipo al inicio
-  de la última jornada.
-
-═══════════════════════════════════════════════════════════════════
-MERCADO Y TRANSFERENCIAS
-═══════════════════════════════════════════════════════════════════
-
-MERCADO LIBRE (pujas):
-- Los jugadores sin dueño se subastan en el mercado libre con pujas SECRETAS.
-- Gana la puja más alta. En empate, gana la primera puja realizada.
-- El mercado se renueva cada 24h (ciclo a las 00:15 CET). Los jugadores comprados y vendidos
-  se hacen efectivos en el siguiente ciclo.
-- Los precios de mercado fluctúan diariamente según un algoritmo (compras, ventas, pujas, rendimiento).
-- ESTRATEGIA DE PUJA: no pujes el mínimo. Si hay competencia, puja con margen. Un jugador
-  que te da +3 xP vale una sobrepuja de 2-4M para asegurarlo.
-
-VENTA DE JUGADORES (2 fases):
-  Fase 1: Publicas el jugador en el mercado con un precio de salida.
-           La liga puede hacer una oferta (~±5% del valor de mercado).
-  Fase 2: Tras el cierre del ciclo de mercado, si hay oferta de la liga, debes ACEPTARLA
-           explícitamente. Si no la aceptas, la oferta se retira.
-- Publica jugadores a la venta ANTES del cierre del mercado para recibir ofertas.
-- Vende jugadores que: estén lesionados largo tiempo, tengan xP baja consistente,
-  necesites liberar saldo para un fichaje mejor, o estén en racha negativa de valor.
-
-OFERTAS DIRECTAS:
-- Puedes ofertar por jugadores de rivales que NO están en el mercado.
-- El rival recibe la oferta y decide si acepta o no. No es automática.
-
-CLÁUSULAS DE RESCISIÓN:
-  Cálculo por defecto: max(precio_compra × 1.5, valor_mercado × 1.5).
-  Si valor_mercado ≤ 666.666, la cláusula mínima es 1M.
-  Se puede subir hasta 400% del valor base. Regla del bot: 1M invertido = +2M de cláusula (factor 2.0).
-  Se puede bajar: recuperas 50% de lo invertido, pero 48h de bloqueo para volver a subir.
-  Los clausulazos son INMEDIATOS (no requieren aprobación del rival).
-
-  ESTRATEGIA DE CLÁUSULAS:
-  → DEFENSIVA: sube la cláusula de tus jugadores clave cuyo valor de mercado se acerque
-    a su cláusula (ratio valor/cláusula ≥ 0.85). Si no la subes, un rival te lo roba.
-  → OFENSIVA: busca jugadores de rivales con cláusulas bajas y alto xP. Especialmente
-    tras jornadas donde su valor ha subido pero la cláusula no se ha ajustado.
-  → TIMING: ejecuta clausulazos justo antes del cierre de mercado para que el rival no pueda reaccionar.
-  → Nunca gastes tanto en cláusulas que te quedes sin saldo para pujas o en negativo.
-
-BLINDAJE (escudo):
-- Puedes proteger 1 jugador por jornada contra clausulazos.
-- Dura 24h (estándar) o 48h (premium). Solo funciona con cláusula abierta.
-- Úsalo en tu jugador más valioso/expuesto en la ventana entre jornadas.
-
-═══════════════════════════════════════════════════════════════════
-ESTRATEGIA GENERAL Y TOMA DE DECISIONES
-═══════════════════════════════════════════════════════════════════
-
-PRIORIDADES (en orden):
-1. NUNCA quedar en negativo antes de jornada (0 puntos = catastrófico).
-2. Alineación óptima con capitán bien elegido (mayor impacto inmediato).
-3. Compras que mejoren el xP del once (fichajes > rotaciones).
-4. Ventas de jugadores sin hueco en el once o lesionados.
-5. Protección de cláusulas de jugadores clave.
-6. Acumulación de saldo para oportunidades futuras.
-
-ANÁLISIS DE FICHAJES - Factores a evaluar:
-- xP predicha (modelo XGBoost) como indicador principal.
-- Calendario próximo: ¿juega de local? ¿contra rival débil? ¿tiene doble jornada?
-- Estado: ¿lesionado? ¿sancionado? ¿apercibido? ¿titular habitual?
-- Posición: ¿llena un hueco en la formación o mejora al titular actual?
-- Relación coste/xP: ¿cuánto cuesta por cada punto esperado?
-- Tendencia de valor: ¿está subiendo o bajando de precio?
-- Competencia en la puja: si hay muchas pujas, incrementa para asegurar.
-
-CUÁNDO VENDER:
-- Jugador con xP consistentemente baja (últimas 3-5 jornadas).
-- Lesión de larga duración (>2 jornadas).
-- Valor de mercado en caída libre (vender antes de que baje más).
-- Necesitas saldo para un fichaje claramente superior.
-- Tienes exceso en una posición y déficit en otra.
-
-CUÁNDO NO VENDER:
-- Jugador estrella en mala racha puntual (1-2 jornadas malas).
-- Si venderlo te deja sin sustituto y con posición vacía (-4 pt).
-- Si el mercado está deprimido y no recuperarías su valor real.
-
-GESTIÓN DE FORMACIÓN:
-- Usa la formación que maximice el xP total del once.
-- No te cases con una formación: adapta según los jugadores disponibles.
-- Si tienes 5 MED fuertes y 2 DEL débiles, juega 3-5-2 o 4-5-1.
-- Recalcula la formación tras cada fichaje/venta.
-
-═══════════════════════════════════════════════════════════════════
-REGLAS OPERATIVAS DEL AGENTE
-═══════════════════════════════════════════════════════════════════
-
-1. Empieza SIEMPRE obteniendo el snapshot actual y las predicciones xP con tus herramientas.
-2. Analiza antes de actuar: consulta simulate_transfer_plan antes de ejecutar movimientos.
-3. Verifica el saldo DESPUÉS de cada operación. Si te acercas a 0, detente.
-4. Si dry_run está activo, simula todo sin cambios reales.
-5. Tras ejecutar movimientos, refresca el snapshot para verificar el estado.
-6. La subida de cláusula es moderada: solo jugadores top-7 xP y con ratio valor/cláusula ≥ 0.88.
-7. Regla fija de cláusulas: 1M invertido → cláusula sube 2M (factor 2.0).
-8. Prioriza operaciones por impacto en xP: una compra que sube el once +2 xP vale más que
-   subir 3 cláusulas preventivas.
+Reglas operativas:
+1. Empieza por obtener contexto real del equipo y del mercado usando herramientas.
+2. Usa predicciones xP y estado de jugadores para justificar decisiones.
+3. Antes de ejecutar movimientos, consulta al menos una vez la simulación del plan.
+4. Respeta presupuesto, ventanas de mercado y limitaciones de datos.
+5. Si dry_run está activo, actúa como simulación (sin cambios reales).
+6. Después de acciones ejecutadas, verifica estado de nuevo con herramientas.
+7. La subida de cláusula debe ser moderada: solo jugadores clave y expuestos a clausulazo.
+8. Regla fija de cláusulas: por cada 1M invertido, la cláusula sube 2M (factor 2.0).
+9. Regla de jornada: no confundas cierre de mercado con deadline de alineación.
+   Una carencia como "falta portero" es planificada si quedan más de 48h para
+   la jornada, alta entre 24-48h, crítica en <=24h y emergencia en <=1h o si el
+   once sigue inválido al deadline. La prioridad es llegar con saldo positivo y
+   11 alineados.
+10. Las ventas fase 1 no financian compras inmediatas: el dinero solo cuenta
+    cuando la oferta se acepta/procesa.
+11. Regla crítica de clausulazos: no se puede comprar ningún jugador mediante
+   clausulazo desde 24h antes del inicio de la jornada. Si faltan 24h o menos
+   para el primer partido, descarta todos los buyout_player_tool/clausulazos y
+   usa solo mercado de pujas, ventas o subidas de cláusula.
+12. Regla crítica de saldo negativo: si `saldo_disponible` o el saldo del plan
+    es negativo, cambia a modo deuda. La prioridad absoluta es volver a saldo
+    >= 0 antes de la jornada: no compres ni subas cláusulas mientras siga la
+    deuda, vende primero jugadores de impacto bajo o nulo. Para elegir ventas,
+    valida expected points, impacto marginal en el once, valor de mercado,
+    cláusula y que tras vender todavía se pueda alinear una formación válida
+    (por ejemplo, no vendas el único portero).
 
 Formato de salida final:
 - Responde siempre en español.
 - Incluye un bloque JSON válido con:
   {
-    "decision_general": "resumen ejecutivo de la estrategia aplicada",
-    "contexto_jornada": "jornada N, rival más relevante, horas al primer partido",
-    "acciones_ejecutadas": ["acción 1 con justificación", "..."],
-    "acciones_descartadas": ["acción descartada con motivo", "..."],
-    "riesgos_detectados": ["riesgo identificado y mitigación", "..."],
-    "estado_saldo": "saldo final tras operaciones",
-    "xp_once_estimado": "xP total del once tras cambios",
-    "capitan_recomendado": "jugador y motivo",
-    "siguiente_revision_recomendada": "cuándo y qué revisar"
+    "decision_general": "...",
+    "acciones_ejecutadas": ["..."],
+    "acciones_ajustadas": ["..."],
+    "acciones_rechazadas": ["..."],
+    "acciones_descartadas": ["..."],
+    "riesgos_detectados": ["..."],
+    "siguiente_revision_recomendada": "..."
   }
 """
 
@@ -428,6 +304,53 @@ def _extract_output(response: dict) -> str:
     return ""
 
 
+def _agent_run_name(
+    phase: str,
+    objective: str,
+    *,
+    command: str | None = None,
+    explicit_run_name: str | None = None,
+) -> str:
+    if explicit_run_name:
+        return explicit_run_name
+    phase_key = str(phase or "").strip().lower()
+    command_key = str(command or "").strip().lower()
+    if command_key == "informe":
+        return "fantasy-bot.manual-report"
+    if command_key == "compraventa":
+        return "fantasy-bot.manual-compraventa"
+    if command_key == "daemon":
+        return "fantasy-bot.daemon-cycle"
+    if phase_key == "pre":
+        return "fantasy-bot.pre-market-agent"
+    if phase_key == "post":
+        return "fantasy-bot.post-market-agent"
+    if phase_key == "full":
+        return "fantasy-bot.full-agent"
+    if objective:
+        return "fantasy-bot.objective-agent"
+    return "fantasy-bot.langchain-agent"
+
+
+def _invoke_executor_with_config(
+    executor: Any,
+    objective: str,
+    invoke_config: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return executor.invoke({"input": objective}, config=invoke_config)
+    except TypeError:
+        return executor.invoke({"input": objective})
+    except Exception:
+        try:
+            return executor.invoke(
+                {"messages": [{"role": "user", "content": objective}]},
+                config=invoke_config,
+            )
+        except TypeError:
+            return executor.invoke({"messages": [{"role": "user", "content": objective}]})
+
+
 def run_agent_objective(
     *,
     league_id: str,
@@ -439,7 +362,51 @@ def run_agent_objective(
     max_iterations: int = 20,
     dry_run: bool = False,
     verbose: bool = False,
+    engine: str | None = None,
+    trace_run_name: str | None = None,
+    trace_command: str | None = None,
+    trace_market_cycle_id: str | None = None,
+    trace_extra_metadata: dict | None = None,
 ) -> dict:
+    engine_key = (
+        engine
+        or os.getenv("FANTASY_AGENT_ENGINE")
+        or os.getenv("LANGCHAIN_AGENT_ENGINE")
+        or "langgraph"
+    ).strip().lower()
+    run_name = _agent_run_name(
+        phase,
+        objective,
+        command=trace_command,
+        explicit_run_name=trace_run_name,
+    )
+    trace_metadata = dict(trace_extra_metadata or {})
+    trace_metadata.setdefault("engine", engine_key)
+    trace_metadata.setdefault("llm_model", llm_model)
+    trace_metadata.setdefault("model_provider", "openai")
+    if engine_key in {"langgraph", "graph"}:
+        from prediction.langgraph_agent import run_graph_objective
+
+        return run_graph_objective(
+            league_id=league_id,
+            objective=objective,
+            phase=phase,
+            model_type=model_type,
+            llm_model=llm_model,
+            temperature=temperature,
+            max_iterations=max_iterations,
+            dry_run=dry_run,
+            verbose=verbose,
+            trace_run_name=run_name,
+            trace_command=trace_command,
+            trace_market_cycle_id=trace_market_cycle_id,
+            trace_extra_metadata=trace_metadata,
+        )
+    if engine_key not in {"legacy", "langchain"}:
+        raise ValueError(
+            f"Motor de agente inválido: {engine_key}. Usa langgraph o legacy."
+        )
+
     runtime = FantasyAgentRuntime(
         league_id=league_id,
         model_type=model_type,
@@ -453,13 +420,29 @@ def run_agent_objective(
         max_iterations=max_iterations,
         verbose=verbose,
     )
-    # API legacy: {"input": ...}
-    # API moderna: {"messages": [{"role":"user","content": ...}]}
-    try:
-        response = executor.invoke({"input": objective})
-    except Exception:
-        response = executor.invoke(
-            {"messages": [{"role": "user", "content": objective}]}
+    invoke_config = build_langsmith_config(
+        run_name=run_name,
+        phase=phase,
+        command=trace_command,
+        league_id=league_id,
+        market_cycle_id=trace_market_cycle_id,
+        dry_run=dry_run,
+        extra_metadata=trace_metadata,
+    )
+
+    with langsmith_trace_context(
+        run_name=run_name,
+        phase=phase,
+        command=trace_command,
+        league_id=league_id,
+        market_cycle_id=trace_market_cycle_id,
+        dry_run=dry_run,
+        extra_metadata=trace_metadata,
+    ):
+        response = _invoke_executor_with_config(
+            executor,
+            objective,
+            invoke_config,
         )
 
     steps = []
@@ -483,6 +466,8 @@ def run_agent_objective(
         "dry_run": dry_run,
         "model_type": model_type,
         "llm_model": llm_model,
+        "engine": "legacy",
+        "trace_run_name": run_name,
         "output": _extract_output(response),
         "steps": steps,
     }
@@ -498,6 +483,11 @@ def run_agent_phase(
     max_iterations: int = 20,
     dry_run: bool = False,
     verbose: bool = False,
+    engine: str | None = None,
+    trace_run_name: str | None = None,
+    trace_command: str | None = None,
+    trace_market_cycle_id: str | None = None,
+    trace_extra_metadata: dict | None = None,
 ) -> dict:
     phase_key = (phase or "pre").strip().lower()
     if phase_key not in PHASE_OBJECTIVES:
@@ -512,11 +502,16 @@ def run_agent_phase(
         max_iterations=max_iterations,
         dry_run=dry_run,
         verbose=verbose,
+        engine=engine,
+        trace_run_name=trace_run_name,
+        trace_command=trace_command,
+        trace_market_cycle_id=trace_market_cycle_id,
+        trace_extra_metadata=trace_extra_metadata,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Agente LangChain para LaLiga Fantasy")
+    parser = argparse.ArgumentParser(description="Agente LangGraph para LaLiga Fantasy")
     parser.add_argument(
         "--league",
         default="",
@@ -531,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-model",
         default=os.getenv("LANGCHAIN_LLM_MODEL", "gpt-5-mini"),
-        help="Modelo LLM usado por LangChain.",
+        help="Modelo LLM usado por el agente.",
     )
     parser.add_argument(
         "--temperature",
@@ -542,6 +537,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-iterations",
         type=int,
         default=int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20")),
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["langgraph", "legacy"],
+        default=(
+            os.getenv("FANTASY_AGENT_ENGINE")
+            or os.getenv("LANGCHAIN_AGENT_ENGINE")
+            or "langgraph"
+        ),
+        help="Motor del agente. Por defecto usa LangGraph; legacy conserva el agent executor anterior.",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -577,15 +582,17 @@ def main() -> None:
         max_iterations=max(1, args.max_iterations),
         dry_run=bool(args.dry_run),
         verbose=bool(args.verbose),
+        engine=args.engine,
     )
 
     print()
     print("=" * 72)
-    print("LANGCHAIN FANTASY AGENT")
+    print("FANTASY AGENT")
     print("=" * 72)
     print(f"Liga: {result['league_id']}")
     print(f"Objetivo: {result['objective']}")
     print(f"Dry run: {result['dry_run']}")
+    print(f"Motor: {result.get('engine', args.engine)}")
     print("-" * 72)
     print(result["output"])
     print("-" * 72)

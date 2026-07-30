@@ -95,7 +95,32 @@ Diferencias clave:
 | `/api/v4/league/{leagueId}/team/daily-reward` | POST | ✅ | Recompensa diaria |
 | `/api/v4/league/{leagueId}/team/{teamId}/check-daily-reward` | GET | ✅ | Comprobar recompensa |
 
-### Endpoints DEPRECADOS / MUERTOS (404)
+| Endpoint | Uso probable |
+|----------|--------------|
+| `/api/v3/league/{leagueId}/market` | GET mercado |
+| `/api/v3/league/{leagueId}/market/sell` | POST publicar venta |
+| `/api/v3/league/{leagueId}/market/history` | Histórico mercado |
+| `/api/v3/league/{leagueId}/market/direct-offer` | Oferta directa |
+| `/api/v3/league/{leagueId}/market/immediate-sale` | Venta inmediata |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/bid` | POST pujar |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/offer` | POST hacer oferta |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/delete` | Eliminar del mercado |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/bid/{bidId}` | Gestionar puja |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/offer/{offerId}` | Gestionar oferta |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/bid/{bidId}/cancel` | Cancelar puja |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/offer/{offerId}/cancel` | Cancelar oferta |
+| `/api/v3/league/{leagueId}/market/{marketPlayerId}/offer/{offerId}/reject` | Rechazar oferta |
+| `/api/v3/player/{playerId}/market-value` | Historial precios (requiere autenticación en la API actual) |
+| `/api/v3/players` | Lista jugadores legacy; comprobado 2026-04-17: devuelve 404 sin token |
+| `/api/v3/players/league/{leagueId}` | Jugadores de la liga (fallback autenticado actualizado) |
+| `/api/v3/leagues/{leagueId}` | Info liga |
+| `/api/v3/leagues/{leagueId}/me` | Mi equipo en liga |
+| `/api/v3/teams/{teamId}` | Plantilla de un equipo |
+| `/api/v3/teams/{teamId}/lineup` | Alineación |
+| `/api/v3/teams/{teamId}/money` | Saldo |
+| `/api/v3/calendar` | Calendario público |
+| `/api/v3/week/current` | Jornada actual pública |
+| `/api/v3/ranking/...` | Rankings |
 
 | Endpoint | Estado anterior | Notas |
 |----------|----------------|-------|
@@ -108,7 +133,20 @@ Diferencias clave:
 | `/api/v5/teams/{teamId}/lineup` | GET/PUT lineup v5 | Solo funciona v3 |
 | `/api/v3/teams/{teamId}/lineup/week/{wn}` | GET lineup v3 | Solo funciona v4 |
 
-### Endpoints con MÉTODO CAMBIADO
+| Endpoint | Uso probable |
+|----------|--------------|
+| `/api/v4/league/{leagueId}/buyout/{playerTeamId}` | GET info clausulazo |
+| `/api/v4/league/{leagueId}/buyout/{playerTeamId}/pay` | POST pagar clausulazo |
+| `/api/v4/league/{leagueId}/market/{marketPlayerId}/offer/{offerId}/accept` | POST aceptar oferta (fase 2) |
+| `/api/v4/league/{leagueId}/playerTeam/{playerTeamId}/loan` | Préstamos |
+| `/api/v4/league/{leagueId}/playerTeam/{playerTeamId}/offer` | Ofertas sobre jugador |
+| `/api/v4/league/{leagueId}/playerTeam/{playerTeamId}/reject-all-offers` | Rechazar todas ofertas |
+| `/api/v4/league/{leagueId}/playerTeam/{playerTeamId}/return-loan` | Devolver préstamo |
+| `/api/v4/league/{leagueId}/loan/{loanOfferId}/accept` | Aceptar préstamo |
+| `/api/v4/leagues/{leagueId}/teams` | Equipos de la liga; fallback actualizado para ranking (comprobado 2026-04-17) |
+| `/api/v4/leagues/{leagueId}/teams/{teamId}` | Equipo (v4) |
+| `/api/v4/league/{leagueId}/team/daily-reward` | Recompensa diaria |
+| `/api/v4/league/{leagueId}/team/{teamId}/check-daily-reward` | Comprobar recompensa |
 
 | Endpoint | Antes | Ahora | Notas |
 |----------|-------|-------|-------|

@@ -1,10 +1,14 @@
-# LangChain Fantasy Agent
+# LangGraph Fantasy Agent
 
 ## 1. Que hace el bot
 
-El agente IA gestiona tu equipo de LaLiga Fantasy de forma autonoma:
+El agente IA gestiona tu equipo de LaLiga Fantasy de forma autonoma con un
+grafo LangGraph. El runner conserva el nombre historico `langchain_agent.py`,
+pero el motor por defecto es `langgraph`.
 
 - Usa tools del repositorio + API oficial para analizar equipo, mercado y expected points.
+- Usa `news_reader_tool` como lector RAG local sobre `scrapes/` para lesiones, sanciones, apercibidos y movimientos de valor.
+- Divide el ciclo en nodos: contexto, analista, ojeador, manager, ejecutor y salida final.
 - Modelo de prediccion fijo: `xgboost`.
 - La liga se selecciona en Telegram por nombre (`/ligas` y `/liga <nombre>`), sin configurar `LALIGA_LEAGUE_ID`.
 - Detecta automaticamente la hora de mercado desde la expiracion de jugadores publicados en la liga.
@@ -13,6 +17,8 @@ El agente IA gestiona tu equipo de LaLiga Fantasy de forma autonoma:
 - Incluye comando manual `/ventas` para forzar fase 2 (aceptar ofertas de liga pendientes tras cierre).
 - Guarda alineacion exactamente 23h55 antes del inicio de jornada.
 - Permite optimizacion manual inmediata de alineacion con `/optimizar`.
+- Regla crítica de mercado: desde 24h antes del primer partido de la jornada no se puede comprar a nadie mediante clausulazo. El agente debe descartar `buyout_player_tool` y limitarse a pujas, ventas o subidas de cláusula.
+- Regla critica de saldo: si el saldo esta negativo, el agente activa modo deuda. No compra ni sube clausulas hasta recuperar saldo >= 0; vende primero jugadores de impacto bajo o nulo, considerando xP, valor de mercado, clausula y que la plantilla siga pudiendo alinear un once valido.
 - Puede subir clausulas de jugadores propios con criterio de moderacion (solo clave + expuestos).
 - Regla fija de clausula: por cada 1M invertido, sube 2M la clausula.
 - Si el token no esta valido, avisa por Telegram para renovarlo.
@@ -29,6 +35,7 @@ cp .env.example .env
 
 ```env
 OPENAI_API_KEY=...
+FANTASY_AGENT_ENGINE=langgraph
 LANGCHAIN_LLM_MODEL=gpt-5-mini
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
@@ -71,3 +78,24 @@ docker compose logs -f autonomous-bot
 - `/liga <nombre>`
 
 El bot confirmara la hora detectada de mercado y los horarios automaticos PRE/POST (-10m/+10m).
+
+## 3. Flujo de nodos
+
+1. `contexto`
+   - Llama a herramientas reales para cargar estado global: plantilla, saldo, puntos, mercado disponible, predicciones xP, noticias locales y alineacion actual.
+2. `analista`
+   - Sub-agente centrado en tu equipo: ventas, banquillo, riesgos y proteccion de clausulas.
+3. `ojeador`
+   - Sub-agente centrado en mercado: chollos, clausulazos, subidas/bajadas y jugadores a evitar.
+4. `manager`
+   - LLM principal que cruza informes, valida presupuesto/fase y decide acciones.
+5. `ejecutor`
+   - Ejecuta o simula ventas, pujas, clausulazos, subidas de clausula, ofertas cerradas y alineacion.
+
+Para ejecutar manualmente:
+
+```bash
+python -m prediction.langchain_agent --phase pre --dry-run
+python -m prediction.langchain_agent --phase full --dry-run --engine langgraph
+python -m prediction.langchain_agent --phase pre --dry-run --engine legacy
+```

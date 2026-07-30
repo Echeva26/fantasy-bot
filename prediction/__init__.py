@@ -11,6 +11,7 @@ Módulos:
     predict       — Genera predicciones para la próxima jornada
     advisor       — Conecta xP con tu liga y genera informe de recomendaciones
     langchain_tools       — Herramientas para agente LLM (snapshot/xP/mercado/API)
+    langgraph_agent       — Orquestador LangGraph por nodos contexto/analisis/manager/ejecutor
     langchain_agent       — Ejecutor de agente LangChain por objetivo/fase
     langchain_autonomous  — Daemon autónomo diario PRE/POST usando el agente
 """

@@ -1,9 +1,10 @@
 """
-Runner Docker para agente LangChain autónomo.
+Runner Docker para agente LangGraph/LangChain autónomo.
 
 Lanza en un solo proceso:
-- Daemon LangChain (scheduler PRE/POST)
+- Daemon autónomo (scheduler PRE/POST)
 - Bot de Telegram para renovación de token (opcional)
+- Job de reentrenamiento periódico del modelo xP (opcional)
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import time
 from types import SimpleNamespace
 
 from prediction.langchain_autonomous import run_daemon
+from prediction.retrain import run_retrain_daemon
 from prediction.token_bot import run_token_bot
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Runner Docker LangChain: daemon + token bot"
+        description="Runner Docker: daemon LangGraph + token bot"
     )
     parser.add_argument(
         "--league",
@@ -61,6 +63,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.getenv("LANGCHAIN_MAX_ITERATIONS", "20")),
     )
     parser.add_argument(
+        "--agent-engine",
+        choices=["langgraph", "legacy"],
+        default=(
+            os.getenv("FANTASY_AGENT_ENGINE")
+            or os.getenv("LANGCHAIN_AGENT_ENGINE")
+            or "langgraph"
+        ),
+        help="Motor del agente autónomo. Por defecto usa LangGraph.",
+    )
+    parser.add_argument(
         "--pre-objective",
         default=os.getenv("LANGCHAIN_PRE_OBJECTIVE", ""),
     )
@@ -85,7 +97,62 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("TOKEN_BOT_POLL_TIMEOUT", "50")),
     )
+    parser.add_argument(
+        "--retrain-enabled",
+        action="store_true",
+        default=_env_bool("RETRAIN_ENABLED", True),
+    )
+    parser.add_argument("--retrain-disabled", action="store_true")
     return parser
+
+
+def _maybe_disable_langsmith_on_forbidden() -> None:
+    """
+    Evita spam de warnings cuando LANGSMITH_TRACING está activo pero la API responde 403.
+
+    En ese caso deshabilitamos tracing en caliente para que el bot siga funcionando
+    sin ruido en logs.
+    """
+    tracing = os.getenv("LANGSMITH_TRACING", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    api_key = os.getenv("LANGSMITH_API_KEY", "").strip()
+    if not tracing or not api_key:
+        return
+
+    try:
+        from langsmith import Client
+        from langsmith.utils import LangSmithError
+    except Exception:
+        return
+
+    try:
+        # Un request ligero para validar credenciales/permisos.
+        # Si esto falla con 403, el backend rechazará igualmente /runs/multipart.
+        client = Client(
+            api_url=os.getenv("LANGSMITH_ENDPOINT", "").strip() or None,
+            api_key=api_key,
+        )
+        next(client.list_projects(limit=1), None)
+    except LangSmithError as exc:
+        msg = str(exc)
+        if "403" in msg or "Forbidden" in msg:
+            os.environ["LANGSMITH_TRACING"] = "false"
+            os.environ["LANGCHAIN_TRACING_V2"] = "false"
+            for name in ("langsmith", "langsmith.client", "langsmith.utils"):
+                logging.getLogger(name).setLevel(logging.ERROR)
+            logger.warning(
+                "LangSmith devuelve 403 (Forbidden). Deshabilitando tracing para evitar spam en logs. "
+                "Revisa permisos del API key / workspace / endpoint."
+            )
+        else:
+            logger.debug("LangSmith no disponible (se ignora): %s", exc)
+    except Exception as exc:
+        logger.debug("Chequeo LangSmith falló (se ignora): %s", exc)
 
 
 def main() -> None:
@@ -93,6 +160,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+    _maybe_disable_langsmith_on_forbidden()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -106,6 +174,7 @@ def main() -> None:
         llm_model=args.llm_model,
         temperature=args.temperature,
         max_iterations=args.max_iterations,
+        agent_engine=args.agent_engine,
         pre_objective=args.pre_objective,
         post_objective=args.post_objective,
         dry_run=args.dry_run,
@@ -148,6 +217,24 @@ def main() -> None:
             logger.info("Token bot thread iniciada.")
     else:
         logger.info("Token bot deshabilitado.")
+
+    retrain_enabled = bool(args.retrain_enabled and not args.retrain_disabled)
+    if retrain_enabled:
+        retrain_thread = threading.Thread(
+            target=run_retrain_daemon,
+            kwargs={
+                "stop_event": stop_event,
+                "bot_token": args.bot_token,
+                "notify_chat_id": args.notify_chat_id,
+            },
+            name="retrain-daemon",
+            daemon=True,
+        )
+        retrain_thread.start()
+        threads.append(retrain_thread)
+        logger.info("Retrain daemon thread iniciada.")
+    else:
+        logger.info("Retrain daemon deshabilitado.")
 
     try:
         while True:
